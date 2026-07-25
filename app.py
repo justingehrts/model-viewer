@@ -65,7 +65,7 @@ ENS_NAME_MAP = {
 # LAYER 1: DATA INGESTION (WITH STREAMLIT CACHING)
 # ==============================================================================
 
-@st.cache_data(ttl=3600)  # Cache API responses in memory for 1 hour
+@st.cache_data(ttl=3600)
 def fetch_deterministic_data(lat, lon, days=7):
     url = "https://api.open-meteo.com/v1/forecast"
     models = ["ecmwf_ifs025", "gfs_seamless"]
@@ -98,7 +98,10 @@ def fetch_deterministic_data(lat, lon, days=7):
         if precip_key in hourly:
             df_precip[nickname] = hourly[precip_key]
             
-    return df_temp, df_precip
+    # Timestamp when this payload was fetched
+    fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    return df_temp, df_precip, fetch_time
 
 
 @st.cache_data(ttl=3600)
@@ -108,6 +111,7 @@ def fetch_ensemble_data(lat, lon, days=7):
     
     dict_temp = {}
     dict_precip = {}
+    run_cycles = {} # Store model run timestamps (e.g. 'EPS': '2026-07-24 12Z')
     
     for m in models:
         nickname = ENS_NAME_MAP.get(m, m)
@@ -130,6 +134,14 @@ def fetch_ensemble_data(lat, lon, days=7):
         if "hourly" not in data:
             continue
             
+        # Extract run cycle timestamp if provided by API, otherwise parse start of forecast
+        if "model_initialization_time" in data:
+            init_dt = pd.to_datetime(data["model_initialization_time"])
+            run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
+        elif "hourly" in data and "time" in data["hourly"]:
+            init_dt = pd.to_datetime(data["hourly"]["time"][0])
+            run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
+            
         hourly = data["hourly"]
         df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
         df_m_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
@@ -148,7 +160,7 @@ def fetch_ensemble_data(lat, lon, days=7):
         dict_temp[nickname] = df_m_temp
         dict_precip[nickname] = df_m_precip
         
-    return dict_temp, dict_precip
+    return dict_temp, dict_precip, run_cycles
 
 # ==============================================================================
 # LAYER 2 & 3: PROCESSING & GRAND ENSEMBLE BUILDER
@@ -224,10 +236,19 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# Fetch Pre-Cached Datasets
+# Fetch Pre-Cached Datasets + Timestamps
 with st.spinner("Fetching multi-model ensemble payloads..."):
-    df_det_temp, df_det_precip = fetch_deterministic_data(lat, lon, days=forecast_days)
-    dict_ens_temp, dict_ens_precip = fetch_ensemble_data(lat, lon, days=forecast_days)
+    df_det_temp, df_det_precip, fetch_time = fetch_deterministic_data(lat, lon, days=forecast_days)
+    dict_ens_temp, dict_ens_precip, run_cycles = fetch_ensemble_data(lat, lon, days=forecast_days)
+
+# Display Run Information in Sidebar
+with st.sidebar:
+    st.divider()
+    st.caption(f"🕒 **Last API Fetch:** {fetch_time}")
+    
+    st.markdown("**Model Run Cycles Loaded:**")
+    for model_name, cycle_str in run_cycles.items():
+        st.text(f"• {model_name:<12}: {cycle_str}")
 
 # Select Payload based on Dropdown
 if selected_var_key == "temperature_2m":
