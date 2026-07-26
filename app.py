@@ -66,42 +66,56 @@ ENS_NAME_MAP = {
 # LAYER 1: DATA INGESTION (WITH STREAMLIT CACHING & RUN TIMESTAMPS)
 # ==============================================================================
 
-@st.cache_data(ttl=900)  # 15-minute cache so fresh model runs reflect quickly
+@st.cache_data(ttl=900)
 def fetch_deterministic_data(lat, lon, days=7):
     url = "https://api.open-meteo.com/v1/forecast"
     models = ["ecmwf_ifs025", "gfs_seamless"]
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,precipitation",
-        "models": ",".join(models),
-        "temperature_unit": "fahrenheit",
-        "precipitation_unit": "inch",
-        "timezone": "auto",
-        "forecast_days": days
-    }
     
-    res = requests.get(url, params=params)
-    res.raise_for_status()
-    data = res.json()
-    hourly = data["hourly"]
-    
-    df_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-    df_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+    df_temp = None
+    df_precip = None
     
     for m in models:
         nickname = DET_NAME_MAP.get(m, m)
-        temp_key = f"temperature_2m_{m}"
-        precip_key = f"precipitation_{m}"
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m,precipitation",
+            "models": m,
+            "temperature_unit": "fahrenheit",
+            "precipitation_unit": "inch",
+            "timezone": "auto",
+            "forecast_days": days
+        }
         
-        if temp_key in hourly:
-            df_temp[nickname] = hourly[temp_key]
-        if precip_key in hourly:
-            df_precip[nickname] = hourly[precip_key]
+        res = requests.get(url, params=params)
+        if res.status_code != 200:
+            continue
             
+        data = res.json()
+        if "hourly" not in data:
+            continue
+            
+        hourly = data["hourly"]
+        
+        if df_temp is None:
+            df_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+            df_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+            
+        temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
+        precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
+        
+        if temp_keys:
+            df_temp[nickname] = hourly[temp_keys[0]]
+        if precip_keys:
+            df_precip[nickname] = hourly[precip_keys[0]]
+            
+    # Fallback empty structures if queries fail
+    if df_temp is None:
+        df_temp = pd.DataFrame(columns=["time"])
+        df_precip = pd.DataFrame(columns=["time"])
+
     fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return df_temp, df_precip, fetch_time
-
 
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
@@ -260,6 +274,10 @@ with st.sidebar:
 with st.spinner("Fetching multi-model ensemble payloads..."):
     df_det_temp, df_det_precip, fetch_time = fetch_deterministic_data(lat, lon, days=forecast_days)
     dict_ens_temp, dict_ens_precip, run_cycles = fetch_ensemble_data(lat, lon, days=forecast_days)
+
+if df_det_temp.empty or "time" not in df_det_temp.columns:
+    st.error("⚠️ Weather API request encountered an upstream error. Please click 'Refresh Data' or try again in a few moments.")
+    st.stop()
 
 # Display Run Information in Sidebar
 with st.sidebar:
