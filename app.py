@@ -66,44 +66,7 @@ ENS_NAME_MAP = {
 # LAYER 1: DATA INGESTION (WITH STREAMLIT CACHING & RUN TIMESTAMPS)
 # ==============================================================================
 
-@st.cache_data(ttl=3600)  # Cache API responses in memory for 1 hour
-def fetch_deterministic_data(lat, lon, days=7):
-    url = "https://api.open-meteo.com/v1/forecast"
-    models = ["ecmwf_ifs025", "gfs_seamless"]
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,precipitation",
-        "models": ",".join(models),
-        "temperature_unit": "fahrenheit",
-        "precipitation_unit": "inch",
-        "timezone": "auto",
-        "forecast_days": days
-    }
-    
-    res = requests.get(url, params=params)
-    res.raise_for_status()
-    data = res.json()
-    hourly = data["hourly"]
-    
-    df_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-    df_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-    
-    for m in models:
-        nickname = DET_NAME_MAP.get(m, m)
-        temp_key = f"temperature_2m_{m}"
-        precip_key = f"precipitation_{m}"
-        
-        if temp_key in hourly:
-            df_temp[nickname] = hourly[temp_key]
-        if precip_key in hourly:
-            df_precip[nickname] = hourly[precip_key]
-            
-    fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return df_temp, df_precip, fetch_time
-
-
-@st.cache_data(ttl=900)  # Reduced cache to 15 mins for faster updates
+@st.cache_data(ttl=900)  # 15-minute cache so fresh runs trigger updates
 def fetch_ensemble_data(lat, lon, days=7):
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
     models = ["ecmwf_ifs025", "ecmwf_aifs025", "gfs_seamless", "google_weathernext2_ensemble"]
@@ -121,7 +84,7 @@ def fetch_ensemble_data(lat, lon, days=7):
             "models": m,
             "temperature_unit": "fahrenheit",
             "precipitation_unit": "inch",
-            "timezone": "auto",
+            "timezone": "UTC",  # Kept in UTC during fetch to extract the true Z-cycle
             "forecast_days": days
         }
         
@@ -130,21 +93,26 @@ def fetch_ensemble_data(lat, lon, days=7):
             continue
             
         data = res.json()
-        if "hourly" not in data:
+        if "hourly" not in data or "time" not in data["hourly"]:
             continue
             
-        # ACCURATE RUN EXTRACTION:
-        # Check top-level JSON metadata for explicit initialization time
-        if "model_initialization_time" in data:
+        # 1. EXTRACT REAL MODEL RUN INITIALIZATION TIME
+        if "model_initialization_time" in data and data["model_initialization_time"]:
             init_dt = pd.to_datetime(data["model_initialization_time"])
             run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
         else:
-            # Fallback: Query the metadata header if provided
-            run_cycles[nickname] = "Latest Live"
-
+            # Fallback: Open-Meteo ensemble hourly array start hour in UTC
+            first_utc_time = pd.to_datetime(data["hourly"]["time"][0])
+            run_cycles[nickname] = first_utc_time.strftime("%m/%d %HZ")
+            
         hourly = data["hourly"]
-        df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-        df_m_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+        
+        # 2. CONVERT TIMESTAMPS TO LOCAL TIME AFTER EXTRACTING UTC RUN CYCLE
+        # Convert UTC array to local timezone matching lat/lon
+        df_time_local = pd.to_datetime(hourly["time"], utc=True).dt.tz_convert("America/New_York").dt.tz_localize(None)
+        
+        df_m_temp = pd.DataFrame({"time": df_time_local})
+        df_m_precip = pd.DataFrame({"time": df_time_local})
         
         temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
         precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
