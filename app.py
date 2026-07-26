@@ -38,14 +38,14 @@ WEATHER_VARS = {
 MODEL_CONFIG = {
     # Deterministic Operational Runs
     "ECMWF":          {"color": "#56B4E9"},  # Sky Blue
-    "GFS":            {"color": "#D55E00"},  # Vermilion / Red-Orange
+    "GFS":            {"color": "#D55E00"},  # Vermilion
     
     # Ensemble Model Families
     "EPS":            {"color": "#0072B2"},  # Blue
-    "AIFS":           {"color": "#CC79A7"},  # Reddish Purple
-    "GEFS":           {"color": "#E69F00"},  # Amber / Orange
-    "WeatherNext":    {"color": "#009E73"},  # Bluish Green (Teal)
-    "Grand Ensemble": {"color": "#111111"}   # Dark Charcoal / Neutral
+    "AIFS":           {"color": "#CC79A7"},  # Purple
+    "GEFS":           {"color": "#E69F00"},  # Amber
+    "WeatherNext":    {"color": "#009E73"},  # Teal
+    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray (High contrast on both Light & Dark!)
 }
 
 ENS_ORDER = ["EPS", "AIFS", "GEFS", "WeatherNext", "Grand Ensemble"]
@@ -350,14 +350,14 @@ with tab1:
                 hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{ens_name} (Median)</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
             ))
 
+    # Remove template="plotly_white" so Plotly inherits Streamlit's theme!
     fig_hourly.update_layout(
-        title=dict(text=f"Hourly {var_cfg['label']} Trajectory ({var_cfg['unit']})", font=dict(size=18)),
-        xaxis_title="Date / Time (Local)",
-        yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
-        hovermode="x unified",
-        template="plotly_white",
-        height=550,
-        legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
+    title=dict(text=f"Hourly {var_cfg['label']} Trajectory ({var_cfg['unit']})", font=dict(size=18)),
+    xaxis_title="Date / Time (Local)",
+    yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
+    hovermode="x unified",
+    height=550,
+    legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
     st.plotly_chart(fig_hourly, use_container_width=True)
 
