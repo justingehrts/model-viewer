@@ -469,30 +469,30 @@ with tab3:
         date_obj = pd.to_datetime(d)
         row = {"Date": date_obj.strftime("%a %b %d, %Y")}
         
-        # Deterministic
+        # 1. Deterministic Operational Runs (Low / High)
         for det_col in ["ECMWF", "GFS"]:
             if det_col in daily_det_highs.columns:
                 if selected_var_key == "temperature_2m" and d in daily_det_lows.index:
-                    row[f"Det {det_col} (High/Low)"] = f"{daily_det_highs.loc[d, det_col]:.1f}° / {daily_det_lows.loc[d, det_col]:.1f}°F"
+                    row[f"Det {det_col} (L/H)"] = f"{daily_det_lows.loc[d, det_col]:.1f}° / {daily_det_highs.loc[d, det_col]:.1f}°F"
                 else:
                     row[f"Det {det_col}"] = round(daily_det_highs.loc[d, det_col], 2)
                 
-        # Individual Ensembles
+        # 2. Individual Ensemble Medians (Low / High)
         for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
             if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
                 high_vals = daily_ens_highs[ens_name].loc[d].values
                 if selected_var_key == "temperature_2m" and ens_name in daily_ens_lows and d in daily_ens_lows[ens_name].index:
                     low_vals = daily_ens_lows[ens_name].loc[d].values
-                    row[f"{ens_name} Med (H/L)"] = f"{np.median(high_vals):.1f}° / {np.median(low_vals):.1f}°F"
+                    row[f"{ens_name} Med (L/H)"] = f"{np.median(low_vals):.1f}° / {np.median(high_vals):.1f}°F"
                 else:
                     row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
                 
-        # Grand Ensemble
+        # 3. Grand Ensemble Master Consensus (Low / High + High IQR Spread)
         if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
             g_highs = daily_ens_highs["Grand Ensemble"].loc[d].values
             if selected_var_key == "temperature_2m" and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
                 g_lows = daily_ens_lows["Grand Ensemble"].loc[d].values
-                row["Grand Ens Med (H/L)"] = f"{np.median(g_highs):.1f}° / {np.median(g_lows):.1f}°F"
+                row["Grand Ens Med (L/H)"] = f"{np.median(g_lows):.1f}° / {np.median(g_highs):.1f}°F"
                 row["High IQR Spread"] = f"{np.percentile(g_highs, 25):.1f}° to {np.percentile(g_highs, 75):.1f}°F"
             else:
                 row["Grand Ens Median"] = round(float(np.median(g_highs)), 2)
