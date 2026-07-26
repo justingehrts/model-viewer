@@ -34,17 +34,17 @@ WEATHER_VARS = {
     }
 }
 
-# Color Vision Deficiency (CVD) Safe Palette (Okabe-Ito / IBM Design Inspired)
+# Color Vision Deficiency (CVD) Safe Palette
 MODEL_CONFIG = {
     # Deterministic Operational Runs
     "ECMWF":          {"color": "#56B4E9"},  # Sky Blue
-    "GFS":            {"color": "#D55E00"},  # Vermilion / Red-Orange
+    "GFS":            {"color": "#D55E00"},  # Vermilion
     
     # Ensemble Model Families
     "EPS":            {"color": "#0072B2"},  # Blue
-    "AIFS":           {"color": "#CC79A7"},  # Reddish Purple
-    "GEFS":           {"color": "#E69F00"},  # Amber / Orange
-    "WeatherNext":    {"color": "#009E73"},  # Bluish Green (Teal)
+    "AIFS":           {"color": "#CC79A7"},  # Purple
+    "GEFS":           {"color": "#E69F00"},  # Amber
+    "WeatherNext":    {"color": "#009E73"},  # Teal
     "Grand Ensemble": {"color": "#888888"}   # Mid-Gray (High contrast in Light & Dark mode)
 }
 
@@ -63,10 +63,10 @@ ENS_NAME_MAP = {
 }
 
 # ==============================================================================
-# LAYER 1: DATA INGESTION (WITH STREAMLIT CACHING & RUN TIMESTAMPS)
+# LAYER 1: DATA INGESTION (SAFE MULTI-QUERY FETCH)
 # ==============================================================================
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=900)  # 15-minute cache
 def fetch_deterministic_data(lat, lon, days=7):
     url = "https://api.open-meteo.com/v1/forecast"
     models = ["ecmwf_ifs025", "gfs_seamless"]
@@ -87,35 +87,34 @@ def fetch_deterministic_data(lat, lon, days=7):
             "forecast_days": days
         }
         
-        res = requests.get(url, params=params)
-        if res.status_code != 200:
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if "hourly" in data and "time" in data["hourly"]:
+                    hourly = data["hourly"]
+                    
+                    if df_temp is None:
+                        df_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+                        df_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+                        
+                    temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
+                    precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
+                    
+                    if temp_keys:
+                        df_temp[nickname] = hourly[temp_keys[0]]
+                    if precip_keys:
+                        df_precip[nickname] = hourly[precip_keys[0]]
+        except Exception:
             continue
             
-        data = res.json()
-        if "hourly" not in data:
-            continue
-            
-        hourly = data["hourly"]
-        
-        if df_temp is None:
-            df_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-            df_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-            
-        temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
-        precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
-        
-        if temp_keys:
-            df_temp[nickname] = hourly[temp_keys[0]]
-        if precip_keys:
-            df_precip[nickname] = hourly[precip_keys[0]]
-            
-    # Fallback empty structures if queries fail
     if df_temp is None:
         df_temp = pd.DataFrame(columns=["time"])
         df_precip = pd.DataFrame(columns=["time"])
 
     fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return df_temp, df_precip, fetch_time
+
 
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
@@ -139,41 +138,42 @@ def fetch_ensemble_data(lat, lon, days=7):
             "forecast_days": days
         }
         
-        res = requests.get(url, params=params)
-        if res.status_code != 200:
+        try:
+            res = requests.get(url, params=params, timeout=15)
+            if res.status_code != 200:
+                continue
+                
+            data = res.json()
+            if "hourly" not in data or "time" not in data["hourly"]:
+                continue
+                
+            if "model_initialization_time" in data and data["model_initialization_time"]:
+                init_dt = pd.to_datetime(data["model_initialization_time"])
+                run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
+            elif "hourly" in data and "time" in data["hourly"]:
+                offset_sec = data.get("utc_offset_seconds", 0)
+                first_time_utc = pd.to_datetime(data["hourly"]["time"][0]) - pd.Timedelta(seconds=offset_sec)
+                run_cycles[nickname] = first_time_utc.strftime("%m/%d %HZ")
+                
+            hourly = data["hourly"]
+            df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+            df_m_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+            
+            temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
+            precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
+            
+            for k in temp_keys:
+                col = k.replace("temperature_2m_", "")
+                df_m_temp[col] = hourly[k]
+                
+            for k in precip_keys:
+                col = k.replace("precipitation_", "")
+                df_m_precip[col] = hourly[k]
+                
+            dict_temp[nickname] = df_m_temp
+            dict_precip[nickname] = df_m_precip
+        except Exception:
             continue
-            
-        data = res.json()
-        if "hourly" not in data or "time" not in data["hourly"]:
-            continue
-            
-        # Parse actual UTC model initialization time from top-level metadata
-        if "model_initialization_time" in data and data["model_initialization_time"]:
-            init_dt = pd.to_datetime(data["model_initialization_time"])
-            run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
-        elif "hourly" in data and "time" in data["hourly"]:
-            # Fallback: Parse start time adjusted by UTC offset
-            offset_sec = data.get("utc_offset_seconds", 0)
-            first_time_utc = pd.to_datetime(data["hourly"]["time"][0]) - pd.Timedelta(seconds=offset_sec)
-            run_cycles[nickname] = first_time_utc.strftime("%m/%d %HZ")
-            
-        hourly = data["hourly"]
-        df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-        df_m_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-        
-        temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
-        precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
-        
-        for k in temp_keys:
-            col = k.replace("temperature_2m_", "")
-            df_m_temp[col] = hourly[k]
-            
-        for k in precip_keys:
-            col = k.replace("precipitation_", "")
-            df_m_precip[col] = hourly[k]
-            
-        dict_temp[nickname] = df_m_temp
-        dict_precip[nickname] = df_m_precip
         
     return dict_temp, dict_precip, run_cycles
 
@@ -182,7 +182,6 @@ def fetch_ensemble_data(lat, lon, days=7):
 # ==============================================================================
 
 def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
-    # 1. Build Grand Ensemble
     all_member_dfs = []
     for model_name, df_m in dict_ens.items():
         cols_to_rename = {c: f"{model_name}_{c}" for c in df_m.columns if c != 'time'}
@@ -193,7 +192,6 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
         df_grand = pd.concat(all_member_dfs, axis=1).reset_index()
         dict_ens["Grand Ensemble"] = df_grand
 
-    # 2. Compute Hourly Summaries
     hourly_summaries = {}
     for name in ENS_ORDER:
         if name in dict_ens:
@@ -206,7 +204,6 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
             df_summary['q75'] = df[member_cols].quantile(0.75, axis=1)
             hourly_summaries[name] = df_summary
 
-    # 3. Compute Daily Calendar Aggregations
     daily_ens_highs = {}
     daily_ens_lows = {}
     
@@ -214,32 +211,32 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
     daily_det_lows = pd.DataFrame()
 
     df_det_daily = df_det.copy()
-    df_det_daily['date'] = df_det_daily['time'].dt.strftime('%Y-%m-%d')
-    det_cols = [c for c in df_det.columns if c != 'time']
+    if not df_det_daily.empty and 'time' in df_det_daily.columns:
+        df_det_daily['date'] = df_det_daily['time'].dt.strftime('%Y-%m-%d')
+        det_cols = [c for c in df_det.columns if c != 'time']
 
-    if selected_var_key == "temperature_2m":
-        for name in ENS_ORDER:
-            if name in dict_ens:
-                df = dict_ens[name]
-                member_cols = [c for c in df.columns if c != 'time']
-                df_daily = df.copy()
-                df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
-                daily_ens_highs[name] = df_daily.groupby('date')[member_cols].max()
-                daily_ens_lows[name] = df_daily.groupby('date')[member_cols].min()
-                
-        daily_det_highs = df_det_daily.groupby('date')[det_cols].max()
-        daily_det_lows = df_det_daily.groupby('date')[det_cols].min()
-    else:
-        # Precipitation (Sum)
-        for name in ENS_ORDER:
-            if name in dict_ens:
-                df = dict_ens[name]
-                member_cols = [c for c in df.columns if c != 'time']
-                df_daily = df.copy()
-                df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
-                daily_ens_highs[name] = df_daily.groupby('date')[member_cols].sum()
-                
-        daily_det_highs = df_det_daily.groupby('date')[det_cols].sum()
+        if selected_var_key == "temperature_2m":
+            for name in ENS_ORDER:
+                if name in dict_ens:
+                    df = dict_ens[name]
+                    member_cols = [c for c in df.columns if c != 'time']
+                    df_daily = df.copy()
+                    df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
+                    daily_ens_highs[name] = df_daily.groupby('date')[member_cols].max()
+                    daily_ens_lows[name] = df_daily.groupby('date')[member_cols].min()
+                    
+            daily_det_highs = df_det_daily.groupby('date')[det_cols].max()
+            daily_det_lows = df_det_daily.groupby('date')[det_cols].min()
+        else:
+            for name in ENS_ORDER:
+                if name in dict_ens:
+                    df = dict_ens[name]
+                    member_cols = [c for c in df.columns if c != 'time']
+                    df_daily = df.copy()
+                    df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
+                    daily_ens_highs[name] = df_daily.groupby('date')[member_cols].sum()
+                    
+            daily_det_highs = df_det_daily.groupby('date')[det_cols].sum()
 
     return hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows
 
@@ -275,8 +272,9 @@ with st.spinner("Fetching multi-model ensemble payloads..."):
     df_det_temp, df_det_precip, fetch_time = fetch_deterministic_data(lat, lon, days=forecast_days)
     dict_ens_temp, dict_ens_precip, run_cycles = fetch_ensemble_data(lat, lon, days=forecast_days)
 
+# Safety Check
 if df_det_temp.empty or "time" not in df_det_temp.columns:
-    st.error("⚠️ Weather API request encountered an upstream error. Please click 'Refresh Data' or try again in a few moments.")
+    st.error("⚠️ Unable to connect to Open-Meteo API. Please click 'Refresh Data' or try again in a few moments.")
     st.stop()
 
 # Display Run Information in Sidebar
@@ -310,23 +308,24 @@ if "Grand Ensemble" in daily_ens_highs and not daily_det_highs.empty:
     grand_daily = daily_ens_highs["Grand Ensemble"]
     dates = list(daily_det_highs.index)
     
-    peak_val = grand_daily.loc[dates[0]].median().max() if len(dates) > 0 else 0
-    max_day_str = dates[0]
-    
-    for d in dates:
-        m_val = np.median(grand_daily.loc[d].values)
-        if m_val > peak_val:
-            peak_val = m_val
-            max_day_str = d
-            
-    first_day_spread = np.percentile(grand_daily.loc[dates[0]].values, 75) - np.percentile(grand_daily.loc[dates[0]].values, 25)
-    last_day_spread = np.percentile(grand_daily.loc[dates[-1]].values, 75) - np.percentile(grand_daily.loc[dates[-1]].values, 25)
+    if len(dates) > 0:
+        peak_val = grand_daily.loc[dates[0]].median().max()
+        max_day_str = dates[0]
+        
+        for d in dates:
+            m_val = np.median(grand_daily.loc[d].values)
+            if m_val > peak_val:
+                peak_val = m_val
+                max_day_str = d
+                
+        first_day_spread = np.percentile(grand_daily.loc[dates[0]].values, 75) - np.percentile(grand_daily.loc[dates[0]].values, 25)
+        last_day_spread = np.percentile(grand_daily.loc[dates[-1]].values, 75) - np.percentile(grand_daily.loc[dates[-1]].values, 25)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Location Coordinates", f"{lat:.2f}°, {lon:.2f}°")
-    col2.metric(f"Peak Consensus {var_cfg['label']}", f"{peak_val:.1f} {var_cfg['unit']}", f"Day: {max_day_str}")
-    col3.metric("Day 1 Consensus Spread (IQR)", f"{first_day_spread:.1f} {var_cfg['unit']}")
-    col4.metric(f"Day {forecast_days} Uncertainty Spread", f"{last_day_spread:.1f} {var_cfg['unit']}", f"+{last_day_spread - first_day_spread:.1f} {var_cfg['unit']} vs Day 1", delta_color="inverse")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Location Coordinates", f"{lat:.2f}°, {lon:.2f}°")
+        col2.metric(f"Peak Consensus {var_cfg['label']}", f"{peak_val:.1f} {var_cfg['unit']}", f"Day: {max_day_str}")
+        col3.metric("Day 1 Consensus Spread (IQR)", f"{first_day_spread:.1f} {var_cfg['unit']}")
+        col4.metric(f"Day {forecast_days} Uncertainty Spread", f"{last_day_spread:.1f} {var_cfg['unit']}", f"+{last_day_spread - first_day_spread:.1f} {var_cfg['unit']} vs Day 1", delta_color="inverse")
 
 st.divider()
 
@@ -340,7 +339,6 @@ tab1, tab2, tab3 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution 
 with tab1:
     fig_hourly = go.Figure()
     
-    # Deterministic Operational Runs
     for det_name in ["ECMWF", "GFS"]:
         if det_name in df_det_active.columns:
             color = MODEL_CONFIG[det_name]["color"]
@@ -353,7 +351,6 @@ with tab1:
                 hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{det_name} (Det)</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
             ))
             
-    # Ensemble Medians
     for ens_name in ENS_ORDER:
         if ens_name in hourly_summaries:
             df_sum = hourly_summaries[ens_name]
@@ -381,11 +378,10 @@ with tab1:
     st.plotly_chart(fig_hourly, use_container_width=True)
 
 
-# --- TAB 2: DAILY DISTRIBUTION SPREAD (BOX PLOTS FOR HIGHS AND LOWS) ---
+# --- TAB 2: DAILY DISTRIBUTION SPREAD ---
 with tab2:
     dates = list(daily_det_highs.index)
     
-    # --- CHART A: DAILY HIGHS / TOTAL PRECIPITATION ---
     fig_daily_high = go.Figure()
     
     for ens_name in ENS_ORDER:
@@ -430,7 +426,6 @@ with tab2:
     )
     st.plotly_chart(fig_daily_high, use_container_width=True)
 
-    # --- CHART B: DAILY LOWS (ONLY RENDERED FOR TEMPERATURE) ---
     if selected_var_key == "temperature_2m" and not daily_det_lows.empty:
         st.divider()
         fig_daily_low = go.Figure()
@@ -450,7 +445,7 @@ with tab2:
                             marker_color=color,
                             boxpoints='outliers',
                             legendgroup=ens_name,
-                            showlegend=False, # Shared legend with top chart
+                            showlegend=False,
                             hovertemplate=f"<b>{ens_name}</b><br>Date: {date_str}<br>Low: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
                         ))
 
@@ -486,7 +481,6 @@ with tab3:
         date_obj = pd.to_datetime(d)
         row = {"Date": date_obj.strftime("%a %b %d, %Y")}
         
-        # 1. Deterministic Operational Runs (Low / High)
         for det_col in ["ECMWF", "GFS"]:
             if det_col in daily_det_highs.columns:
                 if selected_var_key == "temperature_2m" and d in daily_det_lows.index:
@@ -494,7 +488,6 @@ with tab3:
                 else:
                     row[f"Det {det_col}"] = round(daily_det_highs.loc[d, det_col], 2)
                 
-        # 2. Individual Ensemble Medians (Low / High)
         for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
             if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
                 high_vals = daily_ens_highs[ens_name].loc[d].values
@@ -504,7 +497,6 @@ with tab3:
                 else:
                     row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
                 
-        # 3. Grand Ensemble Master Consensus (Low / High)
         if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
             g_highs = daily_ens_highs["Grand Ensemble"].loc[d].values
             if selected_var_key == "temperature_2m" and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
