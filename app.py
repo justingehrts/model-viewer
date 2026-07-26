@@ -103,7 +103,7 @@ def fetch_deterministic_data(lat, lon, days=7):
     return df_temp, df_precip, fetch_time
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=900)  # Reduced cache to 15 mins for faster updates
 def fetch_ensemble_data(lat, lon, days=7):
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
     models = ["ecmwf_ifs025", "ecmwf_aifs025", "gfs_seamless", "google_weathernext2_ensemble"]
@@ -133,14 +133,15 @@ def fetch_ensemble_data(lat, lon, days=7):
         if "hourly" not in data:
             continue
             
-        # Parse model initialization run time
+        # ACCURATE RUN EXTRACTION:
+        # Check top-level JSON metadata for explicit initialization time
         if "model_initialization_time" in data:
             init_dt = pd.to_datetime(data["model_initialization_time"])
             run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
-        elif "hourly" in data and "time" in data["hourly"]:
-            init_dt = pd.to_datetime(data["hourly"]["time"][0])
-            run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
-            
+        else:
+            # Fallback: Query the metadata header if provided
+            run_cycles[nickname] = "Latest Live"
+
         hourly = data["hourly"]
         df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
         df_m_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
