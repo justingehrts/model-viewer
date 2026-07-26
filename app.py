@@ -60,6 +60,42 @@ ENS_NAME_MAP = {
 # LAYER 1: DATA INGESTION
 # ==============================================================================
 
+@st.cache_data(ttl=86400) # Cache airport locations for 24 hours
+def get_coordinates_from_airport(airport_code):
+    """
+    Looks up latitude/longitude for airport ICAO/IATA codes (e.g. KCMH, CMH)
+    using the free NOAA Aviation Weather Center API.
+    """
+    code = airport_code.strip().upper()
+    url = f"https://aviationweather.gov/api/data/stationinfo?ids={code}&format=json"
+    
+    try:
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) > 0:
+                station = data[0]
+                lat = station.get("lat")
+                lon = station.get("lon")
+                name = station.get("site", code)
+                return lat, lon, name
+    except Exception:
+        pass
+        
+    # Fallback to Open-Meteo Geocoding API
+    geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={code}&count=1"
+    try:
+        res = requests.get(geo_url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if "results" in data and len(data["results"]) > 0:
+                item = data["results"][0]
+                return item["latitude"], item["longitude"], item["name"]
+    except Exception:
+        pass
+
+    return None, None, None
+    
 @st.cache_data(ttl=900)  # 15-minute cache
 def fetch_deterministic_data(lat, lon, days=7):
     """Fetches high-resolution blended operational deterministic run."""
@@ -232,9 +268,27 @@ st.title("🌤️ Multi-Model Ensemble Weather Consensus Dashboard")
 st.markdown("Comparing deterministic operational runs against **197 probabilistic ensemble members** across European (ECMWF/EPS/AIFS), American (GFS/GEFS), and AI (Google WeatherNext 2) forecasting systems.")
 
 with st.sidebar:
-    st.header("⚙️ Location & Forecast Horizon")
-    lat = st.number_input("Latitude", value=39.97, step=0.01, format="%.2f")
-    lon = st.number_input("Longitude", value=-83.00, step=0.01, format="%.2f")
+    st.header("⚙️ Location & Horizon")
+    
+    loc_mode = st.radio("Location Mode", ["Airport Code", "Manual Lat/Lon"], horizontal=True)
+    
+    if loc_mode == "Airport Code":
+        airport_input = st.text_input("Airport Code (ICAO / IATA)", value="KCMH").strip().upper()
+        
+        # Resolve Airport
+        auto_lat, auto_lon, station_name = get_coordinates_from_airport(airport_input)
+        
+        if auto_lat is not None and auto_lon is not None:
+            lat = auto_lat
+            lon = auto_lon
+            st.success(f"📍 **{station_name}** ({lat:.2f}°, {lon:.2f}°)")
+        else:
+            st.warning("⚠️ Code not found. Defaulting to KCMH (39.99°, -82.89°)")
+            lat, lon = 39.99, -82.89
+    else:
+        lat = st.number_input("Latitude", value=39.97, step=0.01, format="%.2f")
+        lon = st.number_input("Longitude", value=-83.00, step=0.01, format="%.2f")
+        
     forecast_days = st.slider("Forecast Horizon (Days)", min_value=3, max_value=14, value=7)
     
     st.divider()
