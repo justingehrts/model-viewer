@@ -15,15 +15,15 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# CONFIGURATION & METADATA CONFIG (TWEAK B)
+# CONFIGURATION & METADATA CONFIG
 # ==============================================================================
 WEATHER_VARS = {
     "temperature_2m": {
         "label": "Air Temperature",
         "unit": "°F",
         "hourly_param": "temperature_2m",
-        "daily_agg": "max",          # 'max' for daily highs
-        "chart_title": "Daily High Temperature Spread"
+        "daily_agg": "max",          # 'max' for daily highs, 'min' calculated separately for lows
+        "chart_title": "Daily Temperature Spread"
     },
     "precipitation": {
         "label": "Total Precipitation",
@@ -34,17 +34,18 @@ WEATHER_VARS = {
     }
 }
 
+# Color Vision Deficiency (CVD) Safe Palette (Okabe-Ito / IBM Design Inspired)
 MODEL_CONFIG = {
     # Deterministic Operational Runs
-    "ECMWF":          {"color": "#1f77b4"},  # Royal Blue
-    "GFS":            {"color": "#d62728"},  # Crimson Red
+    "ECMWF":          {"color": "#56B4E9"},  # Sky Blue
+    "GFS":            {"color": "#D55E00"},  # Vermilion / Red-Orange
     
     # Ensemble Model Families
-    "EPS":            {"color": "#2b5c8f"},  # Deep Blue
-    "AIFS":           {"color": "#7b4173"},  # Purple
-    "GEFS":           {"color": "#e377c2"},  # Rose / Pink
-    "WeatherNext":    {"color": "#2ca02c"},  # Emerald Green
-    "Grand Ensemble": {"color": "#111111"}   # Charcoal / Off-Black
+    "EPS":            {"color": "#0072B2"},  # Blue
+    "AIFS":           {"color": "#CC79A7"},  # Reddish Purple
+    "GEFS":           {"color": "#E69F00"},  # Amber / Orange
+    "WeatherNext":    {"color": "#009E73"},  # Bluish Green (Teal)
+    "Grand Ensemble": {"color": "#111111"}   # Dark Charcoal / Neutral
 }
 
 ENS_ORDER = ["EPS", "AIFS", "GEFS", "WeatherNext", "Grand Ensemble"]
@@ -62,10 +63,10 @@ ENS_NAME_MAP = {
 }
 
 # ==============================================================================
-# LAYER 1: DATA INGESTION (WITH STREAMLIT CACHING)
+# LAYER 1: DATA INGESTION (WITH STREAMLIT CACHING & RUN TIMESTAMPS)
 # ==============================================================================
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600)  # Cache API responses in memory for 1 hour
 def fetch_deterministic_data(lat, lon, days=7):
     url = "https://api.open-meteo.com/v1/forecast"
     models = ["ecmwf_ifs025", "gfs_seamless"]
@@ -98,9 +99,7 @@ def fetch_deterministic_data(lat, lon, days=7):
         if precip_key in hourly:
             df_precip[nickname] = hourly[precip_key]
             
-    # Timestamp when this payload was fetched
     fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
     return df_temp, df_precip, fetch_time
 
 
@@ -111,7 +110,7 @@ def fetch_ensemble_data(lat, lon, days=7):
     
     dict_temp = {}
     dict_precip = {}
-    run_cycles = {} # Store model run timestamps (e.g. 'EPS': '2026-07-24 12Z')
+    run_cycles = {}
     
     for m in models:
         nickname = ENS_NAME_MAP.get(m, m)
@@ -134,7 +133,7 @@ def fetch_ensemble_data(lat, lon, days=7):
         if "hourly" not in data:
             continue
             
-        # Extract run cycle timestamp if provided by API, otherwise parse start of forecast
+        # Parse model initialization run time
         if "model_initialization_time" in data:
             init_dt = pd.to_datetime(data["model_initialization_time"])
             run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
@@ -166,7 +165,7 @@ def fetch_ensemble_data(lat, lon, days=7):
 # LAYER 2 & 3: PROCESSING & GRAND ENSEMBLE BUILDER
 # ==============================================================================
 
-def process_ensemble_data(dict_ens, df_det, agg_func="max"):
+def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
     # 1. Build Grand Ensemble
     all_member_dfs = []
     for model_name, df_m in dict_ens.items():
@@ -191,23 +190,42 @@ def process_ensemble_data(dict_ens, df_det, agg_func="max"):
             df_summary['q75'] = df[member_cols].quantile(0.75, axis=1)
             hourly_summaries[name] = df_summary
 
-    # 3. Compute Daily Calendar Aggregations
-    daily_ens = {}
-    for name in ENS_ORDER:
-        if name in dict_ens:
-            df = dict_ens[name]
-            member_cols = [c for c in df.columns if c != 'time']
-            df_daily = df.copy()
-            df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
-            daily_ens[name] = df_daily.groupby('date')[member_cols].agg(agg_func)
+    # 3. Compute Daily Calendar Aggregations (Highs & Lows for Temp, Sum for Precip)
+    daily_ens_highs = {}
+    daily_ens_lows = {}
+    
+    daily_det_highs = pd.DataFrame()
+    daily_det_lows = pd.DataFrame()
 
-    # 4. Compute Daily Deterministic Aggregations
     df_det_daily = df_det.copy()
     df_det_daily['date'] = df_det_daily['time'].dt.strftime('%Y-%m-%d')
     det_cols = [c for c in df_det.columns if c != 'time']
-    daily_det = df_det_daily.groupby('date')[det_cols].agg(agg_func)
 
-    return hourly_summaries, daily_ens, daily_det
+    if selected_var_key == "temperature_2m":
+        for name in ENS_ORDER:
+            if name in dict_ens:
+                df = dict_ens[name]
+                member_cols = [c for c in df.columns if c != 'time']
+                df_daily = df.copy()
+                df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
+                daily_ens_highs[name] = df_daily.groupby('date')[member_cols].max()
+                daily_ens_lows[name] = df_daily.groupby('date')[member_cols].min()
+                
+        daily_det_highs = df_det_daily.groupby('date')[det_cols].max()
+        daily_det_lows = df_det_daily.groupby('date')[det_cols].min()
+    else:
+        # Precipitation (Sum)
+        for name in ENS_ORDER:
+            if name in dict_ens:
+                df = dict_ens[name]
+                member_cols = [c for c in df.columns if c != 'time']
+                df_daily = df.copy()
+                df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
+                daily_ens_highs[name] = df_daily.groupby('date')[member_cols].sum()
+                
+        daily_det_highs = df_det_daily.groupby('date')[det_cols].sum()
+
+    return hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows
 
 # ==============================================================================
 # STREAMLIT UI & SIDEBAR
@@ -217,7 +235,7 @@ st.title("🌤️ Multi-Model Ensemble Weather Consensus Dashboard")
 st.markdown("Comparing deterministic operational runs against **197 probabilistic ensemble members** across European (ECMWF/EPS/AIFS), American (GFS/GEFS), and AI (Google WeatherNext 2) forecasting systems.")
 
 with st.sidebar:
-    st.header("⚙️ Forecast Controls")
+    st.header("⚙️ Location & Forecast Horizon")
     lat = st.number_input("Latitude", value=39.97, step=0.01, format="%.2f")
     lon = st.number_input("Longitude", value=-83.00, step=0.01, format="%.2f")
     forecast_days = st.slider("Forecast Horizon (Days)", min_value=3, max_value=14, value=7)
@@ -236,7 +254,7 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# Fetch Pre-Cached Datasets + Timestamps
+# Fetch Pre-Cached Datasets
 with st.spinner("Fetching multi-model ensemble payloads..."):
     df_det_temp, df_det_precip, fetch_time = fetch_deterministic_data(lat, lon, days=forecast_days)
     dict_ens_temp, dict_ens_precip, run_cycles = fetch_ensemble_data(lat, lon, days=forecast_days)
@@ -245,7 +263,6 @@ with st.spinner("Fetching multi-model ensemble payloads..."):
 with st.sidebar:
     st.divider()
     st.caption(f"🕒 **Last API Fetch:** {fetch_time}")
-    
     st.markdown("**Model Run Cycles Loaded:**")
     for model_name, cycle_str in run_cycles.items():
         st.text(f"• {model_name:<12}: {cycle_str}")
@@ -259,21 +276,20 @@ else:
     dict_ens_active = dict_ens_precip
 
 # Process Data dynamically
-hourly_summaries, daily_ens, daily_det = process_ensemble_data(
+hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows = process_ensemble_data(
     dict_ens_active, 
     df_det_active, 
-    agg_func=var_cfg["daily_agg"]
+    selected_var_key=selected_var_key
 )
 
 # ==============================================================================
 # KEY METRICS SUMMARY CARDS
 # ==============================================================================
 
-if "Grand Ensemble" in daily_ens and not daily_det.empty:
-    grand_daily = daily_ens["Grand Ensemble"]
-    dates = list(daily_det.index)
+if "Grand Ensemble" in daily_ens_highs and not daily_det_highs.empty:
+    grand_daily = daily_ens_highs["Grand Ensemble"]
+    dates = list(daily_det_highs.index)
     
-    # Calculate key metrics for the 7-day window
     peak_val = grand_daily.loc[dates[0]].median().max() if len(dates) > 0 else 0
     max_day_str = dates[0]
     
@@ -346,21 +362,22 @@ with tab1:
     st.plotly_chart(fig_hourly, use_container_width=True)
 
 
-# --- TAB 2: DAILY DISTRIBUTION SPREAD (BOX PLOTS) ---
+# --- TAB 2: DAILY DISTRIBUTION SPREAD (BOX PLOTS FOR HIGHS AND LOWS) ---
 with tab2:
-    fig_daily = go.Figure()
-    dates = list(daily_det.index)
+    dates = list(daily_det_highs.index)
     
-    # Ensemble Box Plots
+    # --- CHART A: DAILY HIGHS / TOTAL PRECIPITATION ---
+    fig_daily_high = go.Figure()
+    
     for ens_name in ENS_ORDER:
-        if ens_name in daily_ens:
-            df_daily_m = daily_ens[ens_name]
+        if ens_name in daily_ens_highs:
+            df_m = daily_ens_highs[ens_name]
             color = MODEL_CONFIG[ens_name]["color"]
             
             for date_str in dates:
-                if date_str in df_daily_m.index:
-                    vals = df_daily_m.loc[date_str].values
-                    fig_daily.add_trace(go.Box(
+                if date_str in df_m.index:
+                    vals = df_m.loc[date_str].values
+                    fig_daily_high.add_trace(go.Box(
                         y=vals,
                         x=[date_str] * len(vals),
                         name=ens_name,
@@ -368,38 +385,85 @@ with tab2:
                         boxpoints='outliers',
                         legendgroup=ens_name,
                         showlegend=(date_str == dates[0]),
-                        hovertemplate=f"<b>{ens_name}</b><br>Date: {date_str}<br>Val: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                        hovertemplate=f"<b>{ens_name}</b><br>Date: {date_str}<br>High: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
                     ))
 
-    # Overlay Deterministic Markers
     for det_name in ["ECMWF", "GFS"]:
-        if det_name in daily_det.columns:
+        if det_name in daily_det_highs.columns:
             color = MODEL_CONFIG[det_name]["color"]
-            fig_daily.add_trace(go.Scatter(
-                x=daily_det.index,
-                y=daily_det[det_name],
+            fig_daily_high.add_trace(go.Scatter(
+                x=daily_det_highs.index,
+                y=daily_det_highs[det_name],
                 mode='markers',
                 name=f"{det_name} (Det)",
                 marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                hovertemplate=f"<b>{det_name} (Det)</b><br>Date: %{{x}}<br>Val: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                hovertemplate=f"<b>{det_name} (Det)</b><br>Date: %{{x}}<br>High: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
             ))
 
-    fig_daily.update_layout(
-        title=dict(text=f"{var_cfg['chart_title']} ({var_cfg['unit']})", font=dict(size=18)),
+    chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
+    fig_daily_high.update_layout(
+        title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
         xaxis_title="Calendar Day",
         yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
         boxmode='group',
         template="plotly_white",
-        height=550,
+        height=500,
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
-    st.plotly_chart(fig_daily, use_container_width=True)
+    st.plotly_chart(fig_daily_high, use_container_width=True)
+
+    # --- CHART B: DAILY LOWS (ONLY RENDERED FOR TEMPERATURE) ---
+    if selected_var_key == "temperature_2m" and not daily_det_lows.empty:
+        st.divider()
+        fig_daily_low = go.Figure()
+        
+        for ens_name in ENS_ORDER:
+            if ens_name in daily_ens_lows:
+                df_m_low = daily_ens_lows[ens_name]
+                color = MODEL_CONFIG[ens_name]["color"]
+                
+                for date_str in dates:
+                    if date_str in df_m_low.index:
+                        vals = df_m_low.loc[date_str].values
+                        fig_daily_low.add_trace(go.Box(
+                            y=vals,
+                            x=[date_str] * len(vals),
+                            name=ens_name,
+                            marker_color=color,
+                            boxpoints='outliers',
+                            legendgroup=ens_name,
+                            showlegend=False, # Shared legend with top chart
+                            hovertemplate=f"<b>{ens_name}</b><br>Date: {date_str}<br>Low: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                        ))
+
+        for det_name in ["ECMWF", "GFS"]:
+            if det_name in daily_det_lows.columns:
+                color = MODEL_CONFIG[det_name]["color"]
+                fig_daily_low.add_trace(go.Scatter(
+                    x=daily_det_lows.index,
+                    y=daily_det_lows[det_name],
+                    mode='markers',
+                    name=f"{det_name} (Det)",
+                    showlegend=False,
+                    marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
+                    hovertemplate=f"<b>{det_name} (Det)</b><br>Date: %{{x}}<br>Low: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                ))
+
+        fig_daily_low.update_layout(
+            title=dict(text=f"Daily Low Temperature Spread ({var_cfg['unit']})", font=dict(size=18)),
+            xaxis_title="Calendar Day",
+            yaxis_title=f"Low Temperature ({var_cfg['unit']})",
+            boxmode='group',
+            template="plotly_white",
+            height=500
+        )
+        st.plotly_chart(fig_daily_low, use_container_width=True)
 
 
 # --- TAB 3: SUMMARY DATA TABLE & CSV DOWNLOAD ---
 with tab3:
     summary_rows = []
-    dates = list(daily_det.index)
+    dates = list(daily_det_highs.index)
     
     for d in dates:
         date_obj = pd.to_datetime(d)
@@ -407,20 +471,32 @@ with tab3:
         
         # Deterministic
         for det_col in ["ECMWF", "GFS"]:
-            if det_col in daily_det.columns:
-                row[f"Det {det_col}"] = round(daily_det.loc[d, det_col], 2)
+            if det_col in daily_det_highs.columns:
+                if selected_var_key == "temperature_2m" and d in daily_det_lows.index:
+                    row[f"Det {det_col} (High/Low)"] = f"{daily_det_highs.loc[d, det_col]:.1f}° / {daily_det_lows.loc[d, det_col]:.1f}°F"
+                else:
+                    row[f"Det {det_col}"] = round(daily_det_highs.loc[d, det_col], 2)
                 
         # Individual Ensembles
         for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
-            if ens_name in daily_ens and d in daily_ens[ens_name].index:
-                vals = daily_ens[ens_name].loc[d].values
-                row[f"{ens_name} Median"] = round(float(np.median(vals)), 2)
+            if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
+                high_vals = daily_ens_highs[ens_name].loc[d].values
+                if selected_var_key == "temperature_2m" and ens_name in daily_ens_lows and d in daily_ens_lows[ens_name].index:
+                    low_vals = daily_ens_lows[ens_name].loc[d].values
+                    row[f"{ens_name} Med (H/L)"] = f"{np.median(high_vals):.1f}° / {np.median(low_vals):.1f}°F"
+                else:
+                    row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
                 
         # Grand Ensemble
-        if "Grand Ensemble" in daily_ens and d in daily_ens["Grand Ensemble"].index:
-            g_vals = daily_ens["Grand Ensemble"].loc[d].values
-            row["Grand Ens Median"] = round(float(np.median(g_vals)), 2)
-            row["Consensus IQR (25-75%)"] = f"{np.percentile(g_vals, 25):.2f} to {np.percentile(g_vals, 75):.2f} {var_cfg['unit']}"
+        if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
+            g_highs = daily_ens_highs["Grand Ensemble"].loc[d].values
+            if selected_var_key == "temperature_2m" and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
+                g_lows = daily_ens_lows["Grand Ensemble"].loc[d].values
+                row["Grand Ens Med (H/L)"] = f"{np.median(g_highs):.1f}° / {np.median(g_lows):.1f}°F"
+                row["High IQR Spread"] = f"{np.percentile(g_highs, 25):.1f}° to {np.percentile(g_highs, 75):.1f}°F"
+            else:
+                row["Grand Ens Median"] = round(float(np.median(g_highs)), 2)
+                row["Consensus IQR"] = f"{np.percentile(g_highs, 25):.2f} to {np.percentile(g_highs, 75):.2f} {var_cfg['unit']}"
             
         summary_rows.append(row)
         
