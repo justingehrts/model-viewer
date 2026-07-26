@@ -22,7 +22,7 @@ WEATHER_VARS = {
         "label": "Air Temperature",
         "unit": "°F",
         "hourly_param": "temperature_2m",
-        "daily_agg": "max",          # 'max' for daily highs, 'min' calculated separately for lows
+        "daily_agg": "max",          # 'max' for daily highs
         "chart_title": "Daily Temperature Spread"
     },
     "precipitation": {
@@ -38,14 +38,14 @@ WEATHER_VARS = {
 MODEL_CONFIG = {
     # Deterministic Operational Runs
     "ECMWF":          {"color": "#56B4E9"},  # Sky Blue
-    "GFS":            {"color": "#D55E00"},  # Vermilion
+    "GFS":            {"color": "#D55E00"},  # Vermilion / Red-Orange
     
     # Ensemble Model Families
     "EPS":            {"color": "#0072B2"},  # Blue
-    "AIFS":           {"color": "#CC79A7"},  # Purple
-    "GEFS":           {"color": "#E69F00"},  # Amber
-    "WeatherNext":    {"color": "#009E73"},  # Teal
-    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray (High contrast on both Light & Dark!)
+    "AIFS":           {"color": "#CC79A7"},  # Reddish Purple
+    "GEFS":           {"color": "#E69F00"},  # Amber / Orange
+    "WeatherNext":    {"color": "#009E73"},  # Bluish Green (Teal)
+    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray (High contrast in Light & Dark mode)
 }
 
 ENS_ORDER = ["EPS", "AIFS", "GEFS", "WeatherNext", "Grand Ensemble"]
@@ -66,7 +66,44 @@ ENS_NAME_MAP = {
 # LAYER 1: DATA INGESTION (WITH STREAMLIT CACHING & RUN TIMESTAMPS)
 # ==============================================================================
 
-@st.cache_data(ttl=900)  # 15-minute cache so fresh runs trigger updates
+@st.cache_data(ttl=900)  # 15-minute cache so fresh model runs reflect quickly
+def fetch_deterministic_data(lat, lon, days=7):
+    url = "https://api.open-meteo.com/v1/forecast"
+    models = ["ecmwf_ifs025", "gfs_seamless"]
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,precipitation",
+        "models": ",".join(models),
+        "temperature_unit": "fahrenheit",
+        "precipitation_unit": "inch",
+        "timezone": "auto",
+        "forecast_days": days
+    }
+    
+    res = requests.get(url, params=params)
+    res.raise_for_status()
+    data = res.json()
+    hourly = data["hourly"]
+    
+    df_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+    df_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+    
+    for m in models:
+        nickname = DET_NAME_MAP.get(m, m)
+        temp_key = f"temperature_2m_{m}"
+        precip_key = f"precipitation_{m}"
+        
+        if temp_key in hourly:
+            df_temp[nickname] = hourly[temp_key]
+        if precip_key in hourly:
+            df_precip[nickname] = hourly[precip_key]
+            
+    fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return df_temp, df_precip, fetch_time
+
+
+@st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
     models = ["ecmwf_ifs025", "ecmwf_aifs025", "gfs_seamless", "google_weathernext2_ensemble"]
@@ -84,7 +121,7 @@ def fetch_ensemble_data(lat, lon, days=7):
             "models": m,
             "temperature_unit": "fahrenheit",
             "precipitation_unit": "inch",
-            "timezone": "UTC",  # Kept in UTC during fetch to extract the true Z-cycle
+            "timezone": "auto",
             "forecast_days": days
         }
         
@@ -96,23 +133,19 @@ def fetch_ensemble_data(lat, lon, days=7):
         if "hourly" not in data or "time" not in data["hourly"]:
             continue
             
-        # 1. EXTRACT REAL MODEL RUN INITIALIZATION TIME
+        # Parse actual UTC model initialization time from top-level metadata
         if "model_initialization_time" in data and data["model_initialization_time"]:
             init_dt = pd.to_datetime(data["model_initialization_time"])
             run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
-        else:
-            # Fallback: Open-Meteo ensemble hourly array start hour in UTC
-            first_utc_time = pd.to_datetime(data["hourly"]["time"][0])
-            run_cycles[nickname] = first_utc_time.strftime("%m/%d %HZ")
+        elif "hourly" in data and "time" in data["hourly"]:
+            # Fallback: Parse start time adjusted by UTC offset
+            offset_sec = data.get("utc_offset_seconds", 0)
+            first_time_utc = pd.to_datetime(data["hourly"]["time"][0]) - pd.Timedelta(seconds=offset_sec)
+            run_cycles[nickname] = first_time_utc.strftime("%m/%d %HZ")
             
         hourly = data["hourly"]
-        
-        # 2. CONVERT TIMESTAMPS TO LOCAL TIME AFTER EXTRACTING UTC RUN CYCLE
-        # Convert UTC array to local timezone matching lat/lon
-        df_time_local = pd.to_datetime(hourly["time"], utc=True).dt.tz_convert("America/New_York").dt.tz_localize(None)
-        
-        df_m_temp = pd.DataFrame({"time": df_time_local})
-        df_m_precip = pd.DataFrame({"time": df_time_local})
+        df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+        df_m_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
         
         temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
         precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
@@ -159,7 +192,7 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
             df_summary['q75'] = df[member_cols].quantile(0.75, axis=1)
             hourly_summaries[name] = df_summary
 
-    # 3. Compute Daily Calendar Aggregations (Highs & Lows for Temp, Sum for Precip)
+    # 3. Compute Daily Calendar Aggregations
     daily_ens_highs = {}
     daily_ens_lows = {}
     
@@ -319,14 +352,13 @@ with tab1:
                 hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{ens_name} (Median)</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
             ))
 
-    # Remove template="plotly_white" so Plotly inherits Streamlit's theme!
     fig_hourly.update_layout(
-    title=dict(text=f"Hourly {var_cfg['label']} Trajectory ({var_cfg['unit']})", font=dict(size=18)),
-    xaxis_title="Date / Time (Local)",
-    yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
-    hovermode="x unified",
-    height=550,
-    legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
+        title=dict(text=f"Hourly {var_cfg['label']} Trajectory ({var_cfg['unit']})", font=dict(size=18)),
+        xaxis_title="Date / Time (Local)",
+        yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
+        hovermode="x unified",
+        height=550,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
     st.plotly_chart(fig_hourly, use_container_width=True)
 
@@ -375,7 +407,6 @@ with tab2:
         xaxis_title="Calendar Day",
         yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
         boxmode='group',
-        template="plotly_white",
         height=500,
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
@@ -423,7 +454,6 @@ with tab2:
             xaxis_title="Calendar Day",
             yaxis_title=f"Low Temperature ({var_cfg['unit']})",
             boxmode='group',
-            template="plotly_white",
             height=500
         )
         st.plotly_chart(fig_daily_low, use_container_width=True)
@@ -456,7 +486,7 @@ with tab3:
                 else:
                     row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
                 
-        # 3. Grand Ensemble Master Consensus (Low / High + High IQR Spread)
+        # 3. Grand Ensemble Master Consensus (Low / High)
         if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
             g_highs = daily_ens_highs["Grand Ensemble"].loc[d].values
             if selected_var_key == "temperature_2m" and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
