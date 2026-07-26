@@ -36,24 +36,18 @@ WEATHER_VARS = {
 
 # Color Vision Deficiency (CVD) Safe Palette
 MODEL_CONFIG = {
-    # Deterministic Operational Runs
-    "ECMWF":          {"color": "#56B4E9"},  # Sky Blue
-    "GFS":            {"color": "#D55E00"},  # Vermilion
+    # Deterministic Operational Run
+    "Deterministic":  {"color": "#D55E00"},  # Vermilion
     
     # Ensemble Model Families
     "EPS":            {"color": "#0072B2"},  # Blue
     "AIFS":           {"color": "#CC79A7"},  # Purple
     "GEFS":           {"color": "#E69F00"},  # Amber
     "WeatherNext":    {"color": "#009E73"},  # Teal
-    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray (High contrast in Light & Dark mode)
+    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray
 }
 
 ENS_ORDER = ["EPS", "AIFS", "GEFS", "WeatherNext", "Grand Ensemble"]
-
-DET_NAME_MAP = {
-    "ecmwf_ifs025": "ECMWF",
-    "gfs_seamless": "GFS"
-}
 
 ENS_NAME_MAP = {
     "ecmwf_ifs025": "EPS",
@@ -63,67 +57,54 @@ ENS_NAME_MAP = {
 }
 
 # ==============================================================================
-# LAYER 1: DATA INGESTION (SAFE MULTI-QUERY FETCH)
+# LAYER 1: DATA INGESTION
 # ==============================================================================
 
 @st.cache_data(ttl=900)  # 15-minute cache
 def fetch_deterministic_data(lat, lon, days=7):
+    """Fetches high-resolution blended operational deterministic run."""
     url = "https://api.open-meteo.com/v1/forecast"
-    models = ["ecmwf_ifs025", "gfs_seamless"]
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,precipitation",
+        "temperature_unit": "fahrenheit",
+        "precipitation_unit": "inch",
+        "timezone": "auto",
+        "forecast_days": days
+    }
     
-    df_temp = None
-    df_precip = None
-    
-    for m in models:
-        nickname = DET_NAME_MAP.get(m, m)
-        params = {
-            "latitude": lat,
-            "longitude": lon,
-            "hourly": "temperature_2m,precipitation",
-            "models": m,
-            "temperature_unit": "fahrenheit",
-            "precipitation_unit": "inch",
-            "timezone": "auto",
-            "forecast_days": days
-        }
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()
         
-        try:
-            res = requests.get(url, params=params, timeout=10)
-            if res.status_code == 200:
-                data = res.json()
-                if "hourly" in data and "time" in data["hourly"]:
-                    hourly = data["hourly"]
-                    
-                    if df_temp is None:
-                        df_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-                        df_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-                        
-                    temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
-                    precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
-                    
-                    if temp_keys:
-                        df_temp[nickname] = hourly[temp_keys[0]]
-                    if precip_keys:
-                        df_precip[nickname] = hourly[precip_keys[0]]
-        except Exception:
-            continue
-            
-    if df_temp is None:
-        df_temp = pd.DataFrame(columns=["time"])
-        df_precip = pd.DataFrame(columns=["time"])
-
-    fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return df_temp, df_precip, fetch_time
+        hourly = data["hourly"]
+        df_temp = pd.DataFrame({
+            "time": pd.to_datetime(hourly["time"]),
+            "Deterministic": hourly["temperature_2m"]
+        })
+        df_precip = pd.DataFrame({
+            "time": pd.to_datetime(hourly["time"]),
+            "Deterministic": hourly["precipitation"]
+        })
+        
+        fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return df_temp, df_precip, fetch_time, None
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), "", str(e)
 
 
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
+    """Fetches 197 probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext."""
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
     models = ["ecmwf_ifs025", "ecmwf_aifs025", "gfs_seamless", "google_weathernext2_ensemble"]
     
     dict_temp = {}
     dict_precip = {}
     run_cycles = {}
+    errors = []
     
     for m in models:
         nickname = ENS_NAME_MAP.get(m, m)
@@ -141,12 +122,14 @@ def fetch_ensemble_data(lat, lon, days=7):
         try:
             res = requests.get(url, params=params, timeout=15)
             if res.status_code != 200:
+                errors.append(f"{nickname}: HTTP {res.status_code}")
                 continue
                 
             data = res.json()
             if "hourly" not in data or "time" not in data["hourly"]:
                 continue
                 
+            # Parse model initialization run cycle timestamp
             if "model_initialization_time" in data and data["model_initialization_time"]:
                 init_dt = pd.to_datetime(data["model_initialization_time"])
                 run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
@@ -172,10 +155,11 @@ def fetch_ensemble_data(lat, lon, days=7):
                 
             dict_temp[nickname] = df_m_temp
             dict_precip[nickname] = df_m_precip
-        except Exception:
+        except Exception as e:
+            errors.append(f"{nickname}: {str(e)}")
             continue
         
-    return dict_temp, dict_precip, run_cycles
+    return dict_temp, dict_precip, run_cycles, errors
 
 # ==============================================================================
 # LAYER 2 & 3: PROCESSING & GRAND ENSEMBLE BUILDER
@@ -269,12 +253,12 @@ with st.sidebar:
 
 # Fetch Pre-Cached Datasets
 with st.spinner("Fetching multi-model ensemble payloads..."):
-    df_det_temp, df_det_precip, fetch_time = fetch_deterministic_data(lat, lon, days=forecast_days)
-    dict_ens_temp, dict_ens_precip, run_cycles = fetch_ensemble_data(lat, lon, days=forecast_days)
+    df_det_temp, df_det_precip, fetch_time, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
+    dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
 
-# Safety Check
-if df_det_temp.empty or "time" not in df_det_temp.columns:
-    st.error("⚠️ Unable to connect to Open-Meteo API. Please click 'Refresh Data' or try again in a few moments.")
+# Handle API Error Diagnostics
+if det_err or df_det_temp.empty:
+    st.error(f"⚠️ Unable to fetch deterministic weather data from Open-Meteo. Details: `{det_err}`")
     st.stop()
 
 # Display Run Information in Sidebar
@@ -339,17 +323,16 @@ tab1, tab2, tab3 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution 
 with tab1:
     fig_hourly = go.Figure()
     
-    for det_name in ["ECMWF", "GFS"]:
-        if det_name in df_det_active.columns:
-            color = MODEL_CONFIG[det_name]["color"]
-            fig_hourly.add_trace(go.Scatter(
-                x=df_det_active['time'],
-                y=df_det_active[det_name],
-                mode='lines',
-                name=f"{det_name} (Det)",
-                line=dict(color=color, width=3),
-                hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{det_name} (Det)</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
-            ))
+    if "Deterministic" in df_det_active.columns:
+        color = MODEL_CONFIG["Deterministic"]["color"]
+        fig_hourly.add_trace(go.Scatter(
+            x=df_det_active['time'],
+            y=df_det_active["Deterministic"],
+            mode='lines',
+            name="Deterministic Operational Run",
+            line=dict(color=color, width=3),
+            hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>Deterministic Run</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+        ))
             
     for ens_name in ENS_ORDER:
         if ens_name in hourly_summaries:
@@ -403,17 +386,16 @@ with tab2:
                         hovertemplate=f"<b>{ens_name}</b><br>Date: {date_str}<br>High: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
                     ))
 
-    for det_name in ["ECMWF", "GFS"]:
-        if det_name in daily_det_highs.columns:
-            color = MODEL_CONFIG[det_name]["color"]
-            fig_daily_high.add_trace(go.Scatter(
-                x=daily_det_highs.index,
-                y=daily_det_highs[det_name],
-                mode='markers',
-                name=f"{det_name} (Det)",
-                marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                hovertemplate=f"<b>{det_name} (Det)</b><br>Date: %{{x}}<br>High: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
-            ))
+    if "Deterministic" in daily_det_highs.columns:
+        color = MODEL_CONFIG["Deterministic"]["color"]
+        fig_daily_high.add_trace(go.Scatter(
+            x=daily_det_highs.index,
+            y=daily_det_highs["Deterministic"],
+            mode='markers',
+            name="Deterministic Operational Run",
+            marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
+            hovertemplate=f"<b>Deterministic Run</b><br>Date: %{{x}}<br>High: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+        ))
 
     chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
     fig_daily_high.update_layout(
@@ -449,18 +431,17 @@ with tab2:
                             hovertemplate=f"<b>{ens_name}</b><br>Date: {date_str}<br>Low: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
                         ))
 
-        for det_name in ["ECMWF", "GFS"]:
-            if det_name in daily_det_lows.columns:
-                color = MODEL_CONFIG[det_name]["color"]
-                fig_daily_low.add_trace(go.Scatter(
-                    x=daily_det_lows.index,
-                    y=daily_det_lows[det_name],
-                    mode='markers',
-                    name=f"{det_name} (Det)",
-                    showlegend=False,
-                    marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                    hovertemplate=f"<b>{det_name} (Det)</b><br>Date: %{{x}}<br>Low: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
-                ))
+        if "Deterministic" in daily_det_lows.columns:
+            color = MODEL_CONFIG["Deterministic"]["color"]
+            fig_daily_low.add_trace(go.Scatter(
+                x=daily_det_lows.index,
+                y=daily_det_lows["Deterministic"],
+                mode='markers',
+                name="Deterministic Operational Run",
+                showlegend=False,
+                marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
+                hovertemplate=f"<b>Deterministic Run</b><br>Date: %{{x}}<br>Low: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+            ))
 
         fig_daily_low.update_layout(
             title=dict(text=f"Daily Low Temperature Spread ({var_cfg['unit']})", font=dict(size=18)),
@@ -481,12 +462,11 @@ with tab3:
         date_obj = pd.to_datetime(d)
         row = {"Date": date_obj.strftime("%a %b %d, %Y")}
         
-        for det_col in ["ECMWF", "GFS"]:
-            if det_col in daily_det_highs.columns:
-                if selected_var_key == "temperature_2m" and d in daily_det_lows.index:
-                    row[f"Det {det_col} (L/H)"] = f"{daily_det_lows.loc[d, det_col]:.1f}° / {daily_det_highs.loc[d, det_col]:.1f}°F"
-                else:
-                    row[f"Det {det_col}"] = round(daily_det_highs.loc[d, det_col], 2)
+        if "Deterministic" in daily_det_highs.columns:
+            if selected_var_key == "temperature_2m" and d in daily_det_lows.index:
+                row["Deterministic (L/H)"] = f"{daily_det_lows.loc[d, 'Deterministic']:.1f}° / {daily_det_highs.loc[d, 'Deterministic']:.1f}°F"
+            else:
+                row["Deterministic"] = round(daily_det_highs.loc[d, 'Deterministic'], 2)
                 
         for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
             if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
