@@ -464,6 +464,7 @@ with tab1:
 with tab2:
     dates = list(daily_det_highs.index)
     
+    # 1. HIGH TEMPERATURE / PRECIPITATION CHART
     fig_daily_high = go.Figure()
     
     for ens_name in ENS_ORDER:
@@ -471,19 +472,26 @@ with tab2:
             df_m = daily_ens_highs[ens_name]
             color = MODEL_CONFIG[ens_name]["color"]
             
+            # Combine all dates into a single trace per model to enable proper day grouping
+            x_vals = []
+            y_vals = []
             for date_str in dates:
                 if date_str in df_m.index:
                     vals = df_m.loc[date_str].values
-                    fig_daily_high.add_trace(go.Box(
-                        y=vals,
-                        x=[date_str] * len(vals),
-                        name=ens_name,
-                        marker_color=color,
-                        boxpoints='outliers',
-                        legendgroup=ens_name,
-                        showlegend=(date_str == dates[0]),
-                        hoverinfo="y+name"  # ONLY shows trace name & exact numerical value
-                    ))
+                    x_vals.extend([date_str] * len(vals))
+                    y_vals.extend(vals)
+                    
+            fig_daily_high.add_trace(go.Box(
+                x=x_vals,
+                y=y_vals,
+                name=ens_name,
+                marker_color=color,
+                line=dict(width=2),        # Thicker box borders
+                whiskerwidth=0.8,          # Wider top/bottom cap whiskers
+                boxpoints='outliers',
+                legendgroup=ens_name,
+                hoverinfo="y+name"
+            ))
 
     if "Deterministic" in daily_det_highs.columns:
         color = MODEL_CONFIG["Deterministic"]["color"]
@@ -502,13 +510,14 @@ with tab2:
         xaxis_title="Calendar Day",
         yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
         boxmode='group',
-        boxgap=0,           # Eliminates outer gap between day columns
-        boxgroupgap=0,      # Eliminates inner gap between model boxes to maximize width
+        boxgap=0.3,             # LARGE gap between days to clearly separate dates
+        boxgroupgap=0.08,        # SMALL gap between models within the same day
         height=520,
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
     st.plotly_chart(fig_daily_high, use_container_width=True)
 
+    # 2. LOW TEMPERATURE CHART
     if selected_var_key == "temperature_2m" and not daily_det_lows.empty:
         st.divider()
         fig_daily_low = go.Figure()
@@ -518,19 +527,26 @@ with tab2:
                 df_m_low = daily_ens_lows[ens_name]
                 color = MODEL_CONFIG[ens_name]["color"]
                 
+                x_vals_low = []
+                y_vals_low = []
                 for date_str in dates:
                     if date_str in df_m_low.index:
                         vals = df_m_low.loc[date_str].values
-                        fig_daily_low.add_trace(go.Box(
-                            y=vals,
-                            x=[date_str] * len(vals),
-                            name=ens_name,
-                            marker_color=color,
-                            boxpoints='outliers',
-                            legendgroup=ens_name,
-                            showlegend=False,
-                            hoverinfo="y+name"
-                        ))
+                        x_vals_low.extend([date_str] * len(vals))
+                        y_vals_low.extend(vals)
+                        
+                fig_daily_low.add_trace(go.Box(
+                    x=x_vals_low,
+                    y=y_vals_low,
+                    name=ens_name,
+                    marker_color=color,
+                    line=dict(width=2),    # Thicker box borders
+                    whiskerwidth=0.8,      # Wider cap whiskers
+                    boxpoints='outliers',
+                    legendgroup=ens_name,
+                    showlegend=False,
+                    hoverinfo="y+name"
+                ))
 
         if "Deterministic" in daily_det_lows.columns:
             color = MODEL_CONFIG["Deterministic"]["color"]
@@ -549,8 +565,8 @@ with tab2:
             xaxis_title="Calendar Day",
             yaxis_title=f"Low Temperature ({var_cfg['unit']})",
             boxmode='group',
-            boxgap=0,
-            boxgroupgap=0,
+            boxgap=0.3,         # LARGE gap between days
+            boxgroupgap=0.08,    # SMALL gap between models within day
             height=520
         )
         st.plotly_chart(fig_daily_low, use_container_width=True)
