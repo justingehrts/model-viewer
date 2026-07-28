@@ -34,7 +34,7 @@ WEATHER_VARS = {
     }
 }
 
-# Color Vision Deficiency (CVD) Safe Palette
+# Color Vision Deficiency (CVD) Safe Palette (Okabe-Ito Inspired)
 MODEL_CONFIG = {
     # Deterministic Operational Run
     "Deterministic":  {"color": "#D55E00"},  # Vermilion
@@ -44,7 +44,7 @@ MODEL_CONFIG = {
     "AIFS":           {"color": "#CC79A7"},  # Purple
     "GEFS":           {"color": "#E69F00"},  # Amber
     "WeatherNext":    {"color": "#009E73"},  # Teal
-    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray
+    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray (Contrast in Light & Dark)
 }
 
 ENS_ORDER = ["EPS", "AIFS", "GEFS", "WeatherNext", "Grand Ensemble"]
@@ -57,18 +57,18 @@ ENS_NAME_MAP = {
 }
 
 # ==============================================================================
-# LAYER 1: DATA INGESTION
+# HELPER: AIRPORT GEOCODING LOOKUP
 # ==============================================================================
 
-@st.cache_data(ttl=86400) # Cache airport locations for 24 hours
+@st.cache_data(ttl=86400)  # Cache airport lookups for 24 hours
 def get_coordinates_from_airport(airport_code):
-    """
-    Looks up latitude/longitude for airport ICAO/IATA codes (e.g. KCMH, CMH)
-    using the free NOAA Aviation Weather Center API.
-    """
+    """Looks up lat/lon for ICAO/IATA airport codes (e.g., KCMH, CMH) via NOAA + Open-Meteo."""
     code = airport_code.strip().upper()
+    if not code:
+        return 39.99, -82.89, "Port Columbus Intl (KCMH)"
+        
+    # 1. Try NOAA Aviation Weather Center
     url = f"https://aviationweather.gov/api/data/stationinfo?ids={code}&format=json"
-    
     try:
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
@@ -78,11 +78,12 @@ def get_coordinates_from_airport(airport_code):
                 lat = station.get("lat")
                 lon = station.get("lon")
                 name = station.get("site", code)
-                return lat, lon, name
+                if lat is not None and lon is not None:
+                    return lat, lon, name
     except Exception:
         pass
         
-    # Fallback to Open-Meteo Geocoding API
+    # 2. Fallback to Open-Meteo Geocoding API
     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={code}&count=1"
     try:
         res = requests.get(geo_url, timeout=5)
@@ -94,8 +95,12 @@ def get_coordinates_from_airport(airport_code):
     except Exception:
         pass
 
-    return None, None, None
-    
+    return 39.99, -82.89, f"Default Location (KCMH)"
+
+# ==============================================================================
+# LAYER 1: DATA INGESTION
+# ==============================================================================
+
 @st.cache_data(ttl=900)  # 15-minute cache
 def fetch_deterministic_data(lat, lon, days=7):
     """Fetches high-resolution blended operational deterministic run."""
@@ -165,7 +170,7 @@ def fetch_ensemble_data(lat, lon, days=7):
             if "hourly" not in data or "time" not in data["hourly"]:
                 continue
                 
-            # Parse model initialization run cycle timestamp
+            # Parse actual model initialization run cycle timestamp
             if "model_initialization_time" in data and data["model_initialization_time"]:
                 init_dt = pd.to_datetime(data["model_initialization_time"])
                 run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
@@ -261,7 +266,7 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
     return hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows
 
 # ==============================================================================
-# STREAMLIT UI & SIDEBAR (WITH FORM WRAPPER & NO WIDGET CONFLICTS)
+# STREAMLIT UI & SIDEBAR
 # ==============================================================================
 
 st.title("🌤️ Multi-Model Ensemble Weather Consensus Dashboard")
@@ -270,20 +275,15 @@ st.markdown("Comparing deterministic operational runs against **197 probabilisti
 with st.sidebar:
     st.header("⚙️ Location & Forecast Controls")
     
-    # 1. BATCH CONTROLS INSIDE A FORM TO PREVENT RATE LIMIT BURSTS
+    # Batch inputs inside a form to prevent API rate bursts while typing
     with st.form("forecast_controls_form"):
         loc_mode = st.radio("Location Mode", ["Airport Code", "Manual Lat/Lon"], horizontal=True)
         
         if loc_mode == "Airport Code":
             airport_input = st.text_input("Airport Code (ICAO / IATA)", value="KCMH").strip().upper()
             auto_lat, auto_lon, station_name = get_coordinates_from_airport(airport_input)
-            
-            if auto_lat is not None and auto_lon is not None:
-                lat, lon = auto_lat, auto_lon
-                st.caption(f"📍 **{station_name}** ({lat:.2f}°, {lon:.2f}°)")
-            else:
-                st.caption("⚠️ Station not found. Defaulting to KCMH (39.99°, -82.89°)")
-                lat, lon = 39.99, -82.89
+            lat, lon = auto_lat, auto_lon
+            st.caption(f"📍 **{station_name}** ({lat:.2f}°, {lon:.2f}°)")
         else:
             lat = st.number_input("Latitude", value=39.97, step=0.01, format="%.2f")
             lon = st.number_input("Longitude", value=-83.00, step=0.01, format="%.2f")
@@ -296,16 +296,47 @@ with st.sidebar:
             format_func=lambda x: WEATHER_VARS[x]["label"]
         )
         
-        # Must be st.form_submit_button INSIDE a form
         submitted = st.form_submit_button("🚀 Load / Update Forecast", use_container_width=True)
 
     var_cfg = WEATHER_VARS[selected_var_key]
     
-    # 2. STANDALONE BUTTON OUTSIDE THE FORM
+    # Standalone Refresh button outside the form
     st.divider()
     if st.button("🔄 Force Clear Cache & Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
+
+# Fetch Pre-Cached Datasets
+with st.spinner("Fetching multi-model ensemble payloads..."):
+    df_det_temp, df_det_precip, fetch_time, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
+    dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
+
+# Handle API Error Diagnostics
+if det_err or df_det_temp.empty:
+    st.error(f"⚠️ Unable to fetch weather data from Open-Meteo. Details: `{det_err}`")
+    st.stop()
+
+# Display Run Information in Sidebar
+with st.sidebar:
+    st.caption(f"🕒 **Last API Fetch:** {fetch_time}")
+    st.markdown("**Model Run Cycles Loaded:**")
+    for model_name, cycle_str in run_cycles.items():
+        st.text(f"• {model_name:<12}: {cycle_str}")
+
+# Select Payload based on Dropdown
+if selected_var_key == "temperature_2m":
+    df_det_active = df_det_temp
+    dict_ens_active = dict_ens_temp
+else:
+    df_det_active = df_det_precip
+    dict_ens_active = dict_ens_precip
+
+# Process Data dynamically
+hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows = process_ensemble_data(
+    dict_ens_active, 
+    df_det_active, 
+    selected_var_key=selected_var_key
+)
 
 # ==============================================================================
 # KEY METRICS SUMMARY CARDS
