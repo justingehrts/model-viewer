@@ -45,7 +45,7 @@ MODEL_CONFIG = {
     "AIFS":           {"color": "#CC79A7"},  # Purple
     "GEFS":           {"color": "#E69F00"},  # Amber
     "WeatherNext":    {"color": "#009E73"},  # Teal
-    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray (Contrast in Light & Dark)
+    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray
 }
 
 ENS_ORDER = ["EPS", "AIFS", "GEFS", "WeatherNext", "Grand Ensemble"]
@@ -58,17 +58,50 @@ ENS_NAME_MAP = {
 }
 
 # ==============================================================================
-# HELPER: AIRPORT GEOCODING LOOKUP
+# HELPER 1: DEV MOCK DATA GENERATOR (OFFLINE / 0 API CALLS)
 # ==============================================================================
 
-@st.cache_data(ttl=86400)  # Cache airport lookups for 24 hours
+def generate_mock_data(days=7):
+    """Generates synthetic hourly weather data so you can test layout/charts offline."""
+    now = datetime.now()
+    dates = pd.date_range(start=now, periods=days * 24, freq='h')
+    
+    # Generate realistic diurnal temperature curve (60°F to 80°F)
+    base_temp = 70 + 10 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
+    
+    df_det_temp = pd.DataFrame({'time': dates, 'Deterministic': base_temp})
+    df_det_precip = pd.DataFrame({'time': dates, 'Deterministic': np.zeros(len(dates))})
+    
+    dict_ens_temp = {}
+    dict_ens_precip = {}
+    run_cycles = {}
+    
+    for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
+        df_t = pd.DataFrame({'time': dates})
+        df_p = pd.DataFrame({'time': dates})
+        
+        # Add synthetic ensemble member variation
+        for m in range(1, 31):
+            df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
+            df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
+            
+        dict_ens_temp[nickname] = df_t
+        dict_ens_precip[nickname] = df_p
+        run_cycles[nickname] = "DEV-MOCK 00Z"
+        
+    return df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles
+
+# ==============================================================================
+# HELPER 2: AIRPORT GEOCODING LOOKUP
+# ==============================================================================
+
+@st.cache_data(ttl=86400)
 def get_coordinates_from_airport(airport_code):
     """Looks up lat/lon for ICAO/IATA airport codes (e.g., KCMH, CMH) via NOAA + Open-Meteo."""
     code = airport_code.strip().upper()
     if not code:
         return 39.99, -82.89, "Port Columbus Intl (KCMH)"
         
-    # 1. Try NOAA Aviation Weather Center
     url = f"https://aviationweather.gov/api/data/stationinfo?ids={code}&format=json"
     try:
         res = requests.get(url, timeout=5)
@@ -84,7 +117,6 @@ def get_coordinates_from_airport(airport_code):
     except Exception:
         pass
         
-    # 2. Fallback to Open-Meteo Geocoding API
     geo_url = f"https://geocoding-api.open-meteo.com/v1/search?name={code}&count=1"
     try:
         res = requests.get(geo_url, timeout=5)
@@ -96,44 +128,13 @@ def get_coordinates_from_airport(airport_code):
     except Exception:
         pass
 
-    return 39.99, -82.89, f"Default Location (KCMH)"
-
-# ==============================================================================
-# DEV MOCK DATA GENERATOR (OFFLINE / ZERO API CALLS)
-# ==============================================================================
-
-def generate_mock_data(days=7):
-    """Generates synthetic hourly weather data so you can test layout/charts offline."""
-    now = datetime.now()
-    dates = pd.date_range(start=now, periods=days * 24, freq='h')
-    base_temp = 70 + 10 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
-    
-    df_det_temp = pd.DataFrame({'time': dates, 'Deterministic': base_temp})
-    df_det_precip = pd.DataFrame({'time': dates, 'Deterministic': np.zeros(len(dates))})
-    
-    dict_ens_temp = {}
-    dict_ens_precip = {}
-    run_cycles = {}
-    
-    for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
-        df_t = pd.DataFrame({'time': dates})
-        df_p = pd.DataFrame({'time': dates})
-        for m in range(1, 31):
-            df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
-            df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
-            
-        dict_ens_temp[nickname] = df_t
-        dict_ens_precip[nickname] = df_p
-        run_cycles[nickname] = "DEV-MOCK 00Z"
-        
-    return df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles
-
+    return 39.99, -82.89, "Default Location (KCMH)"
 
 # ==============================================================================
 # LAYER 1: LIVE DATA INGESTION (CACHED FOR 15 MINUTES)
 # ==============================================================================
 
-@st.cache_data(ttl=900)  # <-- YOUR 15-MINUTE CACHE IS RIGHT HERE!
+@st.cache_data(ttl=900)
 def fetch_deterministic_data(lat, lon, days=7):
     """Fetches high-resolution blended operational deterministic run."""
     url = "https://api.open-meteo.com/v1/forecast"
@@ -168,7 +169,7 @@ def fetch_deterministic_data(lat, lon, days=7):
         return pd.DataFrame(), pd.DataFrame(), "", str(e)
 
 
-@st.cache_data(ttl=900)  # <-- AND HERE FOR ENSEMBLES!
+@st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
     """Fetches 197 probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext."""
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
@@ -194,12 +195,6 @@ def fetch_ensemble_data(lat, lon, days=7):
         
         try:
             res = requests.get(url, params=params, timeout=15)
-            
-            # If rate limited, pause and notify gracefully instead of crashing
-            if res.status_code == 429:
-                errors.append(f"{nickname}: Rate limit hit (HTTP 429)")
-                continue
-                
             if res.status_code != 200:
                 errors.append(f"{nickname}: HTTP {res.status_code}")
                 continue
@@ -233,10 +228,9 @@ def fetch_ensemble_data(lat, lon, days=7):
                 
             dict_temp[nickname] = df_m_temp
             dict_precip[nickname] = df_m_precip
-            
-            # Micro-pause between model calls to avoid bursting the per-second rate limit
-            time.sleep(0.15)
-            
+
+            time.sleep(0.15)  # Micro-pause to prevent rate-limit bursts
+
         except Exception as e:
             errors.append(f"{nickname}: {str(e)}")
             continue
@@ -317,9 +311,7 @@ with st.sidebar:
     st.header("⚙️ Location & Forecast Controls")
     
     with st.form("forecast_controls_form"):
-        # ADD THIS TOGGLE:
         dev_mode = st.toggle("🛠️ Dev Mode (Use Offline Mock Data)", value=False)
-        
         loc_mode = st.radio("Location Mode", ["Airport Code", "Manual Lat/Lon"], horizontal=True)
         
         if loc_mode == "Airport Code":
@@ -343,20 +335,30 @@ with st.sidebar:
 
     var_cfg = WEATHER_VARS[selected_var_key]
     
-    # Standalone Refresh button outside the form
     st.divider()
     if st.button("🔄 Force Clear Cache & Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-# Fetch Pre-Cached Datasets
-with st.spinner("Fetching multi-model ensemble payloads..."):
-    df_det_temp, df_det_precip, fetch_time, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
-    dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
+# ==============================================================================
+# ROUTING: DEV MODE VS LIVE FETCH
+# ==============================================================================
 
-# Handle API Error Diagnostics
-if det_err or df_det_temp.empty:
+if dev_mode:
+    # 0 API Calls — Instant offline render with synthetic data
+    df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles = generate_mock_data(days=forecast_days)
+    fetch_time = "OFFLINE DEV MODE"
+    det_err = None
+else:
+    # Real live network calls to Open-Meteo
+    with st.spinner("Fetching multi-model ensemble payloads..."):
+        df_det_temp, df_det_precip, fetch_time, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
+        dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
+
+# Safety Check (ONLY runs if Dev Mode is OFF)
+if not dev_mode and (det_err or df_det_temp.empty):
     st.error(f"⚠️ Unable to fetch weather data from Open-Meteo. Details: `{det_err}`")
+    st.info("💡 **Tip:** Switch on '🛠️ Dev Mode' in the sidebar to test layout & charts offline without hitting API rate limits.")
     st.stop()
 
 # Display Run Information in Sidebar
@@ -381,17 +383,6 @@ hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lo
     selected_var_key=selected_var_key
 )
 
-if dev_mode:
-    # 0 API Calls — Instant render with offline synthetic data!
-    df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles = generate_mock_data(days=forecast_days)
-    fetch_time = "OFFLINE DEV MODE"
-    det_err = None
-else:
-    # Real live network calls to Open-Meteo
-    with st.spinner("Fetching multi-model ensemble payloads..."):
-        df_det_temp, df_det_precip, fetch_time, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
-        dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
-        
 # ==============================================================================
 # KEY METRICS SUMMARY CARDS
 # ==============================================================================
