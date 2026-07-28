@@ -284,6 +284,16 @@ st.title("🌤️ Multi-Model Ensemble Weather Consensus Dashboard")
 st.markdown("Comparing deterministic operational runs against **197 probabilistic ensemble members** across European (ECMWF/EPS/AIFS), American (GFS/GEFS), and AI (Google WeatherNext 2) forecasting systems.")
 
 with st.sidebar:
+
+    dev_mode = st.sidebar.toggle("🛠️ Dev Mode (Use Offline Mock Data)")
+
+if dev_mode:
+    # Return fake local dataframes instantly — 0 API calls!
+    df_det_temp, dict_ens_temp = load_offline_mock_data()
+else:
+    # Fetch real live data from Open-Meteo
+    df_det_temp, dict_ens_temp, run_cycles = fetch_ensemble_data(lat, lon)
+    
     st.header("⚙️ Location & Forecast Controls")
     
     # Batch inputs inside a form to prevent API rate bursts while typing
