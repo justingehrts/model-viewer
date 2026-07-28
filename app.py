@@ -482,7 +482,7 @@ with tab2:
                         boxpoints='outliers',
                         legendgroup=ens_name,
                         showlegend=(date_str == dates[0]),
-                        hovertemplate=f"<b>{ens_name}</b><br>Date: {date_str}<br>High: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                        hovertemplate=f"<b>{ens_name} High</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
                     ))
 
     if "Deterministic" in daily_det_highs.columns:
@@ -493,7 +493,7 @@ with tab2:
             mode='markers',
             name="Deterministic Operational Run",
             marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-            hovertemplate=f"<b>Deterministic Run</b><br>Date: %{{x}}<br>High: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+            hovertemplate=f"<b>Deterministic High</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
         ))
 
     chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
@@ -502,7 +502,9 @@ with tab2:
         xaxis_title="Calendar Day",
         yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
         boxmode='group',
-        height=500,
+        boxgap=0.15,          # Controls gap between day groups (makes boxes wider)
+        boxgroupgap=0.05,     # Controls gap between model boxes within a day
+        height=520,
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
     st.plotly_chart(fig_daily_high, use_container_width=True)
@@ -527,7 +529,7 @@ with tab2:
                             boxpoints='outliers',
                             legendgroup=ens_name,
                             showlegend=False,
-                            hovertemplate=f"<b>{ens_name}</b><br>Date: {date_str}<br>Low: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                            hovertemplate=f"<b>{ens_name} Low</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
                         ))
 
         if "Deterministic" in daily_det_lows.columns:
@@ -539,7 +541,7 @@ with tab2:
                 name="Deterministic Operational Run",
                 showlegend=False,
                 marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                hovertemplate=f"<b>Deterministic Run</b><br>Date: %{{x}}<br>Low: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                hovertemplate=f"<b>Deterministic Low</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
             ))
 
         fig_daily_low.update_layout(
@@ -547,11 +549,12 @@ with tab2:
             xaxis_title="Calendar Day",
             yaxis_title=f"Low Temperature ({var_cfg['unit']})",
             boxmode='group',
-            height=500
+            boxgap=0.15,
+            boxgroupgap=0.05,
+            height=520
         )
         st.plotly_chart(fig_daily_low, use_container_width=True)
-
-
+        
 # --- TAB 3: SUMMARY DATA TABLE & CSV DOWNLOAD ---
 with tab3:
     summary_rows = []
