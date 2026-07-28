@@ -123,15 +123,17 @@ def generate_mock_data(days=7):
     for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
         df_t = pd.DataFrame({'time': dates})
         df_p = pd.DataFrame({'time': dates})
+        
         # Add random ensemble member noise
         for m in range(1, 31):
             df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
             df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
-        dict_temp[nickname] = df_t
-        dict_precip[nickname] = df_p
-        run_cycles[nickname] = "DEV-MOCK"
+            
+        dict_ens_temp[nickname] = df_t
+        dict_ens_precip[nickname] = df_p
+        run_cycles[nickname] = "DEV-MOCK 00Z"
         
-    return df_det_temp, df_det_precip, dict_temp, dict_precip, run_cycles
+    return df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles
 
 # ACTUAL DATA INGESTION
 
