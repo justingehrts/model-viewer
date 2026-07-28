@@ -267,29 +267,16 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
 st.title("🌤️ Multi-Model Ensemble Weather Consensus Dashboard")
 st.markdown("Comparing deterministic operational runs against **197 probabilistic ensemble members** across European (ECMWF/EPS/AIFS), American (GFS/GEFS), and AI (Google WeatherNext 2) forecasting systems.")
 
-with st.sidebar:
+with st.sidebar.form("forecast_controls"):
     st.header("⚙️ Location & Horizon")
-    
     loc_mode = st.radio("Location Mode", ["Airport Code", "Manual Lat/Lon"], horizontal=True)
-    
-    if loc_mode == "Airport Code":
-        airport_input = st.text_input("Airport Code (ICAO / IATA)", value="KCMH").strip().upper()
-        
-        # Resolve Airport
-        auto_lat, auto_lon, station_name = get_coordinates_from_airport(airport_input)
-        
-        if auto_lat is not None and auto_lon is not None:
-            lat = auto_lat
-            lon = auto_lon
-            st.success(f"📍 **{station_name}** ({lat:.2f}°, {lon:.2f}°)")
-        else:
-            st.warning("⚠️ Code not found. Defaulting to KCMH (39.99°, -82.89°)")
-            lat, lon = 39.99, -82.89
-    else:
-        lat = st.number_input("Latitude", value=39.97, step=0.01, format="%.2f")
-        lon = st.number_input("Longitude", value=-83.00, step=0.01, format="%.2f")
-        
+    airport_input = st.text_input("Airport Code", value="KCMH").strip().upper()
+    lat = st.number_input("Latitude", value=39.97, step=0.01)
+    lon = st.number_input("Longitude", value=-83.00, step=0.01)
     forecast_days = st.slider("Forecast Horizon (Days)", min_value=3, max_value=14, value=7)
+    
+    # The app ONLY fetches data when this button is explicitly pressed!
+    submit_button = st.form_submit_button("🚀 Load Forecast", use_container_width=True)
     
     st.divider()
     
