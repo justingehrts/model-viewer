@@ -261,69 +261,51 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
     return hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows
 
 # ==============================================================================
-# STREAMLIT UI & SIDEBAR
+# STREAMLIT UI & SIDEBAR (WITH FORM WRAPPER & NO WIDGET CONFLICTS)
 # ==============================================================================
 
 st.title("🌤️ Multi-Model Ensemble Weather Consensus Dashboard")
 st.markdown("Comparing deterministic operational runs against **197 probabilistic ensemble members** across European (ECMWF/EPS/AIFS), American (GFS/GEFS), and AI (Google WeatherNext 2) forecasting systems.")
 
-with st.sidebar.form("forecast_controls"):
-    st.header("⚙️ Location & Horizon")
-    loc_mode = st.radio("Location Mode", ["Airport Code", "Manual Lat/Lon"], horizontal=True)
-    airport_input = st.text_input("Airport Code", value="KCMH").strip().upper()
-    lat = st.number_input("Latitude", value=39.97, step=0.01)
-    lon = st.number_input("Longitude", value=-83.00, step=0.01)
-    forecast_days = st.slider("Forecast Horizon (Days)", min_value=3, max_value=14, value=7)
+with st.sidebar:
+    st.header("⚙️ Location & Forecast Controls")
     
-    # The app ONLY fetches data when this button is explicitly pressed!
-    submit_button = st.form_submit_button("🚀 Load Forecast", use_container_width=True)
-    
-    st.divider()
-    
-    selected_var_key = st.selectbox(
-        "Forecast Parameter",
-        options=list(WEATHER_VARS.keys()),
-        format_func=lambda x: WEATHER_VARS[x]["label"]
-    )
-    
+    # 1. BATCH CONTROLS INSIDE A FORM TO PREVENT RATE LIMIT BURSTS
+    with st.form("forecast_controls_form"):
+        loc_mode = st.radio("Location Mode", ["Airport Code", "Manual Lat/Lon"], horizontal=True)
+        
+        if loc_mode == "Airport Code":
+            airport_input = st.text_input("Airport Code (ICAO / IATA)", value="KCMH").strip().upper()
+            auto_lat, auto_lon, station_name = get_coordinates_from_airport(airport_input)
+            
+            if auto_lat is not None and auto_lon is not None:
+                lat, lon = auto_lat, auto_lon
+                st.caption(f"📍 **{station_name}** ({lat:.2f}°, {lon:.2f}°)")
+            else:
+                st.caption("⚠️ Station not found. Defaulting to KCMH (39.99°, -82.89°)")
+                lat, lon = 39.99, -82.89
+        else:
+            lat = st.number_input("Latitude", value=39.97, step=0.01, format="%.2f")
+            lon = st.number_input("Longitude", value=-83.00, step=0.01, format="%.2f")
+            
+        forecast_days = st.slider("Forecast Horizon (Days)", min_value=3, max_value=14, value=7)
+        
+        selected_var_key = st.selectbox(
+            "Forecast Parameter",
+            options=list(WEATHER_VARS.keys()),
+            format_func=lambda x: WEATHER_VARS[x]["label"]
+        )
+        
+        # Must be st.form_submit_button INSIDE a form
+        submitted = st.form_submit_button("🚀 Load / Update Forecast", use_container_width=True)
+
     var_cfg = WEATHER_VARS[selected_var_key]
     
-    if st.button("🔄 Refresh Data", use_container_width=True):
+    # 2. STANDALONE BUTTON OUTSIDE THE FORM
+    st.divider()
+    if st.button("🔄 Force Clear Cache & Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-
-# Fetch Pre-Cached Datasets
-with st.spinner("Fetching multi-model ensemble payloads..."):
-    df_det_temp, df_det_precip, fetch_time, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
-    dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
-
-# Handle API Error Diagnostics
-if det_err or df_det_temp.empty:
-    st.error(f"⚠️ Unable to fetch deterministic weather data from Open-Meteo. Details: `{det_err}`")
-    st.stop()
-
-# Display Run Information in Sidebar
-with st.sidebar:
-    st.divider()
-    st.caption(f"🕒 **Last API Fetch:** {fetch_time}")
-    st.markdown("**Model Run Cycles Loaded:**")
-    for model_name, cycle_str in run_cycles.items():
-        st.text(f"• {model_name:<12}: {cycle_str}")
-
-# Select Payload based on Dropdown
-if selected_var_key == "temperature_2m":
-    df_det_active = df_det_temp
-    dict_ens_active = dict_ens_temp
-else:
-    df_det_active = df_det_precip
-    dict_ens_active = dict_ens_precip
-
-# Process Data dynamically
-hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows = process_ensemble_data(
-    dict_ens_active, 
-    df_det_active, 
-    selected_var_key=selected_var_key
-)
 
 # ==============================================================================
 # KEY METRICS SUMMARY CARDS
