@@ -464,12 +464,12 @@ with tab1:
 with tab2:
     dates = list(daily_det_highs.index)
     
-    # Common Axis Styling Options
+    # Common Axis Styling
     axis_style = dict(
         showgrid=True,
-        gridcolor="rgba(128, 128, 128, 0.15)",  # Subtle, non-distracting gridlines
+        gridcolor="rgba(128, 128, 128, 0.15)",
         gridwidth=1,
-        showline=True,                           # Solid baseline
+        showline=True,
         linecolor="rgba(128, 128, 128, 0.4)",
         linewidth=1.5,
         tickfont=dict(size=12, family="sans-serif"),
@@ -501,7 +501,8 @@ with tab2:
                 whiskerwidth=0.8,
                 boxpoints='outliers',
                 legendgroup=ens_name,
-                hoverinfo="y+name"
+                # Model name on line 1, numerical value on line 2 (Side box removed via <extra>)
+                hovertemplate=f"<b>{ens_name} High</b><br>%{{y:.2f}} {var_cfg['unit']}<extra></extra>"
             ))
 
     if "Deterministic" in daily_det_highs.columns:
@@ -512,7 +513,7 @@ with tab2:
             mode='markers',
             name="Deterministic Operational Run",
             marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-            hoverinfo="y+name"
+            hovertemplate=f"<b>Deterministic High</b><br>%{{y:.2f}} {var_cfg['unit']}<extra></extra>"
         ))
 
     chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
@@ -556,7 +557,7 @@ with tab2:
                     boxpoints='outliers',
                     legendgroup=ens_name,
                     showlegend=False,
-                    hoverinfo="y+name"
+                    hovertemplate=f"<b>{ens_name} Low</b><br>%{{y:.2f}} {var_cfg['unit']}<extra></extra>"
                 ))
 
         if "Deterministic" in daily_det_lows.columns:
@@ -568,7 +569,7 @@ with tab2:
                 name="Deterministic Operational Run",
                 showlegend=False,
                 marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                hoverinfo="y+name"
+                hovertemplate=f"<b>Deterministic Low</b><br>%{{y:.2f}} {var_cfg['unit']}<extra></extra>"
             ))
 
         fig_daily_low.update_layout(
