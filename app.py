@@ -464,6 +464,18 @@ with tab1:
 with tab2:
     dates = list(daily_det_highs.index)
     
+    # Common Axis Styling Options
+    axis_style = dict(
+        showgrid=True,
+        gridcolor="rgba(128, 128, 128, 0.15)",  # Subtle, non-distracting gridlines
+        gridwidth=1,
+        showline=True,                           # Solid baseline
+        linecolor="rgba(128, 128, 128, 0.4)",
+        linewidth=1.5,
+        tickfont=dict(size=12, family="sans-serif"),
+        title_font=dict(size=13, family="sans-serif", color="#555555")
+    )
+    
     # 1. HIGH TEMPERATURE / PRECIPITATION CHART
     fig_daily_high = go.Figure()
     
@@ -472,7 +484,6 @@ with tab2:
             df_m = daily_ens_highs[ens_name]
             color = MODEL_CONFIG[ens_name]["color"]
             
-            # Combine all dates into a single trace per model to enable proper day grouping
             x_vals = []
             y_vals = []
             for date_str in dates:
@@ -486,8 +497,8 @@ with tab2:
                 y=y_vals,
                 name=ens_name,
                 marker_color=color,
-                line=dict(width=2),        # Thicker box borders
-                whiskerwidth=0.8,          # Wider top/bottom cap whiskers
+                line=dict(width=2),
+                whiskerwidth=0.8,
                 boxpoints='outliers',
                 legendgroup=ens_name,
                 hoverinfo="y+name"
@@ -507,11 +518,11 @@ with tab2:
     chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
     fig_daily_high.update_layout(
         title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
-        xaxis_title="Calendar Day",
-        yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
+        xaxis=dict(title="Calendar Day", **axis_style),
+        yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
         boxmode='group',
-        boxgap=0.3,             # LARGE gap between days to clearly separate dates
-        boxgroupgap=0.08,        # SMALL gap between models within the same day
+        boxgap=0.3,
+        boxgroupgap=0.08,
         height=520,
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
@@ -540,8 +551,8 @@ with tab2:
                     y=y_vals_low,
                     name=ens_name,
                     marker_color=color,
-                    line=dict(width=2),    # Thicker box borders
-                    whiskerwidth=0.8,      # Wider cap whiskers
+                    line=dict(width=2),
+                    whiskerwidth=0.8,
                     boxpoints='outliers',
                     legendgroup=ens_name,
                     showlegend=False,
@@ -562,11 +573,11 @@ with tab2:
 
         fig_daily_low.update_layout(
             title=dict(text=f"Daily Low Temperature Spread ({var_cfg['unit']})", font=dict(size=18)),
-            xaxis_title="Calendar Day",
-            yaxis_title=f"Low Temperature ({var_cfg['unit']})",
+            xaxis=dict(title="Calendar Day", **axis_style),
+            yaxis=dict(title=f"Low Temperature ({var_cfg['unit']})", zeroline=False, **axis_style),
             boxmode='group',
-            boxgap=0.3,         # LARGE gap between days
-            boxgroupgap=0.08,    # SMALL gap between models within day
+            boxgap=0.3,
+            boxgroupgap=0.08,
             height=520
         )
         st.plotly_chart(fig_daily_low, use_container_width=True)
