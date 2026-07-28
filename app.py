@@ -101,6 +101,40 @@ def get_coordinates_from_airport(airport_code):
 # LAYER 1: DATA INGESTION
 # ==============================================================================
 
+# ==============================================================================
+# DEV MOCK DATA GENERATOR (OFFLINE / ZERO API CALLS)
+# ==============================================================================
+
+def generate_mock_data(days=7):
+    """Generates synthetic hourly weather data so you can test layout/charts offline."""
+    now = datetime.now()
+    dates = pd.date_range(start=now, periods=days * 24, freq='h')
+    
+    # Generate realistic diurnal temperature curve (60°F to 80°F)
+    base_temp = 70 + 10 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
+    
+    df_det_temp = pd.DataFrame({'time': dates, 'Deterministic': base_temp})
+    df_det_precip = pd.DataFrame({'time': dates, 'Deterministic': np.zeros(len(dates))})
+    
+    dict_ens_temp = {}
+    dict_ens_precip = {}
+    run_cycles = {}
+    
+    for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
+        df_t = pd.DataFrame({'time': dates})
+        df_p = pd.DataFrame({'time': dates})
+        # Add random ensemble member noise
+        for m in range(1, 31):
+            df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
+            df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
+        dict_temp[nickname] = df_t
+        dict_precip[nickname] = df_p
+        run_cycles[nickname] = "DEV-MOCK"
+        
+    return df_det_temp, df_det_precip, dict_temp, dict_precip, run_cycles
+
+# ACTUAL DATA INGESTION
+
 @st.cache_data(ttl=900)  # 15-minute cache
 def fetch_deterministic_data(lat, lon, days=7):
     """Fetches high-resolution blended operational deterministic run."""
@@ -284,20 +318,12 @@ st.title("🌤️ Multi-Model Ensemble Weather Consensus Dashboard")
 st.markdown("Comparing deterministic operational runs against **197 probabilistic ensemble members** across European (ECMWF/EPS/AIFS), American (GFS/GEFS), and AI (Google WeatherNext 2) forecasting systems.")
 
 with st.sidebar:
-
-    dev_mode = st.sidebar.toggle("🛠️ Dev Mode (Use Offline Mock Data)")
-
-if dev_mode:
-    # Return fake local dataframes instantly — 0 API calls!
-    df_det_temp, dict_ens_temp = load_offline_mock_data()
-else:
-    # Fetch real live data from Open-Meteo
-    df_det_temp, dict_ens_temp, run_cycles = fetch_ensemble_data(lat, lon)
-    
     st.header("⚙️ Location & Forecast Controls")
     
-    # Batch inputs inside a form to prevent API rate bursts while typing
     with st.form("forecast_controls_form"):
+        # ADD THIS TOGGLE:
+        dev_mode = st.toggle("🛠️ Dev Mode (Use Offline Mock Data)", value=False)
+        
         loc_mode = st.radio("Location Mode", ["Airport Code", "Manual Lat/Lon"], horizontal=True)
         
         if loc_mode == "Airport Code":
@@ -359,6 +385,17 @@ hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lo
     selected_var_key=selected_var_key
 )
 
+if dev_mode:
+    # 0 API Calls — Instant render with offline synthetic data!
+    df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles = generate_mock_data(days=forecast_days)
+    fetch_time = "OFFLINE DEV MODE"
+    det_err = None
+else:
+    # Real live network calls to Open-Meteo
+    with st.spinner("Fetching multi-model ensemble payloads..."):
+        df_det_temp, df_det_precip, fetch_time, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
+        dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
+        
 # ==============================================================================
 # KEY METRICS SUMMARY CARDS
 # ==============================================================================
