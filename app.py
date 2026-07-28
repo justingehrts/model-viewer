@@ -532,6 +532,88 @@ with tab2:
     # 2. LOW TEMPERATURE CHART
     if selected_var_key == "temperature_2m" and not daily_det_lows.empty:
         st.divider()
+        fig_daily_low = go.Figu# --- TAB 2: DAILY DISTRIBUTION SPREAD ---
+with tab2:
+    dates = list(daily_det_highs.index)
+    
+    # Common Axis Styling
+    axis_style = dict(
+        showgrid=True,
+        gridcolor="rgba(128, 128, 128, 0.15)",
+        gridwidth=1,
+        showline=True,
+        linecolor="rgba(128, 128, 128, 0.4)",
+        linewidth=1.5,
+        tickfont=dict(size=12, family="sans-serif"),
+        title_font=dict(size=13, family="sans-serif", color="#555555")
+    )
+    
+    # Custom Box Hover Template (Model Name on top line, summary metrics below)
+    box_hover_template = (
+        "<b>%{fullData.name}</b><br>"
+        "Max: %{upperFence:.1f}<br>"
+        "Q3: %{q3:.1f}<br>"
+        "<b>Median: %{median:.1f}</b><br>"
+        "Q1: %{q1:.1f}<br>"
+        "Min: %{lowerFence:.1f}"
+        "<extra></extra>"
+    )
+    
+    # 1. HIGH TEMPERATURE / PRECIPITATION CHART
+    fig_daily_high = go.Figure()
+    
+    for ens_name in ENS_ORDER:
+        if ens_name in daily_ens_highs:
+            df_m = daily_ens_highs[ens_name]
+            color = MODEL_CONFIG[ens_name]["color"]
+            
+            x_vals = []
+            y_vals = []
+            for date_str in dates:
+                if date_str in df_m.index:
+                    vals = df_m.loc[date_str].values
+                    x_vals.extend([date_str] * len(vals))
+                    y_vals.extend(vals)
+                    
+            fig_daily_high.add_trace(go.Box(
+                x=x_vals,
+                y=y_vals,
+                name=ens_name,
+                marker_color=color,
+                line=dict(width=2),
+                whiskerwidth=0.8,
+                boxpoints='outliers',
+                legendgroup=ens_name,
+                hovertemplate=box_hover_template
+            ))
+
+    if "Deterministic" in daily_det_highs.columns:
+        color = MODEL_CONFIG["Deterministic"]["color"]
+        fig_daily_high.add_trace(go.Scatter(
+            x=daily_det_highs.index,
+            y=daily_det_highs["Deterministic"],
+            mode='markers',
+            name="Deterministic Operational Run",
+            marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
+            hovertemplate="<b>%{fullData.name}</b><br>%{y:.1f} " + var_cfg['unit'] + "<extra></extra>"
+        ))
+
+    chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
+    fig_daily_high.update_layout(
+        title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
+        xaxis=dict(title="Calendar Day", **axis_style),
+        yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
+        boxmode='group',
+        boxgap=0.3,
+        boxgroupgap=0.08,
+        height=520,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
+    )
+    st.plotly_chart(fig_daily_high, use_container_width=True)
+
+    # 2. LOW TEMPERATURE CHART
+    if selected_var_key == "temperature_2m" and not daily_det_lows.empty:
+        st.divider()
         fig_daily_low = go.Figure()
         
         for ens_name in ENS_ORDER:
@@ -557,7 +639,7 @@ with tab2:
                     boxpoints='outliers',
                     legendgroup=ens_name,
                     showlegend=False,
-                    hovertemplate=f"<b>{ens_name} Low</b><br>%{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                    hovertemplate=box_hover_template
                 ))
 
         if "Deterministic" in daily_det_lows.columns:
@@ -569,7 +651,7 @@ with tab2:
                 name="Deterministic Operational Run",
                 showlegend=False,
                 marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                hovertemplate=f"<b>Deterministic Low</b><br>%{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                hovertemplate="<b>%{fullData.name}</b><br>%{y:.1f} " + var_cfg['unit'] + "<extra></extra>"
             ))
 
         fig_daily_low.update_layout(
