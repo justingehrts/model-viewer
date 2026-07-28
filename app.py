@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime
+import time
 
 # ==============================================================================
 # STREAMLIT PAGE CONFIGURATION
@@ -98,10 +99,6 @@ def get_coordinates_from_airport(airport_code):
     return 39.99, -82.89, f"Default Location (KCMH)"
 
 # ==============================================================================
-# LAYER 1: DATA INGESTION
-# ==============================================================================
-
-# ==============================================================================
 # DEV MOCK DATA GENERATOR (OFFLINE / ZERO API CALLS)
 # ==============================================================================
 
@@ -109,8 +106,6 @@ def generate_mock_data(days=7):
     """Generates synthetic hourly weather data so you can test layout/charts offline."""
     now = datetime.now()
     dates = pd.date_range(start=now, periods=days * 24, freq='h')
-    
-    # Generate realistic diurnal temperature curve (60°F to 80°F)
     base_temp = 70 + 10 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
     
     df_det_temp = pd.DataFrame({'time': dates, 'Deterministic': base_temp})
@@ -123,8 +118,6 @@ def generate_mock_data(days=7):
     for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
         df_t = pd.DataFrame({'time': dates})
         df_p = pd.DataFrame({'time': dates})
-        
-        # Add random ensemble member noise
         for m in range(1, 31):
             df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
             df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
@@ -135,9 +128,12 @@ def generate_mock_data(days=7):
         
     return df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles
 
-# ACTUAL DATA INGESTION
 
-@st.cache_data(ttl=900)  # 15-minute cache
+# ==============================================================================
+# LAYER 1: LIVE DATA INGESTION (CACHED FOR 15 MINUTES)
+# ==============================================================================
+
+@st.cache_data(ttl=900)  # <-- YOUR 15-MINUTE CACHE IS RIGHT HERE!
 def fetch_deterministic_data(lat, lon, days=7):
     """Fetches high-resolution blended operational deterministic run."""
     url = "https://api.open-meteo.com/v1/forecast"
@@ -172,9 +168,7 @@ def fetch_deterministic_data(lat, lon, days=7):
         return pd.DataFrame(), pd.DataFrame(), "", str(e)
 
 
-import time  # Ensure time is imported at the top of app.py
-
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=900)  # <-- AND HERE FOR ENSEMBLES!
 def fetch_ensemble_data(lat, lon, days=7):
     """Fetches 197 probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext."""
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
