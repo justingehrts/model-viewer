@@ -136,6 +136,8 @@ def fetch_deterministic_data(lat, lon, days=7):
         return pd.DataFrame(), pd.DataFrame(), "", str(e)
 
 
+import time  # Ensure time is imported at the top of app.py
+
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
     """Fetches 197 probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext."""
@@ -162,6 +164,12 @@ def fetch_ensemble_data(lat, lon, days=7):
         
         try:
             res = requests.get(url, params=params, timeout=15)
+            
+            # If rate limited, pause and notify gracefully instead of crashing
+            if res.status_code == 429:
+                errors.append(f"{nickname}: Rate limit hit (HTTP 429)")
+                continue
+                
             if res.status_code != 200:
                 errors.append(f"{nickname}: HTTP {res.status_code}")
                 continue
@@ -170,7 +178,6 @@ def fetch_ensemble_data(lat, lon, days=7):
             if "hourly" not in data or "time" not in data["hourly"]:
                 continue
                 
-            # Parse actual model initialization run cycle timestamp
             if "model_initialization_time" in data and data["model_initialization_time"]:
                 init_dt = pd.to_datetime(data["model_initialization_time"])
                 run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
@@ -196,6 +203,10 @@ def fetch_ensemble_data(lat, lon, days=7):
                 
             dict_temp[nickname] = df_m_temp
             dict_precip[nickname] = df_m_precip
+            
+            # Micro-pause between model calls to avoid bursting the per-second rate limit
+            time.sleep(0.15)
+            
         except Exception as e:
             errors.append(f"{nickname}: {str(e)}")
             continue
