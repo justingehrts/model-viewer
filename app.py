@@ -476,6 +476,17 @@ with tab2:
         title_font=dict(size=13, family="sans-serif", color="#555555")
     )
     
+    # Custom Hover Template with Model Name as Header (NO DATES)
+    clean_box_hovertemplate = (
+        "<b>%{fullData.name}</b><br>"
+        "Max: %{upperFence:.1f}<br>"
+        "Q3: %{q3:.1f}<br>"
+        "<b>Median: %{median:.1f}</b><br>"
+        "Q1: %{q1:.1f}<br>"
+        "Min: %{lowerFence:.1f}"
+        "<extra></extra>"
+    )
+    
     # 1. HIGH TEMPERATURE / PRECIPITATION CHART
     fig_daily_high = go.Figure()
     
@@ -501,7 +512,7 @@ with tab2:
                 whiskerwidth=0.8,
                 boxpoints='outliers',
                 legendgroup=ens_name,
-                hoverinfo="y+name"
+                hovertemplate=clean_box_hovertemplate
             ))
 
     if "Deterministic" in daily_det_highs.columns:
@@ -557,7 +568,7 @@ with tab2:
                     boxpoints='outliers',
                     legendgroup=ens_name,
                     showlegend=False,
-                    hoverinfo="y+name"
+                    hovertemplate=clean_box_hovertemplate
                 ))
                 
         if "Deterministic" in daily_det_lows.columns:
