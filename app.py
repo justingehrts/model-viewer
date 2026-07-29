@@ -476,7 +476,7 @@ with tab2:
         title_font=dict(size=13, family="sans-serif", color="#555555")
     )
     
-    # Custom Box Hover Template
+    # Custom Clean Box Hover Template (NO DATES, JUST MODEL & METRICS)
     box_hover_template = (
         "<b>%{fullData.name}</b><br>"
         "Max: %{upperFence:.1f}<br>"
@@ -535,6 +535,7 @@ with tab2:
         boxgap=0.3,
         boxgroupgap=0.08,
         height=520,
+        hovermode="closest",  # PREVENTS PLOTLY FROM SHOWING THE DEFAULT DATE-BASED HOVER CALLOUTS!
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
     st.plotly_chart(fig_daily_high, use_container_width=True)
@@ -589,10 +590,10 @@ with tab2:
             boxmode='group',
             boxgap=0.3,
             boxgroupgap=0.08,
-            height=520
+            height=520,
+            hovermode="closest"  # PREVENTS DEFAULT HOVER CALLOUT OVERRIDES!
         )
         st.plotly_chart(fig_daily_low, use_container_width=True)
-
 
 # --- TAB 3: SUMMARY DATA TABLE & CSV DOWNLOAD ---
 with tab3:
