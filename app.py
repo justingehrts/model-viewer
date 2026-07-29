@@ -515,7 +515,7 @@ fig_daily_high.add_trace(go.Box(
         hoverinfo="y+name"
     ))
 
-    if "Deterministic" in daily_det_highs.columns:
+if "Deterministic" in daily_det_highs.columns:
         color = MODEL_CONFIG["Deterministic"]["color"]
         fig_daily_high.add_trace(go.Scatter(
             x=daily_det_highs.index,
