@@ -503,17 +503,17 @@ with tab2:
                     x_vals.extend([date_str] * len(vals))
                     y_vals.extend(vals)
                     
-            fig_daily_high.add_trace(go.Box(
-                x=x_vals,
-                y=y_vals,
-                name=ens_name,
-                marker_color=color,
-                line=dict(width=2),
-                whiskerwidth=0.8,
-                boxpoints='outliers',
-                legendgroup=ens_name,
-                hovertemplate=box_hover_template
-            ))
+fig_daily_high.add_trace(go.Box(
+        x=x_vals,
+        y=y_vals,
+        name=ens_name,
+        marker_color=color,
+        line=dict(width=2),
+        whiskerwidth=0.8,
+        boxpoints='outliers',
+        legendgroup=ens_name,
+        hoverinfo="y+name"
+    ))
 
     if "Deterministic" in daily_det_highs.columns:
         color = MODEL_CONFIG["Deterministic"]["color"]
@@ -535,7 +535,7 @@ with tab2:
         boxgap=0.3,
         boxgroupgap=0.08,
         height=520,
-        hovermode="closest",  # PREVENTS PLOTLY FROM SHOWING THE DEFAULT DATE-BASED HOVER CALLOUTS!
+        hovermode="closest",
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
     st.plotly_chart(fig_daily_high, use_container_width=True)
@@ -568,7 +568,7 @@ with tab2:
                     boxpoints='outliers',
                     legendgroup=ens_name,
                     showlegend=False,
-                    hovertemplate=box_hover_template
+                    hoverinfo="y+name"
                 ))
 
         if "Deterministic" in daily_det_lows.columns:
