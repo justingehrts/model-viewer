@@ -150,74 +150,101 @@ def get_coordinates_from_airport(airport_code):
 # ==============================================================================
 
 @st.cache_data(ttl=900)
-def fetch_deterministic_data(lat, lon, days=7):
-    """Fetches explicit operational deterministic runs for ECMWF IFS and GFS along with exact run cycles."""
-    url = "https://api.open-meteo.com/v1/forecast"
-    
-    # Models to fetch explicitly
-    target_models = {
-        "ECMWF Operational": "ecmwf_ifs025",
-        "GFS Operational": "gfs_seamless"
-    }
-    
-    df_temp = pd.DataFrame()
-    df_precip = pd.DataFrame()
-    det_run_cycles = {}
-    
+def get_model_run_cycles():
+    """Queries Open-Meteo Model Updates endpoint to get the exact latest run cycles for all models."""
+    url = "https://api.open-meteo.com/v1/model-updates"
+    cycles = {}
     try:
-        for label, model_key in target_models.items():
-            params = {
-                "latitude": lat,
-                "longitude": lon,
-                "hourly": "temperature_2m,precipitation",
-                "models": model_key,
-                "temperature_unit": "fahrenheit",
-                "precipitation_unit": "inch",
-                "timezone": "UTC",
-                "forecast_days": days
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            # Map Open-Meteo model keys to readable names
+            model_mapping = {
+                "ecmwf_ifs025": "ECMWF Operational",
+                "gfs_seamless": "GFS Operational",
+                "ecmwf_ifs": "EPS",
+                "ecmwf_aifs025": "AIFS",
+                "gfs_ensemble": "GEFS",
+                "google_weathernext2_ensemble": "WeatherNext"
             }
             
-            res = requests.get(url, params=params, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            
-            # 1. Extract EXACT model initialization time from Open-Meteo root metadata
-            if "model_initialization_time" in data and data["model_initialization_time"]:
-                init_dt = pd.to_datetime(data["model_initialization_time"])
-                det_run_cycles[label] = init_dt.strftime("%m/%d %HZ")
-            else:
-                det_run_cycles[label] = "N/A"
-                
-            # 2. Extract Hourly Data
-            hourly = data["hourly"]
-            if df_temp.empty:
-                df_temp["time"] = pd.to_datetime(hourly["time"])
-                df_precip["time"] = pd.to_datetime(hourly["time"])
-                
-            # Open-Meteo appends parameter suffix when model is specified
-            temp_col = f"temperature_2m_{model_key}"
-            precip_col = f"precipitation_{model_key}"
-            
-            df_temp[label] = hourly.get(temp_col, hourly.get("temperature_2m"))
-            df_precip[label] = hourly.get(precip_col, hourly.get("precipitation"))
-            
-            time.sleep(0.1)
+            # Extract last run time for each model
+            for key, name in model_mapping.items():
+                if key in data:
+                    run_info = data[key]
+                    # last_run_availability_time or last_run
+                    raw_time = run_info.get("last_run") or run_info.get("last_run_availability_time")
+                    if raw_time:
+                        dt = pd.to_datetime(raw_time)
+                        cycles[name] = dt.strftime("%m/%d %HZ")
+    except Exception:
+        pass
+    return cycles
 
+
+@st.cache_data(ttl=900)
+def fetch_deterministic_data(lat, lon, days=7):
+    """Fetches explicit operational deterministic runs for ECMWF IFS and GFS."""
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,precipitation",
+        "models": ["ecmwf_ifs025", "gfs_seamless"],
+        "temperature_unit": "fahrenheit",
+        "precipitation_unit": "inch",
+        "timezone": "UTC",
+        "forecast_days": days
+    }
+    
+    # Get actual run cycles from model updates endpoint
+    all_cycles = get_model_run_cycles()
+    det_run_cycles = {
+        "ECMWF Operational": all_cycles.get("ECMWF Operational", "Latest 00Z/12Z"),
+        "GFS Operational": all_cycles.get("GFS Operational", "Latest 00Z/06Z/12Z/18Z")
+    }
+    
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        
+        hourly = data["hourly"]
+        df_temp = pd.DataFrame({
+            "time": pd.to_datetime(hourly["time"]),
+            "ECMWF Operational": hourly.get("temperature_2m_ecmwf_ifs025"),
+            "GFS Operational": hourly.get("temperature_2m_gfs_seamless")
+        })
+        df_precip = pd.DataFrame({
+            "time": pd.to_datetime(hourly["time"]),
+            "ECMWF Operational": hourly.get("precipitation_ecmwf_ifs025"),
+            "GFS Operational": hourly.get("precipitation_gfs_seamless")
+        })
+        
         fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return df_temp, df_precip, fetch_time, det_run_cycles, None
-
     except Exception as e:
         return pd.DataFrame(), pd.DataFrame(), "", {}, str(e)
 
+
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
-    """Fetches 197 probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext along with exact run cycles."""
+    """Fetches probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext."""
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
     models = ["ecmwf_ifs025", "ecmwf_aifs025", "gfs_seamless", "google_weathernext2_ensemble"]
     
     dict_temp = {}
     dict_precip = {}
-    run_cycles = {}
+    
+    # Get actual run cycles
+    all_cycles = get_model_run_cycles()
+    run_cycles = {
+        "EPS": all_cycles.get("EPS", "Latest 00Z/12Z"),
+        "AIFS": all_cycles.get("AIFS", "Latest 00Z/12Z"),
+        "GEFS": all_cycles.get("GEFS", "Latest 00Z/06Z/12Z/18Z"),
+        "WeatherNext": all_cycles.get("WeatherNext", "Latest 00Z/12Z")
+    }
+    
     errors = []
     
     for m in models:
@@ -242,13 +269,6 @@ def fetch_ensemble_data(lat, lon, days=7):
             data = res.json()
             if "hourly" not in data or "time" not in data["hourly"]:
                 continue
-                
-            # Extract EXACT model initialization timestamp from root metadata
-            if "model_initialization_time" in data and data["model_initialization_time"]:
-                init_dt = pd.to_datetime(data["model_initialization_time"])
-                run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
-            else:
-                run_cycles[nickname] = "N/A"
                 
             hourly = data["hourly"]
             df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
