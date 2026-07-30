@@ -142,7 +142,7 @@ def fetch_deterministic_data(lat, lon, days=7):
         "latitude": lat,
         "longitude": lon,
         "hourly": "temperature_2m,precipitation",
-        "models": ["ecmwf_ifs025", "gfs_seamless"],  # Explicitly requests Euro (IFS) & GFS
+        "models": ["ecmwf_ifs025", "gfs_seamless"],
         "temperature_unit": "fahrenheit",
         "precipitation_unit": "inch",
         "timezone": "auto",
@@ -463,6 +463,7 @@ with tab1:
 
 
 # --- TAB 2: DAILY DISTRIBUTION SPREAD ---
+# --- TAB 2: DAILY DISTRIBUTION SPREAD ---
 with tab2:
     dates = list(daily_det_highs.index)
     
@@ -506,15 +507,17 @@ with tab2:
                 hoverinfo="y+name"
             ))
 
-    if "Deterministic" in daily_det_highs.columns:
-        color = MODEL_CONFIG["Deterministic"]["color"]
+    # DYNAMIC SCATTER LOOP FOR OPERATIONAL RUNS
+    det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#E69F00", "Deterministic": "#D55E00"}
+    for det_col in daily_det_highs.columns:
+        color = det_colors.get(det_col, "#D55E00")
         fig_daily_high.add_trace(go.Scatter(
             x=daily_det_highs.index,
-            y=daily_det_highs["Deterministic"],
+            y=daily_det_highs[det_col],
             mode='markers',
-            name="Deterministic Operational Run",
+            name=det_col,
             marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-            hovertemplate="<b>%{fullData.name}</b><br>%{y:.1f} " + var_cfg['unit'] + "<extra></extra>"
+            hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
         ))
 
     chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
@@ -562,16 +565,16 @@ with tab2:
                     hoverinfo="y+name"
                 ))
                 
-        if "Deterministic" in daily_det_lows.columns:
-            color = MODEL_CONFIG["Deterministic"]["color"]
+        for det_col in daily_det_lows.columns:
+            color = det_colors.get(det_col, "#D55E00")
             fig_daily_low.add_trace(go.Scatter(
                 x=daily_det_lows.index,
-                y=daily_det_lows["Deterministic"],
+                y=daily_det_lows[det_col],
                 mode='markers',
-                name="Deterministic Operational Run",
+                name=det_col,
                 showlegend=False,
                 marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                hovertemplate="<b>%{fullData.name}</b><br>%{y:.1f} " + var_cfg['unit'] + "<extra></extra>"
+                hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
             ))
 
         fig_daily_low.update_layout(
