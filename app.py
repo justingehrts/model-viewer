@@ -151,14 +151,13 @@ def get_coordinates_from_airport(airport_code):
 
 @st.cache_data(ttl=900)
 def get_model_run_cycles():
-    """Queries Open-Meteo Model Updates endpoint to get the exact latest run cycles for all models."""
+    """Queries Open-Meteo Model Updates endpoint for actual model run cycles."""
     url = "https://api.open-meteo.com/v1/model-updates"
     cycles = {}
     try:
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            # Map Open-Meteo model keys to readable names
             model_mapping = {
                 "ecmwf_ifs025": "ECMWF Operational",
                 "gfs_seamless": "GFS Operational",
@@ -167,12 +166,9 @@ def get_model_run_cycles():
                 "gfs_ensemble": "GEFS",
                 "google_weathernext2_ensemble": "WeatherNext"
             }
-            
-            # Extract last run time for each model
             for key, name in model_mapping.items():
                 if key in data:
                     run_info = data[key]
-                    # last_run_availability_time or last_run
                     raw_time = run_info.get("last_run") or run_info.get("last_run_availability_time")
                     if raw_time:
                         dt = pd.to_datetime(raw_time)
@@ -197,11 +193,10 @@ def fetch_deterministic_data(lat, lon, days=7):
         "forecast_days": days
     }
     
-    # Get actual run cycles from model updates endpoint
     all_cycles = get_model_run_cycles()
     det_run_cycles = {
-        "ECMWF Operational": all_cycles.get("ECMWF Operational", "Latest 00Z/12Z"),
-        "GFS Operational": all_cycles.get("GFS Operational", "Latest 00Z/06Z/12Z/18Z")
+        "ECMWF Operational": all_cycles.get("ECMWF Operational", "Latest Available"),
+        "GFS Operational": all_cycles.get("GFS Operational", "Latest Available")
     }
     
     try:
@@ -236,13 +231,12 @@ def fetch_ensemble_data(lat, lon, days=7):
     dict_temp = {}
     dict_precip = {}
     
-    # Get actual run cycles
     all_cycles = get_model_run_cycles()
     run_cycles = {
-        "EPS": all_cycles.get("EPS", "Latest 00Z/12Z"),
-        "AIFS": all_cycles.get("AIFS", "Latest 00Z/12Z"),
-        "GEFS": all_cycles.get("GEFS", "Latest 00Z/06Z/12Z/18Z"),
-        "WeatherNext": all_cycles.get("WeatherNext", "Latest 00Z/12Z")
+        "EPS": all_cycles.get("EPS", "Latest Available"),
+        "AIFS": all_cycles.get("AIFS", "Latest Available"),
+        "GEFS": all_cycles.get("GEFS", "Latest Available"),
+        "WeatherNext": all_cycles.get("WeatherNext", "Latest Available")
     }
     
     errors = []
