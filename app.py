@@ -37,8 +37,10 @@ WEATHER_VARS = {
 
 # Color Vision Deficiency (CVD) Safe Palette (Okabe-Ito Inspired)
 MODEL_CONFIG = {
-    # Deterministic Operational Run
-    "Deterministic":  {"color": "#D55E00"},  # Vermilion
+    # Deterministic Operational Runs
+    "ECMWF Operational": {"color": "#D55E00"},  # Vermilion
+    "GFS Operational":   {"color": "#E69F00"},  # Amber
+    "Deterministic":     {"color": "#D55E00"},
     
     # Ensemble Model Families
     "EPS":            {"color": "#0072B2"},  # Blue
@@ -69,8 +71,16 @@ def generate_mock_data(days=7):
     # Generate realistic diurnal temperature curve (60°F to 80°F)
     base_temp = 70 + 10 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
     
-    df_det_temp = pd.DataFrame({'time': dates, 'Deterministic': base_temp})
-    df_det_precip = pd.DataFrame({'time': dates, 'Deterministic': np.zeros(len(dates))})
+    df_det_temp = pd.DataFrame({
+        'time': dates, 
+        'ECMWF Operational': base_temp + 1.0,
+        'GFS Operational': base_temp - 1.0
+    })
+    df_det_precip = pd.DataFrame({
+        'time': dates, 
+        'ECMWF Operational': np.zeros(len(dates)),
+        'GFS Operational': np.zeros(len(dates))
+    })
     
     dict_ens_temp = {}
     dict_ens_precip = {}
@@ -89,7 +99,12 @@ def generate_mock_data(days=7):
         dict_ens_precip[nickname] = df_p
         run_cycles[nickname] = "DEV-MOCK 00Z"
         
-    return df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles
+    det_run_cycles = {
+        "ECMWF Operational": "DEV-MOCK 00Z",
+        "GFS Operational": "DEV-MOCK 00Z"
+    }
+        
+    return df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, det_run_cycles, run_cycles
 
 # ==============================================================================
 # HELPER 2: AIRPORT GEOCODING LOOKUP
@@ -149,10 +164,19 @@ def fetch_deterministic_data(lat, lon, days=7):
         "forecast_days": days
     }
     
+    det_run_cycles = {}
+    
     try:
         res = requests.get(url, params=params, timeout=10)
         res.raise_for_status()
         data = res.json()
+        
+        # Capture actual initialization cycle if provided by API metadata
+        if "model_initialization_time" in data and data["model_initialization_time"]:
+            init_dt = pd.to_datetime(data["model_initialization_time"])
+            cycle_str = init_dt.strftime("%m/%d %HZ")
+            det_run_cycles["ECMWF Operational"] = cycle_str
+            det_run_cycles["GFS Operational"] = cycle_str
         
         hourly = data["hourly"]
         df_temp = pd.DataFrame({
@@ -167,9 +191,10 @@ def fetch_deterministic_data(lat, lon, days=7):
         })
         
         fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return df_temp, df_precip, fetch_time, None
+        return df_temp, df_precip, fetch_time, det_run_cycles, None
     except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), "", str(e)
+        return pd.DataFrame(), pd.DataFrame(), "", {}, str(e)
+
 
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
@@ -205,13 +230,10 @@ def fetch_ensemble_data(lat, lon, days=7):
             if "hourly" not in data or "time" not in data["hourly"]:
                 continue
                 
+            # Read exact ISO initialization timestamp directly from API metadata
             if "model_initialization_time" in data and data["model_initialization_time"]:
                 init_dt = pd.to_datetime(data["model_initialization_time"])
                 run_cycles[nickname] = init_dt.strftime("%m/%d %HZ")
-            elif "hourly" in data and "time" in data["hourly"]:
-                offset_sec = data.get("utc_offset_seconds", 0)
-                first_time_utc = pd.to_datetime(data["hourly"]["time"][0]) - pd.Timedelta(seconds=offset_sec)
-                run_cycles[nickname] = first_time_utc.strftime("%m/%d %HZ")
                 
             hourly = data["hourly"]
             df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
@@ -347,28 +369,31 @@ with st.sidebar:
 # ==============================================================================
 
 if dev_mode:
-    # 0 API Calls — Instant offline render with synthetic data
-    df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, run_cycles = generate_mock_data(days=forecast_days)
+    df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, det_run_cycles, run_cycles = generate_mock_data(days=forecast_days)
     fetch_time = "OFFLINE DEV MODE"
     det_err = None
 else:
-    # Real live network calls to Open-Meteo
     with st.spinner("Fetching multi-model ensemble payloads..."):
-        df_det_temp, df_det_precip, fetch_time, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
+        df_det_temp, df_det_precip, fetch_time, det_run_cycles, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
         dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
 
-# Safety Check (ONLY runs if Dev Mode is OFF)
 if not dev_mode and (det_err or df_det_temp.empty):
     st.error(f"⚠️ Unable to fetch weather data from Open-Meteo. Details: `{det_err}`")
     st.info("💡 **Tip:** Switch on '🛠️ Dev Mode' in the sidebar to test layout & charts offline without hitting API rate limits.")
     st.stop()
 
-# Display Run Information in Sidebar
+# Display Actual Model Run Cycles in Sidebar
 with st.sidebar:
     st.caption(f"🕒 **Last API Fetch:** {fetch_time}")
     st.markdown("**Model Run Cycles Loaded:**")
+    
+    # Deterministic Operational Run Cycles
+    for model_name, cycle_str in det_run_cycles.items():
+        st.text(f"• {model_name:<18}: {cycle_str}")
+        
+    # Ensemble Run Cycles
     for model_name, cycle_str in run_cycles.items():
-        st.text(f"• {model_name:<12}: {cycle_str}")
+        st.text(f"• {model_name:<18}: {cycle_str}")
 
 # Select Payload based on Dropdown
 if selected_var_key == "temperature_2m":
@@ -424,7 +449,7 @@ tab1, tab2, tab3 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution 
 with tab1:
     fig_hourly = go.Figure()
     
-    # Plot all operational deterministic models dynamically
+    # Render all available operational deterministic models
     det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "Deterministic": "#D55E00"}
     for det_col in [c for c in df_det_active.columns if c != 'time']:
         color = det_colors.get(det_col, "#D55E00")
@@ -462,6 +487,7 @@ with tab1:
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
     )
     st.plotly_chart(fig_hourly, use_container_width=True)
+
 
 # --- TAB 2: DAILY DISTRIBUTION SPREAD ---
 with tab2:
@@ -507,8 +533,7 @@ with tab2:
                 hoverinfo="y+name"
             ))
 
-    # DYNAMIC SCATTER LOOP FOR OPERATIONAL RUNS
-    det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#E69F00", "Deterministic": "#D55E00"}
+    det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "Deterministic": "#D55E00"}
     for det_col in daily_det_highs.columns:
         color = det_colors.get(det_col, "#D55E00")
         fig_daily_high.add_trace(go.Scatter(
@@ -598,7 +623,7 @@ with tab3:
         date_obj = pd.to_datetime(d)
         row = {"Date": date_obj.strftime("%a %b %d, %Y")}
         
-        # Populate operational run data dynamically for all deterministic columns
+        # Populate deterministic run data dynamically
         for det_col in daily_det_highs.columns:
             if selected_var_key == "temperature_2m" and det_col in daily_det_lows.columns and d in daily_det_lows.index:
                 low_val = daily_det_lows.loc[d, det_col]
