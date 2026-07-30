@@ -60,7 +60,7 @@ ENS_NAME_MAP = {
 }
 
 # ==============================================================================
-# HELPER 1: LIVE MODEL RUN CYCLE CALCULATOR
+# HELPER 1: LIVE MODEL RUN CYCLE CALCULATOR (STRICTLY UTC)
 # ==============================================================================
 
 def get_actual_run_cycles():
@@ -187,7 +187,7 @@ def fetch_deterministic_data(lat, lon, days=7):
         "models": ["ecmwf_ifs025", "gfs_seamless"],
         "temperature_unit": "fahrenheit",
         "precipitation_unit": "inch",
-        "timezone": "UTC",
+        "timezone": "auto",  # Set to auto to ensure timestamps match local station time
         "forecast_days": days
     }
     
@@ -247,7 +247,7 @@ def fetch_ensemble_data(lat, lon, days=7):
             "models": m,
             "temperature_unit": "fahrenheit",
             "precipitation_unit": "inch",
-            "timezone": "UTC",
+            "timezone": "auto",  # Set to auto to ensure timestamps match local station time
             "forecast_days": days
         }
         
