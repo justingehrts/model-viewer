@@ -136,12 +136,13 @@ def get_coordinates_from_airport(airport_code):
 
 @st.cache_data(ttl=900)
 def fetch_deterministic_data(lat, lon, days=7):
-    """Fetches high-resolution blended operational deterministic run."""
+    """Fetches explicit operational deterministic runs for ECMWF IFS and GFS."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
         "hourly": "temperature_2m,precipitation",
+        "models": ["ecmwf_ifs025", "gfs_seamless"],  # Explicitly requests Euro (IFS) & GFS
         "temperature_unit": "fahrenheit",
         "precipitation_unit": "inch",
         "timezone": "auto",
@@ -156,18 +157,19 @@ def fetch_deterministic_data(lat, lon, days=7):
         hourly = data["hourly"]
         df_temp = pd.DataFrame({
             "time": pd.to_datetime(hourly["time"]),
-            "Deterministic": hourly["temperature_2m"]
+            "ECMWF Operational": hourly.get("temperature_2m_ecmwf_ifs025"),
+            "GFS Operational": hourly.get("temperature_2m_gfs_seamless")
         })
         df_precip = pd.DataFrame({
             "time": pd.to_datetime(hourly["time"]),
-            "Deterministic": hourly["precipitation"]
+            "ECMWF Operational": hourly.get("precipitation_ecmwf_ifs025"),
+            "GFS Operational": hourly.get("precipitation_gfs_seamless")
         })
         
         fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return df_temp, df_precip, fetch_time, None
     except Exception as e:
         return pd.DataFrame(), pd.DataFrame(), "", str(e)
-
 
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
