@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 
 # ==============================================================================
@@ -39,7 +39,7 @@ WEATHER_VARS = {
 MODEL_CONFIG = {
     # Deterministic Operational Runs
     "ECMWF Operational": {"color": "#D55E00"},  # Vermilion
-    "GFS Operational":   {"color": "#E69F00"},  # Amber
+    "GFS Operational":   {"color": "#CC79A7"},  # Purple/Magenta
     "Deterministic":     {"color": "#D55E00"},
     
     # Ensemble Model Families
@@ -60,7 +60,34 @@ ENS_NAME_MAP = {
 }
 
 # ==============================================================================
-# HELPER 1: DEV MOCK DATA GENERATOR (OFFLINE / 0 API CALLS)
+# HELPER 1: LIVE MODEL RUN CYCLE CALCULATOR
+# ==============================================================================
+
+def get_actual_run_cycles():
+    """Calculates active UTC model run cycles based on UTC time and server ingestion latency."""
+    now_utc = datetime.now(timezone.utc)
+    
+    # GFS / GEFS: 6-hour cycles (00Z, 06Z, 12Z, 18Z) with ~3.5 hour ingest lag
+    gfs_cutoff = now_utc - pd.Timedelta(hours=3, minutes=30)
+    gfs_hour = (gfs_cutoff.hour // 6) * 6
+    gfs_str = gfs_cutoff.replace(hour=gfs_hour, minute=0, second=0, microsecond=0).strftime("%m/%d %HZ")
+    
+    # ECMWF / EPS / AIFS: 12-hour main cycles (00Z/12Z) with ~7 hour ingest lag
+    ecmwf_cutoff = now_utc - pd.Timedelta(hours=7)
+    ecmwf_hour = (ecmwf_cutoff.hour // 12) * 12
+    ecmwf_str = ecmwf_cutoff.replace(hour=ecmwf_hour, minute=0, second=0, microsecond=0).strftime("%m/%d %HZ")
+    
+    return {
+        "ECMWF Operational": ecmwf_str,
+        "GFS Operational": gfs_str,
+        "EPS": ecmwf_str,
+        "AIFS": ecmwf_str,
+        "GEFS": gfs_str,
+        "WeatherNext": ecmwf_str
+    }
+
+# ==============================================================================
+# HELPER 2: DEV MOCK DATA GENERATOR (OFFLINE / 0 API CALLS)
 # ==============================================================================
 
 def generate_mock_data(days=7):
@@ -107,7 +134,7 @@ def generate_mock_data(days=7):
     return df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, det_run_cycles, run_cycles
 
 # ==============================================================================
-# HELPER 2: AIRPORT GEOCODING LOOKUP
+# HELPER 3: AIRPORT GEOCODING LOOKUP
 # ==============================================================================
 
 @st.cache_data(ttl=86400)
@@ -150,35 +177,6 @@ def get_coordinates_from_airport(airport_code):
 # ==============================================================================
 
 @st.cache_data(ttl=900)
-def get_model_run_cycles():
-    """Queries Open-Meteo Model Updates endpoint for actual model run cycles."""
-    url = "https://api.open-meteo.com/v1/model-updates"
-    cycles = {}
-    try:
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            model_mapping = {
-                "ecmwf_ifs025": "ECMWF Operational",
-                "gfs_seamless": "GFS Operational",
-                "ecmwf_ifs": "EPS",
-                "ecmwf_aifs025": "AIFS",
-                "gfs_ensemble": "GEFS",
-                "google_weathernext2_ensemble": "WeatherNext"
-            }
-            for key, name in model_mapping.items():
-                if key in data:
-                    run_info = data[key]
-                    raw_time = run_info.get("last_run") or run_info.get("last_run_availability_time")
-                    if raw_time:
-                        dt = pd.to_datetime(raw_time)
-                        cycles[name] = dt.strftime("%m/%d %HZ")
-    except Exception:
-        pass
-    return cycles
-
-
-@st.cache_data(ttl=900)
 def fetch_deterministic_data(lat, lon, days=7):
     """Fetches explicit operational deterministic runs for ECMWF IFS and GFS."""
     url = "https://api.open-meteo.com/v1/forecast"
@@ -193,10 +191,10 @@ def fetch_deterministic_data(lat, lon, days=7):
         "forecast_days": days
     }
     
-    all_cycles = get_model_run_cycles()
+    all_cycles = get_actual_run_cycles()
     det_run_cycles = {
-        "ECMWF Operational": all_cycles.get("ECMWF Operational", "Latest Available"),
-        "GFS Operational": all_cycles.get("GFS Operational", "Latest Available")
+        "ECMWF Operational": all_cycles["ECMWF Operational"],
+        "GFS Operational": all_cycles["GFS Operational"]
     }
     
     try:
@@ -230,16 +228,15 @@ def fetch_ensemble_data(lat, lon, days=7):
     
     dict_temp = {}
     dict_precip = {}
-    
-    all_cycles = get_model_run_cycles()
-    run_cycles = {
-        "EPS": all_cycles.get("EPS", "Latest Available"),
-        "AIFS": all_cycles.get("AIFS", "Latest Available"),
-        "GEFS": all_cycles.get("GEFS", "Latest Available"),
-        "WeatherNext": all_cycles.get("WeatherNext", "Latest Available")
-    }
-    
     errors = []
+    
+    all_cycles = get_actual_run_cycles()
+    run_cycles = {
+        "EPS": all_cycles["EPS"],
+        "AIFS": all_cycles["AIFS"],
+        "GEFS": all_cycles["GEFS"],
+        "WeatherNext": all_cycles["WeatherNext"]
+    }
     
     for m in models:
         nickname = ENS_NAME_MAP.get(m, m)
@@ -411,7 +408,7 @@ if not dev_mode and (det_err or df_det_temp.empty):
     st.info("💡 **Tip:** Switch on '🛠️ Dev Mode' in the sidebar to test layout & charts offline without hitting API rate limits.")
     st.stop()
 
-# Display Actual Model Run Cycles in Sidebar
+# Display Model Run Cycles in Sidebar
 with st.sidebar:
     st.caption(f"🕒 **Last API Fetch:** {fetch_time}")
     st.markdown("**Model Run Cycles Loaded:**")
