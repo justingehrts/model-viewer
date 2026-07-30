@@ -424,15 +424,17 @@ tab1, tab2, tab3 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution 
 with tab1:
     fig_hourly = go.Figure()
     
-    if "Deterministic" in df_det_active.columns:
-        color = MODEL_CONFIG["Deterministic"]["color"]
+    # Plot all operational deterministic models dynamically
+    det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "Deterministic": "#D55E00"}
+    for det_col in [c for c in df_det_active.columns if c != 'time']:
+        color = det_colors.get(det_col, "#D55E00")
         fig_hourly.add_trace(go.Scatter(
             x=df_det_active['time'],
-            y=df_det_active["Deterministic"],
+            y=df_det_active[det_col],
             mode='lines',
-            name="Deterministic Operational Run",
+            name=det_col,
             line=dict(color=color, width=3),
-            hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>Deterministic Run</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+            hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{det_col}</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
         ))
             
     for ens_name in ENS_ORDER:
@@ -461,8 +463,6 @@ with tab1:
     )
     st.plotly_chart(fig_hourly, use_container_width=True)
 
-
-# --- TAB 2: DAILY DISTRIBUTION SPREAD ---
 # --- TAB 2: DAILY DISTRIBUTION SPREAD ---
 with tab2:
     dates = list(daily_det_highs.index)
@@ -598,11 +598,14 @@ with tab3:
         date_obj = pd.to_datetime(d)
         row = {"Date": date_obj.strftime("%a %b %d, %Y")}
         
-        if "Deterministic" in daily_det_highs.columns:
-            if selected_var_key == "temperature_2m" and d in daily_det_lows.index:
-                row["Deterministic (L/H)"] = f"{daily_det_lows.loc[d, 'Deterministic']:.1f}° / {daily_det_highs.loc[d, 'Deterministic']:.1f}°F"
+        # Populate operational run data dynamically for all deterministic columns
+        for det_col in daily_det_highs.columns:
+            if selected_var_key == "temperature_2m" and det_col in daily_det_lows.columns and d in daily_det_lows.index:
+                low_val = daily_det_lows.loc[d, det_col]
+                high_val = daily_det_highs.loc[d, det_col]
+                row[f"{det_col} (L/H)"] = f"{low_val:.1f}° / {high_val:.1f}°F"
             else:
-                row["Deterministic"] = round(daily_det_highs.loc[d, 'Deterministic'], 2)
+                row[det_col] = round(daily_det_highs.loc[d, det_col], 2)
                 
         for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
             if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
