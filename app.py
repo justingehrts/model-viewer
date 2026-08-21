@@ -181,24 +181,6 @@ def get_coordinates_from_airport(airport_code):
 def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
     """
     Fetches and parses the latest NBM Hourly (NBH) text bulletin from the IEM API.
-    Returns a DataFrame with localized naive timestamps.
-    """
-    # IEM API for NWS text products
-    pil = f"NBH{station_code.upper()}"
-    url = f"https://mesonet.agron.iastate.edu/api/1/nwstext/{pil}"
-    
-    try:
-        res = requests.get(url, timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        
-        if "data" not in data:
-            return pd.DataFrame()
-            
-        raw_text = d@st.cache_data(ttl=900)
-def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
-    """
-    Fetches and parses the latest NBM Hourly (NBH) text bulletin from the IEM API.
     Handles NBM v5.0 formatting and returns a DataFrame with localized naive timestamps.
     """
     pil = f"NBH{station_code.upper()}"
