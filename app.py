@@ -40,7 +40,7 @@ MODEL_CONFIG = {
     # Deterministic Operational Runs
     "ECMWF Operational": {"color": "#D55E00"},  # Vermilion
     "GFS Operational":   {"color": "#CC79A7"},  # Purple/Magenta
-    "NBM Operational":   {"color": "#000000"}
+    "NBM Operational":   {"color": "#000000"},
     "Deterministic":     {"color": "#D55E00"},
     
     # Ensemble Model Families
