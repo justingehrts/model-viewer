@@ -195,68 +195,92 @@ def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
         if "data" not in data:
             return pd.DataFrame()
             
+        raw_text = d@st.cache_data(ttl=900)
+def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
+    """
+    Fetches and parses the latest NBM Hourly (NBH) text bulletin from the IEM API.
+    Handles NBM v5.0 formatting and returns a DataFrame with localized naive timestamps.
+    """
+    pil = f"NBH{station_code.upper()}"
+    url = f"https://mesonet.agron.iastate.edu/api/1/nwstext/{pil}"
+    
+    try:
+        res = requests.get(url, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        
+        if "data" not in data:
+            return pd.DataFrame()
+            
         raw_text = data["data"]
         lines = raw_text.strip().split("\n")
         
-        # Variables for parsing state
         issuance_date_str = None
         utc_hours = []
         temps = []
         
         for line in lines:
-            # 1. Extract issuance date from header (e.g., "KCMH NBM HOURLY GUIDANCE 08/21/2026 1200 UTC")
-            if "NBM HOURLY" in line:
-                parts = line.split()
-                # Find the date string in the header (MM/DD/YYYY)
+            line_clean = line.strip()
+            
+            # Handle NBM v5.0 and older NBM v4.0 headers
+            if "NBH GUIDANCE" in line_clean or "NBM HOURLY" in line_clean:
+                parts = line_clean.split()
                 for p in parts:
-                    if "/" in p and len(p) == 10:
+                    if p.count("/") == 2:  # Finds MM/DD/YYYY or M/D/YYYY
                         issuance_date_str = p
                         
-            # 2. Extract UTC hour headers
-            if line.startswith("UTC"):
-                utc_hours = line.split()[1:] # Skip the word "UTC"
+            if line_clean.startswith("UTC"):
+                utc_hours = line_clean.split()[1:]
                 
-            # 3. Extract Temperature row
-            if line.startswith("TMP"):
-                temps = line.split()[1:] # Skip the word "TMP"
+            if line_clean.startswith("TMP"):
+                temps = line_clean.split()[1:]
                 
         if not issuance_date_str or not utc_hours or not temps:
             return pd.DataFrame()
             
-        # Parse into DataFrame
         records = []
+        # pd.to_datetime gracefully handles "8/21/2026" and "08/21/2026"
         current_dt = pd.to_datetime(f"{issuance_date_str} 00:00:00", utc=True)
         
+        last_hr = None
         for hr_str, tmp_str in zip(utc_hours, temps):
-            hr = int(hr_str)
-            
-            # Create the exact UTC timestamp for this column
+            try:
+                hr = int(hr_str)
+                tmp = float(tmp_str)
+            except ValueError:
+                continue
+                
+            # Skip missing data flags (e.g., 999)
+            if tmp > 150: 
+                continue
+
             target_dt = current_dt.replace(hour=hr)
             
-            # If the hour rolls over midnight (e.g., drops from 23 to 00), advance the day
-            if records and hr < records[-1]["_utc_hour"]:
+            # If the UTC hour rolls over midnight (e.g., 23 drops to 00), advance the day
+            if last_hr is not None and hr < last_hr:
                 current_dt += pd.Timedelta(days=1)
                 target_dt = current_dt.replace(hour=hr)
                 
             records.append({
                 "time_utc": target_dt,
-                "_utc_hour": hr,
-                "NBM Operational": float(tmp_str)
+                "NBM Operational": tmp
             })
+            last_hr = hr
             
         df = pd.DataFrame(records)
-        
-        # Convert UTC to local naive time to perfectly align with Open-Meteo's timezone="auto"
-        # We determine the local offset implicitly by shifting UTC to the station's time zone.
-        # (Assuming Eastern Time for Columbus/CMH as default if tz logic is kept simple)
+        if df.empty:
+            return df
+            
+        # Convert UTC to naive local time to align perfectly with the Open-Meteo payload
         df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
         
-        # Drop helper columns
-        df = df[["time", "NBM Operational"]]
+        # Sort and return just the two necessary columns
+        df = df[["time", "NBM Operational"]].sort_values("time")
         return df
 
     except Exception as e:
-        print(f"NBM Parsing Error: {e}")
+        # Fails gracefully without breaking the Streamlit UI
+        print(f"NBM Parse Error: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=900)
