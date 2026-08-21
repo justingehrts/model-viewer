@@ -178,12 +178,25 @@ def get_coordinates_from_airport(airport_code):
 # ==============================================================================
 
 @st.cache_data(ttl=900)
-def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
+def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.DataFrame:
     """
-    Fetches and parses the latest NBM Hourly (NBH) text bulletin from the IEM API.
-    Handles NBM v5.0 formatting and returns a DataFrame with localized naive timestamps.
+    Fetches the WFO from coordinates, grabs the regional NBM Hourly (NBH) text product,
+    and isolates the specific station's forecast block.
     """
-    pil = f"NBH{station_code.upper()}"
+    headers = {"User-Agent": "StreamlitWeatherDashboard/1.0"}
+    
+    try:
+        # 1. Lookup the WFO (County Warning Area) for the coordinates
+        points_url = f"https://api.weather.gov/points/{lat},{lon}"
+        points_res = requests.get(points_url, headers=headers, timeout=5)
+        points_res.raise_for_status()
+        wfo = points_res.json()["properties"]["cwa"]
+    except Exception as e:
+        print(f"WFO Lookup Error: {e}")
+        return pd.DataFrame()
+        
+    # 2. Fetch the regional NBM product from IEM
+    pil = f"NBH{wfo}"
     url = f"https://mesonet.agron.iastate.edu/api/1/nwstext/{pil}"
     
     try:
@@ -195,33 +208,53 @@ def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
             return pd.DataFrame()
             
         raw_text = data["data"]
-        lines = raw_text.strip().split("\n")
+        
+        # 3. Isolate the specific station block (e.g., "KCMH")
+        station_search = f"K{station_code}" if len(station_code) == 3 else station_code
+        
+        start_idx = raw_text.find(station_search)
+        if start_idx == -1:
+            print(f"Station {station_search} not found in {pil}")
+            return pd.DataFrame()
+            
+        # NWS text blocks are separated by empty lines (\n\n)
+        end_idx = raw_text.find("\n\n", start_idx)
+        if end_idx == -1:
+            end_idx = len(raw_text)
+            
+        block = raw_text[start_idx:end_idx]
+        lines = block.strip().split("\n")
         
         issuance_date_str = None
         utc_hours = []
         temps = []
         
+        # 4. Parse the isolated block
         for line in lines:
             line_clean = line.strip()
             
-            # Handle NBM v5.0 and older NBM v4.0 headers
             if "NBH GUIDANCE" in line_clean or "NBM HOURLY" in line_clean:
                 parts = line_clean.split()
                 for p in parts:
-                    if p.count("/") == 2:  # Finds MM/DD/YYYY or M/D/YYYY
+                    if p.count("/") == 2:
                         issuance_date_str = p
                         
             if line_clean.startswith("UTC"):
-                utc_hours = line_clean.split()[1:]
+                # Use .extend() because products sometimes split across multiple rows
+                utc_hours.extend(line_clean.split()[1:])
                 
             if line_clean.startswith("TMP"):
-                temps = line_clean.split()[1:]
+                temps.extend(line_clean.split()[1:])
                 
         if not issuance_date_str or not utc_hours or not temps:
             return pd.DataFrame()
             
+        # Ensure array lengths match to prevent zip errors
+        min_len = min(len(utc_hours), len(temps))
+        utc_hours = utc_hours[:min_len]
+        temps = temps[:min_len]
+        
         records = []
-        # pd.to_datetime gracefully handles "8/21/2026" and "08/21/2026"
         current_dt = pd.to_datetime(f"{issuance_date_str} 00:00:00", utc=True)
         
         last_hr = None
@@ -232,17 +265,13 @@ def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
             except ValueError:
                 continue
                 
-            # Skip missing data flags (e.g., 999)
-            if tmp > 150: 
+            if tmp > 150: # Skip 999 missing data flags
                 continue
-
-            target_dt = current_dt.replace(hour=hr)
-            
-            # If the UTC hour rolls over midnight (e.g., 23 drops to 00), advance the day
+                
             if last_hr is not None and hr < last_hr:
                 current_dt += pd.Timedelta(days=1)
-                target_dt = current_dt.replace(hour=hr)
                 
+            target_dt = current_dt.replace(hour=hr)
             records.append({
                 "time_utc": target_dt,
                 "NBM Operational": tmp
@@ -253,15 +282,13 @@ def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
         if df.empty:
             return df
             
-        # Convert UTC to naive local time to align perfectly with the Open-Meteo payload
+        # Convert to naive local time
         df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
+        df = df[["time", "NBM Operational"]].sort_values("time").drop_duplicates(subset=["time"])
         
-        # Sort and return just the two necessary columns
-        df = df[["time", "NBM Operational"]].sort_values("time")
         return df
 
     except Exception as e:
-        # Fails gracefully without breaking the Streamlit UI
         print(f"NBM Parse Error: {e}")
         return pd.DataFrame()
 
@@ -524,7 +551,8 @@ if selected_var_key == "temperature_2m":
     dict_ens_active = dict_ens_temp.copy()
     
     with st.spinner(f"Fetching NBM Text Bulletin for {station_id}..."):
-        df_nbm = fetch_nbm_text_bulletin(station_code=station_id)
+        # Ensure lat and lon are passed here
+        df_nbm = fetch_nbm_text_bulletin(station_code=station_id, lat=lat, lon=lon)
         
     if not df_nbm.empty:
         # Outer merge aligns the DataFrames by the 'time' column
@@ -582,7 +610,12 @@ with tab1:
     fig_hourly = go.Figure()
     
     # Render all available operational deterministic models
-    det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "Deterministic": "#D55E00"}
+    det_colors = {
+        "ECMWF Operational": "#D55E00", 
+        "GFS Operational": "#CC79A7", 
+        "NBM Operational": "#000000",
+        "Deterministic": "#D55E00"
+    }
     for det_col in [c for c in df_det_active.columns if c != 'time']:
         color = det_colors.get(det_col, "#D55E00")
         fig_hourly.add_trace(go.Scatter(
