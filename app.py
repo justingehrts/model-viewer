@@ -40,6 +40,7 @@ MODEL_CONFIG = {
     # Deterministic Operational Runs
     "ECMWF Operational": {"color": "#D55E00"},  # Vermilion
     "GFS Operational":   {"color": "#CC79A7"},  # Purple/Magenta
+    "NBM Operational":   {"color": "#000000"}
     "Deterministic":     {"color": "#D55E00"},
     
     # Ensemble Model Families
@@ -175,6 +176,88 @@ def get_coordinates_from_airport(airport_code):
 # ==============================================================================
 # LAYER 1: LIVE DATA INGESTION (CACHED FOR 15 MINUTES)
 # ==============================================================================
+
+@st.cache_data(ttl=900)
+def fetch_nbm_text_bulletin(station_code: str = "CMH") -> pd.DataFrame:
+    """
+    Fetches and parses the latest NBM Hourly (NBH) text bulletin from the IEM API.
+    Returns a DataFrame with localized naive timestamps.
+    """
+    # IEM API for NWS text products
+    pil = f"NBH{station_code.upper()}"
+    url = f"https://mesonet.agron.iastate.edu/api/1/nwstext/{pil}"
+    
+    try:
+        res = requests.get(url, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        
+        if "data" not in data:
+            return pd.DataFrame()
+            
+        raw_text = data["data"]
+        lines = raw_text.strip().split("\n")
+        
+        # Variables for parsing state
+        issuance_date_str = None
+        utc_hours = []
+        temps = []
+        
+        for line in lines:
+            # 1. Extract issuance date from header (e.g., "KCMH NBM HOURLY GUIDANCE 08/21/2026 1200 UTC")
+            if "NBM HOURLY" in line:
+                parts = line.split()
+                # Find the date string in the header (MM/DD/YYYY)
+                for p in parts:
+                    if "/" in p and len(p) == 10:
+                        issuance_date_str = p
+                        
+            # 2. Extract UTC hour headers
+            if line.startswith("UTC"):
+                utc_hours = line.split()[1:] # Skip the word "UTC"
+                
+            # 3. Extract Temperature row
+            if line.startswith("TMP"):
+                temps = line.split()[1:] # Skip the word "TMP"
+                
+        if not issuance_date_str or not utc_hours or not temps:
+            return pd.DataFrame()
+            
+        # Parse into DataFrame
+        records = []
+        current_dt = pd.to_datetime(f"{issuance_date_str} 00:00:00", utc=True)
+        
+        for hr_str, tmp_str in zip(utc_hours, temps):
+            hr = int(hr_str)
+            
+            # Create the exact UTC timestamp for this column
+            target_dt = current_dt.replace(hour=hr)
+            
+            # If the hour rolls over midnight (e.g., drops from 23 to 00), advance the day
+            if records and hr < records[-1]["_utc_hour"]:
+                current_dt += pd.Timedelta(days=1)
+                target_dt = current_dt.replace(hour=hr)
+                
+            records.append({
+                "time_utc": target_dt,
+                "_utc_hour": hr,
+                "NBM Operational": float(tmp_str)
+            })
+            
+        df = pd.DataFrame(records)
+        
+        # Convert UTC to local naive time to perfectly align with Open-Meteo's timezone="auto"
+        # We determine the local offset implicitly by shifting UTC to the station's time zone.
+        # (Assuming Eastern Time for Columbus/CMH as default if tz logic is kept simple)
+        df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
+        
+        # Drop helper columns
+        df = df[["time", "NBM Operational"]]
+        return df
+
+    except Exception as e:
+        print(f"NBM Parsing Error: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=900)
 def fetch_deterministic_data(lat, lon, days=7):
@@ -366,12 +449,20 @@ with st.sidebar:
         
         if loc_mode == "Airport Code":
             airport_input = st.text_input("Airport Code (ICAO / IATA)", value="KCMH").strip().upper()
+            
+            # ---> AIRPORT CODE STRIPPER GOES HERE <---
+            # Strips the 'K' if the user entered 4 letters (e.g. KCMH -> CMH)
+            station_id = airport_input[1:] if len(airport_input) == 4 and airport_input.startswith("K") else airport_input
+            
             auto_lat, auto_lon, station_name = get_coordinates_from_airport(airport_input)
             lat, lon = auto_lat, auto_lon
             st.caption(f"📍 **{station_name}** ({lat:.2f}°, {lon:.2f}°)")
         else:
             lat = st.number_input("Latitude", value=39.97, step=0.01, format="%.2f")
             lon = st.number_input("Longitude", value=-83.00, step=0.01, format="%.2f")
+            
+            # Default to CMH if they are entering coordinates manually
+            station_id = "CMH" 
             
         forecast_days = st.slider("Forecast Horizon (Days)", min_value=3, max_value=14, value=7)
         
@@ -423,11 +514,20 @@ with st.sidebar:
 
 # Select Payload based on Dropdown
 if selected_var_key == "temperature_2m":
-    df_det_active = df_det_temp
-    dict_ens_active = dict_ens_temp
+    df_det_active = df_det_temp.copy()
+    dict_ens_active = dict_ens_temp.copy()
+    
+    with st.spinner(f"Fetching NBM Text Bulletin for {station_id}..."):
+        df_nbm = fetch_nbm_text_bulletin(station_code=station_id)
+        
+    if not df_nbm.empty:
+        # Outer merge aligns the DataFrames by the 'time' column
+        df_det_active = pd.merge(df_det_active, df_nbm, on="time", how="outer")
+        df_det_active = df_det_active.sort_values("time").reset_index(drop=True)
 else:
-    df_det_active = df_det_precip
-    dict_ens_active = dict_ens_precip
+    # Precipitation handling
+    df_det_active = df_det_precip.copy()
+    dict_ens_active = dict_ens_precip.copy()
 
 # Process Data dynamically
 hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows = process_ensemble_data(
