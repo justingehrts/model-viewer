@@ -613,7 +613,7 @@ with tab1:
     det_colors = {
         "ECMWF Operational": "#D55E00", 
         "GFS Operational": "#CC79A7", 
-        "NBM Operational": "#000000",
+        "NBM Operational": "#000000",  # <--- Add this back here
         "Deterministic": "#D55E00"
     }
     for det_col in [c for c in df_det_active.columns if c != 'time']:
