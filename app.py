@@ -182,66 +182,50 @@ def get_coordinates_from_airport(airport_code):
 def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.DataFrame:
     """
     Fetches the NBM Hourly (NBH) text product directly from the NWS MDL endpoint.
-    Bypasses WFO lookups and directly queries the station.
+    Uses Regex block-parsing to guarantee extraction regardless of HTML formatting.
     """
-    # Ensure standard 4-letter ICAO format
     station_search = f"K{station_code}" if len(station_code) == 3 else station_code
     
-    # Isolate request to 'NBH' (Hourly) to align with our hourly charts
+    # The exact URL endpoint requested
     url = f"https://www.weather.gov/mdl/nbm_text_dev?ele=NBH&sta={station_search}&cyc=Latest"
-    headers = {"User-Agent": "WeatherConsensusDashboard/1.0"}
+    
+    # Standard browser User-Agent prevents NWS from 403 blocking the request
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    }
     
     try:
         res = requests.get(url, headers=headers, timeout=10)
         res.raise_for_status()
         
-        # Extract text from HTML <pre> tags
-        match = re.search(r'<pre>(.*?)</pre>', res.text, re.DOTALL | re.IGNORECASE)
-        raw_text = match.group(1) if match else re.sub(r'<[^>]+>', '', res.text)
+        # Strip HTML tags, replacing them with spaces to prevent words from merging
+        raw_text = re.sub(r'<[^>]+>', ' ', res.text)
         
-        lines = raw_text.split("\n")
-        
-        in_station = False
-        issuance_date_str = None
-        issue_hour = None
-        utc_hours = []
-        temps = []
-        
-        for line in lines:
-            line_clean = line.strip()
-            if not line_clean:
-                continue
-                
-            # Detect station header (e.g., KCMH NBM V4.1 HOURLY GUIDANCE)
-            if "GUIDANCE" in line_clean and ("NBM" in line_clean or "NBH" in line_clean):
-                if line_clean.startswith(station_search):
-                    in_station = True
-                    parts = line_clean.split()
-                    
-                    for p in parts:
-                        if p.count("/") == 2:
-                            issuance_date_str = p
-                            
-                    if "UTC" in parts:
-                        try:
-                            utc_idx = parts.index("UTC")
-                            issue_hour_str = parts[utc_idx - 1]
-                            if len(issue_hour_str) == 4:
-                                issue_hour = int(issue_hour_str[:2])
-                        except Exception:
-                            pass
-                else:
-                    if in_station: break # Reached next station block
-                    
-            if in_station:
-                if line_clean.startswith("UTC"):
-                    utc_hours.extend(line_clean.split()[1:])
-                elif line_clean.startswith("TMP"):
-                    temps.extend(line_clean.split()[1:])
-                    
-        if not issuance_date_str or not utc_hours or not temps:
+        # 1. Extract the Date (e.g., 08/21/2026)
+        date_match = re.search(r'\b(\d{1,2}/\d{1,2}/\d{4})\b', raw_text)
+        if not date_match:
             return pd.DataFrame()
+        issuance_date_str = date_match.group(1)
+        
+        # 2. Extract the Issue Hour (e.g., "1200 UTC")
+        issue_hour = None
+        issue_match = re.search(r'\b(\d{4})\s+UTC\b', raw_text)
+        if issue_match:
+            issue_hour = int(issue_match.group(1)[:2])
             
+        # 3. Extract the UTC hour row
+        utc_match = re.search(r'\bUTC\s+((?:\d{1,2}\s+)+)', raw_text)
+        if not utc_match:
+            return pd.DataFrame()
+        utc_hours = utc_match.group(1).split()
+        
+        # 4. Extract the Temperature row (TMP)
+        tmp_match = re.search(r'\bTMP\s+((?:-?\d{1,3}\s+)+)', raw_text)
+        if not tmp_match:
+            return pd.DataFrame()
+        temps = tmp_match.group(1).split()
+        
+        # Enforce array length parity
         min_len = min(len(utc_hours), len(temps))
         utc_hours = utc_hours[:min_len]
         temps = temps[:min_len]
@@ -257,9 +241,10 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
             except ValueError:
                 continue
                 
-            if tmp > 150:
+            if tmp > 150:  # Skip 999 missing data flags
                 continue
                 
+            # Midnight rollover logic
             if last_hr is not None and hr < last_hr:
                 current_dt += pd.Timedelta(days=1)
                 
@@ -274,12 +259,12 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
         if df.empty:
             return df
             
-        # Convert to naive local time
+        # 5. Localize to match Open-Meteo
         df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
         df = df[["time", "NBM Operational"]].sort_values("time").drop_duplicates(subset=["time"])
         
         return df
-
+        
     except Exception as e:
         print(f"MDL NBM Parse Error: {e}")
         return pd.DataFrame()
