@@ -179,71 +179,50 @@ def get_coordinates_from_airport(airport_code):
 # ==============================================================================
 
 @st.cache_data(ttl=900)
-def fetch_nbm_gribstream(lat: float, lon: float, days: int, api_key: str) -> pd.DataFrame:
-    """
-    Fetches NBM point forecast data using the official GribStream API.
-    """
-    url = "https://gribstream.com/api/v2/nbm/timeseries"
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
+def fetch_deterministic_data(lat, lon, days=7):
+    """Fetches explicit operational deterministic runs for ECMWF IFS, GFS, and NBM."""
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "temperature_2m,precipitation",
+        "models": ["ecmwf_ifs025", "gfs_seamless", "ncep_nbm_conus"], # Added NBM here
+        "temperature_unit": "fahrenheit",
+        "precipitation_unit": "inch",
+        "timezone": "auto",  # Set to auto to ensure timestamps match local station time
+        "forecast_days": days
     }
     
-    # Calculate ISO 8601 UTC timestamps for the request body
-    now_utc = datetime.now(timezone.utc)
-    from_time = now_utc.strftime("%Y-%m-%dT%H:00:00Z")
-    until_time = (now_utc + pd.Timedelta(days=days)).strftime("%Y-%m-%dT%H:00:00Z")
-    
-    # GribStream POST payload structure
-    payload = {
-        "fromTime": from_time,
-        "untilTime": until_time,
-        "coordinates": [{"lat": lat, "lon": lon}],
-        "variables": [
-            {"name": "TMP", "level": "2 m above ground", "alias": "temperature"}
-        ]
+    all_cycles = get_actual_run_cycles()
+    det_run_cycles = {
+        "ECMWF Operational": all_cycles["ECMWF Operational"],
+        "GFS Operational": all_cycles["GFS Operational"],
+        "NBM Operational": "Latest Available" # Open-Meteo stitches NBM seamlessly
     }
     
     try:
-        res = requests.post(url, json=payload, headers=headers, timeout=15)
+        res = requests.get(url, params=params, timeout=10)
         res.raise_for_status()
         data = res.json()
         
-        # Parse the JSON array
-        records = data if isinstance(data, list) else data.get("data", [])
-        df_records = []
+        hourly = data["hourly"]
+        df_temp = pd.DataFrame({
+            "time": pd.to_datetime(hourly["time"]),
+            "ECMWF Operational": hourly.get("temperature_2m_ecmwf_ifs025"),
+            "GFS Operational": hourly.get("temperature_2m_gfs_seamless"),
+            "NBM Operational": hourly.get("temperature_2m_ncep_nbm_conus") # Mapped here
+        })
+        df_precip = pd.DataFrame({
+            "time": pd.to_datetime(hourly["time"]),
+            "ECMWF Operational": hourly.get("precipitation_ecmwf_ifs025"),
+            "GFS Operational": hourly.get("precipitation_gfs_seamless"),
+            "NBM Operational": hourly.get("precipitation_ncep_nbm_conus") # Mapped here
+        })
         
-        for row in records:
-            time_str = row.get("validTime") or row.get("time")
-            temp = row.get("temperature") or row.get("TMP")
-            
-            if time_str and temp is not None:
-                # Dynamic unit check to ensure Fahrenheit output (handles Kelvin/Celsius conversion)
-                if temp > 200: 
-                    temp = (temp - 273.15) * 9/5 + 32
-                elif temp < 60 and temp > -50: 
-                    temp = (temp * 9/5) + 32
-                    
-                df_records.append({
-                    "time_utc": pd.to_datetime(time_str, utc=True),
-                    "NBM Operational": temp
-                })
-                
-        df = pd.DataFrame(df_records)
-        if df.empty:
-            return df
-            
-        # Localize to naive local time to match your Open-Meteo data structure
-        df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
-        df = df[["time", "NBM Operational"]].sort_values("time").drop_duplicates(subset=["time"])
-        
-        return df
-        
+        fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return df_temp, df_precip, fetch_time, det_run_cycles, None
     except Exception as e:
-        print(f"GribStream API Error: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), "", {}, str(e)
 
 @st.cache_data(ttl=900)
 def fetch_deterministic_data(lat, lon, days=7):
@@ -502,19 +481,6 @@ with st.sidebar:
 if selected_var_key == "temperature_2m":
     df_det_active = df_det_temp.copy()
     dict_ens_active = dict_ens_temp.copy()
-    
-    with st.spinner(f"Fetching NBM via GribStream API..."):
-        df_nbm = fetch_nbm_gribstream(
-            lat=lat, 
-            lon=lon, 
-            days=forecast_days, 
-            api_key="fa2cf36a20209b00faac6c66a52cfaa6033c9e35"
-        )
-        
-    if not df_nbm.empty:
-        # Outer merge aligns the DataFrames by the 'time' column
-        df_det_active = pd.merge(df_det_active, df_nbm, on="time", how="outer")
-        df_det_active = df_det_active.sort_values("time").reset_index(drop=True)
 else:
     # Precipitation handling
     df_det_active = df_det_precip.copy()
