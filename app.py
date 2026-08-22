@@ -179,56 +179,70 @@ def get_coordinates_from_airport(airport_code):
 # ==============================================================================
 
 @st.cache_data(ttl=900)
-def fetch_nbm_json_api(lat: float, lon: float, api_key: str = "fa2cf36a20209b00faac6c66a52cfaa6033c9e35") -> pd.DataFrame:
+def fetch_nbm_gribstream(lat: float, lon: float, days: int, api_key: str) -> pd.DataFrame:
     """
-    Fetches NBM point forecast data using a JSON API, bypassing raw text parsing.
-    Requires an API key for the GribStream service.
+    Fetches NBM point forecast data using the official GribStream API.
     """
-    url = "https://api.gribstream.com/v1/point"
+    url = "https://gribstream.com/api/v2/nbm/timeseries"
     
-    # We request the 'TMP' (Temperature) variable at '2 m above ground'
-    params = {
-        "lat": lat,
-        "lon": lon,
-        "model": "nbm",
-        "parameters": "TMP:2 m above ground",
-        "units": "imperial", # Requests Fahrenheit directly
-        "apikey": api_key
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    # Calculate ISO 8601 UTC timestamps for the request body
+    now_utc = datetime.now(timezone.utc)
+    from_time = now_utc.strftime("%Y-%m-%dT%H:00:00Z")
+    until_time = (now_utc + pd.Timedelta(days=days)).strftime("%Y-%m-%dT%H:00:00Z")
+    
+    # GribStream POST payload structure
+    payload = {
+        "fromTime": from_time,
+        "untilTime": until_time,
+        "coordinates": [{"lat": lat, "lon": lon}],
+        "variables": [
+            {"name": "TMP", "level": "2 m above ground", "alias": "temperature"}
+        ]
     }
     
     try:
-        res = requests.get(url, params=params, timeout=10)
+        res = requests.post(url, json=payload, headers=headers, timeout=15)
         res.raise_for_status()
         data = res.json()
         
-        # GribStream typically returns a timeseries array
-        if "timeseries" not in data:
-            return pd.DataFrame()
+        # Parse the JSON array
+        records = data if isinstance(data, list) else data.get("data", [])
+        df_records = []
+        
+        for row in records:
+            time_str = row.get("validTime") or row.get("time")
+            temp = row.get("temperature") or row.get("TMP")
             
-        records = []
-        for item in data["timeseries"]:
-            # Parse the UTC timestamp returned by the API
-            utc_dt = pd.to_datetime(item["valid_time"], utc=True)
-            temp_f = item.get("TMP:2 m above ground")
-            
-            if temp_f is not None:
-                records.append({
-                    "time_utc": utc_dt,
-                    "NBM Operational": temp_f
+            if time_str and temp is not None:
+                # Dynamic unit check to ensure Fahrenheit output (handles Kelvin/Celsius conversion)
+                if temp > 200: 
+                    temp = (temp - 273.15) * 9/5 + 32
+                elif temp < 60 and temp > -50: 
+                    temp = (temp * 9/5) + 32
+                    
+                df_records.append({
+                    "time_utc": pd.to_datetime(time_str, utc=True),
+                    "NBM Operational": temp
                 })
                 
-        df = pd.DataFrame(records)
+        df = pd.DataFrame(df_records)
         if df.empty:
             return df
             
         # Localize to naive local time to match your Open-Meteo data structure
         df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
-        df = df[["time", "NBM Operational"]].sort_values("time")
+        df = df[["time", "NBM Operational"]].sort_values("time").drop_duplicates(subset=["time"])
         
         return df
         
     except Exception as e:
-        print(f"NBM JSON API Error: {e}")
+        print(f"GribStream API Error: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=900)
@@ -489,11 +503,15 @@ if selected_var_key == "temperature_2m":
     df_det_active = df_det_temp.copy()
     dict_ens_active = dict_ens_temp.copy()
     
-with st.spinner(f"Fetching NBM via JSON API..."):
-        # Replace 'YOUR_API_KEY' with your actual key
-        df_nbm = fetch_nbm_json_api(lat=lat, lon=lon, api_key="fa2cf36a20209b00faac6c66a52cfaa6033c9e35")
+    with st.spinner(f"Fetching NBM via GribStream API..."):
+        df_nbm = fetch_nbm_gribstream(
+            lat=lat, 
+            lon=lon, 
+            days=forecast_days, 
+            api_key="fa2cf36a20209b00faac6c66a52cfaa6033c9e35"
+        )
         
-if not df_nbm.empty:
+    if not df_nbm.empty:
         # Outer merge aligns the DataFrames by the 'time' column
         df_det_active = pd.merge(df_det_active, df_nbm, on="time", how="outer")
         df_det_active = df_det_active.sort_values("time").reset_index(drop=True)
