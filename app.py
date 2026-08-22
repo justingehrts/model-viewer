@@ -493,7 +493,7 @@ with st.spinner(f"Fetching NBM via JSON API..."):
         # Replace 'YOUR_API_KEY' with your actual key
         df_nbm = fetch_nbm_json_api(lat=lat, lon=lon, api_key="fa2cf36a20209b00faac6c66a52cfaa6033c9e35")
         
-    if not df_nbm.empty:
+if not df_nbm.empty:
         # Outer merge aligns the DataFrames by the 'time' column
         df_det_active = pd.merge(df_det_active, df_nbm, on="time", how="outer")
         df_det_active = df_det_active.sort_values("time").reset_index(drop=True)
