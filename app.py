@@ -179,94 +179,56 @@ def get_coordinates_from_airport(airport_code):
 # ==============================================================================
 
 @st.cache_data(ttl=900)
-def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.DataFrame:
+def fetch_nbm_json_api(lat: float, lon: float, api_key: str = "fa2cf36a20209b00faac6c66a52cfaa6033c9e35") -> pd.DataFrame:
     """
-    Fetches the NBM Hourly (NBH) text product directly from the NWS MDL endpoint.
-    Uses Regex block-parsing to guarantee extraction regardless of HTML formatting.
+    Fetches NBM point forecast data using a JSON API, bypassing raw text parsing.
+    Requires an API key for the GribStream service.
     """
-    station_search = f"K{station_code}" if len(station_code) == 3 else station_code
+    url = "https://api.gribstream.com/v1/point"
     
-    # The exact URL endpoint requested
-    url = f"https://www.weather.gov/mdl/nbm_text_dev?ele=NBH&sta={station_search}&cyc=Latest"
-    
-    # Standard browser User-Agent prevents NWS from 403 blocking the request
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    # We request the 'TMP' (Temperature) variable at '2 m above ground'
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "model": "nbm",
+        "parameters": "TMP:2 m above ground",
+        "units": "imperial", # Requests Fahrenheit directly
+        "apikey": api_key
     }
     
     try:
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, params=params, timeout=10)
         res.raise_for_status()
+        data = res.json()
         
-        # Strip HTML tags, replacing them with spaces to prevent words from merging
-        raw_text = re.sub(r'<[^>]+>', ' ', res.text)
-        
-        # 1. Extract the Date (e.g., 08/21/2026)
-        date_match = re.search(r'\b(\d{1,2}/\d{1,2}/\d{4})\b', raw_text)
-        if not date_match:
+        # GribStream typically returns a timeseries array
+        if "timeseries" not in data:
             return pd.DataFrame()
-        issuance_date_str = date_match.group(1)
-        
-        # 2. Extract the Issue Hour (e.g., "1200 UTC")
-        issue_hour = None
-        issue_match = re.search(r'\b(\d{4})\s+UTC\b', raw_text)
-        if issue_match:
-            issue_hour = int(issue_match.group(1)[:2])
             
-        # 3. Extract the UTC hour row
-        utc_match = re.search(r'\bUTC\s+((?:\d{1,2}\s+)+)', raw_text)
-        if not utc_match:
-            return pd.DataFrame()
-        utc_hours = utc_match.group(1).split()
-        
-        # 4. Extract the Temperature row (TMP)
-        tmp_match = re.search(r'\bTMP\s+((?:-?\d{1,3}\s+)+)', raw_text)
-        if not tmp_match:
-            return pd.DataFrame()
-        temps = tmp_match.group(1).split()
-        
-        # Enforce array length parity
-        min_len = min(len(utc_hours), len(temps))
-        utc_hours = utc_hours[:min_len]
-        temps = temps[:min_len]
-        
         records = []
-        current_dt = pd.to_datetime(f"{issuance_date_str} 00:00:00", utc=True)
-        last_hr = issue_hour if issue_hour is not None else int(utc_hours[0]) - 1
-        
-        for hr_str, tmp_str in zip(utc_hours, temps):
-            try:
-                hr = int(hr_str)
-                tmp = float(tmp_str)
-            except ValueError:
-                continue
-                
-            if tmp > 150:  # Skip 999 missing data flags
-                continue
-                
-            # Midnight rollover logic
-            if last_hr is not None and hr < last_hr:
-                current_dt += pd.Timedelta(days=1)
-                
-            target_dt = current_dt.replace(hour=hr)
-            records.append({
-                "time_utc": target_dt,
-                "NBM Operational": tmp
-            })
-            last_hr = hr
+        for item in data["timeseries"]:
+            # Parse the UTC timestamp returned by the API
+            utc_dt = pd.to_datetime(item["valid_time"], utc=True)
+            temp_f = item.get("TMP:2 m above ground")
             
+            if temp_f is not None:
+                records.append({
+                    "time_utc": utc_dt,
+                    "NBM Operational": temp_f
+                })
+                
         df = pd.DataFrame(records)
         if df.empty:
             return df
             
-        # 5. Localize to match Open-Meteo
+        # Localize to naive local time to match your Open-Meteo data structure
         df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
-        df = df[["time", "NBM Operational"]].sort_values("time").drop_duplicates(subset=["time"])
+        df = df[["time", "NBM Operational"]].sort_values("time")
         
         return df
         
     except Exception as e:
-        print(f"MDL NBM Parse Error: {e}")
+        print(f"NBM JSON API Error: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=900)
@@ -527,9 +489,9 @@ if selected_var_key == "temperature_2m":
     df_det_active = df_det_temp.copy()
     dict_ens_active = dict_ens_temp.copy()
     
-    with st.spinner(f"Fetching NBM Text Bulletin for {station_id}..."):
-        # Ensure lat and lon are passed here
-        df_nbm = fetch_nbm_text_bulletin(station_code=station_id, lat=lat, lon=lon)
+with st.spinner(f"Fetching NBM via JSON API..."):
+        # Replace 'YOUR_API_KEY' with your actual key
+        df_nbm = fetch_nbm_json_api(lat=lat, lon=lon, api_key="fa2cf36a20209b00faac6c66a52cfaa6033c9e35")
         
     if not df_nbm.empty:
         # Outer merge aligns the DataFrames by the 'time' column
