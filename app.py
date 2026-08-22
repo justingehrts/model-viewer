@@ -225,50 +225,6 @@ def fetch_deterministic_data(lat, lon, days=7):
         return pd.DataFrame(), pd.DataFrame(), "", {}, str(e)
 
 @st.cache_data(ttl=900)
-def fetch_deterministic_data(lat, lon, days=7):
-    """Fetches explicit operational deterministic runs for ECMWF IFS and GFS."""
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,precipitation",
-        "models": ["ecmwf_ifs025", "gfs_seamless"],
-        "temperature_unit": "fahrenheit",
-        "precipitation_unit": "inch",
-        "timezone": "auto",  # Set to auto to ensure timestamps match local station time
-        "forecast_days": days
-    }
-    
-    all_cycles = get_actual_run_cycles()
-    det_run_cycles = {
-        "ECMWF Operational": all_cycles["ECMWF Operational"],
-        "GFS Operational": all_cycles["GFS Operational"]
-    }
-    
-    try:
-        res = requests.get(url, params=params, timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        
-        hourly = data["hourly"]
-        df_temp = pd.DataFrame({
-            "time": pd.to_datetime(hourly["time"]),
-            "ECMWF Operational": hourly.get("temperature_2m_ecmwf_ifs025"),
-            "GFS Operational": hourly.get("temperature_2m_gfs_seamless")
-        })
-        df_precip = pd.DataFrame({
-            "time": pd.to_datetime(hourly["time"]),
-            "ECMWF Operational": hourly.get("precipitation_ecmwf_ifs025"),
-            "GFS Operational": hourly.get("precipitation_gfs_seamless")
-        })
-        
-        fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return df_temp, df_precip, fetch_time, det_run_cycles, None
-    except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), "", {}, str(e)
-
-
-@st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
     """Fetches probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext."""
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
@@ -621,7 +577,7 @@ with tab2:
                 hoverinfo="y+name"
             ))
 
-    det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "Deterministic": "#D55E00"}
+    det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "NBM Operational": "#000000", "Deterministic": "#D55E00"}
     for det_col in daily_det_highs.columns:
         color = det_colors.get(det_col, "#D55E00")
         fig_daily_high.add_trace(go.Scatter(
