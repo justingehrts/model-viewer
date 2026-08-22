@@ -181,19 +181,20 @@ def get_coordinates_from_airport(airport_code):
 def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.DataFrame:
     """
     Fetches the WFO from coordinates, grabs the regional NBM Hourly (NBH) text product,
-    and isolates the specific station's forecast block.
+    and isolates the specific station's forecast block safely.
     """
-    headers = {"User-Agent": "StreamlitWeatherDashboard/1.0"}
+    headers = {"User-Agent": "WeatherConsensusDashboard/1.0 (contact@example.com)"}
     
+    # 1. Lookup the WFO (County Warning Area) for the coordinates
     try:
-        # 1. Lookup the WFO (County Warning Area) for the coordinates
         points_url = f"https://api.weather.gov/points/{lat},{lon}"
         points_res = requests.get(points_url, headers=headers, timeout=5)
         points_res.raise_for_status()
         wfo = points_res.json()["properties"]["cwa"]
     except Exception as e:
         print(f"WFO Lookup Error: {e}")
-        return pd.DataFrame()
+        # Hard fallback to Wilmington/Central Ohio if the NWS API throttles the request
+        wfo = "ILN" 
         
     # 2. Fetch the regional NBM product from IEM
     pil = f"NBH{wfo}"
@@ -208,56 +209,66 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
             return pd.DataFrame()
             
         raw_text = data["data"]
+        lines = raw_text.split("\n")
         
-        # 3. Isolate the specific station block (e.g., "KCMH")
         station_search = f"K{station_code}" if len(station_code) == 3 else station_code
         
-        start_idx = raw_text.find(station_search)
-        if start_idx == -1:
-            print(f"Station {station_search} not found in {pil}")
-            return pd.DataFrame()
-            
-        # NWS text blocks are separated by empty lines (\n\n)
-        end_idx = raw_text.find("\n\n", start_idx)
-        if end_idx == -1:
-            end_idx = len(raw_text)
-            
-        block = raw_text[start_idx:end_idx]
-        lines = block.strip().split("\n")
-        
+        in_station = False
         issuance_date_str = None
+        issue_hour = None
         utc_hours = []
         temps = []
         
-        # 4. Parse the isolated block
+        # 3. Resilient line-by-line parsing
         for line in lines:
             line_clean = line.strip()
-            
-            if "NBH GUIDANCE" in line_clean or "NBM HOURLY" in line_clean:
-                parts = line_clean.split()
-                for p in parts:
-                    if p.count("/") == 2:
-                        issuance_date_str = p
+            if not line_clean:
+                continue
+                
+            # Detect any station header
+            if "GUIDANCE" in line_clean and ("NBM" in line_clean or "NBH" in line_clean):
+                if line_clean.startswith(station_search):
+                    in_station = True
+                    parts = line_clean.split()
+                    
+                    # Extract Date
+                    for p in parts:
+                        if p.count("/") == 2:
+                            issuance_date_str = p
+                            
+                    # Extract Issue Hour (located immediately before "UTC")
+                    if "UTC" in parts:
+                        try:
+                            utc_idx = parts.index("UTC")
+                            issue_hour_str = parts[utc_idx - 1]
+                            if len(issue_hour_str) == 4:
+                                issue_hour = int(issue_hour_str[:2])
+                        except Exception:
+                            pass
+                else:
+                    # We hit the next station's header. Stop parsing.
+                    if in_station:
+                        break
                         
-            if line_clean.startswith("UTC"):
-                # Use .extend() because products sometimes split across multiple rows
-                utc_hours.extend(line_clean.split()[1:])
-                
-            if line_clean.startswith("TMP"):
-                temps.extend(line_clean.split()[1:])
-                
+            if in_station:
+                if line_clean.startswith("UTC"):
+                    utc_hours.extend(line_clean.split()[1:])
+                elif line_clean.startswith("TMP"):
+                    temps.extend(line_clean.split()[1:])
+                    
         if not issuance_date_str or not utc_hours or not temps:
             return pd.DataFrame()
             
-        # Ensure array lengths match to prevent zip errors
         min_len = min(len(utc_hours), len(temps))
         utc_hours = utc_hours[:min_len]
         temps = temps[:min_len]
         
+        # 4. Build Timestamps with accurate day-rollover
         records = []
         current_dt = pd.to_datetime(f"{issuance_date_str} 00:00:00", utc=True)
         
-        last_hr = None
+        last_hr = issue_hour if issue_hour is not None else int(utc_hours[0]) - 1
+        
         for hr_str, tmp_str in zip(utc_hours, temps):
             try:
                 hr = int(hr_str)
@@ -265,9 +276,10 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
             except ValueError:
                 continue
                 
-            if tmp > 150: # Skip 999 missing data flags
+            if tmp > 150:  # Skip 999 missing data flags
                 continue
                 
+            # If the forecast hour is numerically lower than the last hour, we crossed midnight
             if last_hr is not None and hr < last_hr:
                 current_dt += pd.Timedelta(days=1)
                 
@@ -282,7 +294,7 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
         if df.empty:
             return df
             
-        # Convert to naive local time
+        # 5. Localize to match Open-Meteo
         df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
         df = df[["time", "NBM Operational"]].sort_values("time").drop_duplicates(subset=["time"])
         
