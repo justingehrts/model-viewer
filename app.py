@@ -5,6 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime, timezone
 import time
+import re
 
 # ==============================================================================
 # STREAMLIT PAGE CONFIGURATION
@@ -180,38 +181,25 @@ def get_coordinates_from_airport(airport_code):
 @st.cache_data(ttl=900)
 def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.DataFrame:
     """
-    Fetches the WFO from coordinates, grabs the regional NBM Hourly (NBH) text product,
-    and isolates the specific station's forecast block safely.
+    Fetches the NBM Hourly (NBH) text product directly from the NWS MDL endpoint.
+    Bypasses WFO lookups and directly queries the station.
     """
-    headers = {"User-Agent": "WeatherConsensusDashboard/1.0 (contact@example.com)"}
+    # Ensure standard 4-letter ICAO format
+    station_search = f"K{station_code}" if len(station_code) == 3 else station_code
     
-    # 1. Lookup the WFO (County Warning Area) for the coordinates
-    try:
-        points_url = f"https://api.weather.gov/points/{lat},{lon}"
-        points_res = requests.get(points_url, headers=headers, timeout=5)
-        points_res.raise_for_status()
-        wfo = points_res.json()["properties"]["cwa"]
-    except Exception as e:
-        print(f"WFO Lookup Error: {e}")
-        # Hard fallback to Wilmington/Central Ohio if the NWS API throttles the request
-        wfo = "ILN" 
-        
-    # 2. Fetch the regional NBM product from IEM
-    pil = f"NBH{wfo}"
-    url = f"https://mesonet.agron.iastate.edu/api/1/nwstext/{pil}"
+    # Isolate request to 'NBH' (Hourly) to align with our hourly charts
+    url = f"https://www.weather.gov/mdl/nbm_text_dev?ele=NBH&sta={station_search}&cyc=Latest"
+    headers = {"User-Agent": "WeatherConsensusDashboard/1.0"}
     
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, headers=headers, timeout=10)
         res.raise_for_status()
-        data = res.json()
         
-        if "data" not in data:
-            return pd.DataFrame()
-            
-        raw_text = data["data"]
+        # Extract text from HTML <pre> tags
+        match = re.search(r'<pre>(.*?)</pre>', res.text, re.DOTALL | re.IGNORECASE)
+        raw_text = match.group(1) if match else re.sub(r'<[^>]+>', '', res.text)
+        
         lines = raw_text.split("\n")
-        
-        station_search = f"K{station_code}" if len(station_code) == 3 else station_code
         
         in_station = False
         issuance_date_str = None
@@ -219,24 +207,21 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
         utc_hours = []
         temps = []
         
-        # 3. Resilient line-by-line parsing
         for line in lines:
             line_clean = line.strip()
             if not line_clean:
                 continue
                 
-            # Detect any station header
+            # Detect station header (e.g., KCMH NBM V4.1 HOURLY GUIDANCE)
             if "GUIDANCE" in line_clean and ("NBM" in line_clean or "NBH" in line_clean):
                 if line_clean.startswith(station_search):
                     in_station = True
                     parts = line_clean.split()
                     
-                    # Extract Date
                     for p in parts:
                         if p.count("/") == 2:
                             issuance_date_str = p
                             
-                    # Extract Issue Hour (located immediately before "UTC")
                     if "UTC" in parts:
                         try:
                             utc_idx = parts.index("UTC")
@@ -246,10 +231,8 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
                         except Exception:
                             pass
                 else:
-                    # We hit the next station's header. Stop parsing.
-                    if in_station:
-                        break
-                        
+                    if in_station: break # Reached next station block
+                    
             if in_station:
                 if line_clean.startswith("UTC"):
                     utc_hours.extend(line_clean.split()[1:])
@@ -263,10 +246,8 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
         utc_hours = utc_hours[:min_len]
         temps = temps[:min_len]
         
-        # 4. Build Timestamps with accurate day-rollover
         records = []
         current_dt = pd.to_datetime(f"{issuance_date_str} 00:00:00", utc=True)
-        
         last_hr = issue_hour if issue_hour is not None else int(utc_hours[0]) - 1
         
         for hr_str, tmp_str in zip(utc_hours, temps):
@@ -276,10 +257,9 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
             except ValueError:
                 continue
                 
-            if tmp > 150:  # Skip 999 missing data flags
+            if tmp > 150:
                 continue
                 
-            # If the forecast hour is numerically lower than the last hour, we crossed midnight
             if last_hr is not None and hr < last_hr:
                 current_dt += pd.Timedelta(days=1)
                 
@@ -294,14 +274,14 @@ def fetch_nbm_text_bulletin(station_code: str, lat: float, lon: float) -> pd.Dat
         if df.empty:
             return df
             
-        # 5. Localize to match Open-Meteo
+        # Convert to naive local time
         df["time"] = df["time_utc"].dt.tz_convert("America/New_York").dt.tz_localize(None)
         df = df[["time", "NBM Operational"]].sort_values("time").drop_duplicates(subset=["time"])
         
         return df
 
     except Exception as e:
-        print(f"NBM Parse Error: {e}")
+        print(f"MDL NBM Parse Error: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=900)
