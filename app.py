@@ -78,10 +78,15 @@ def get_actual_run_cycles():
     ecmwf_cutoff = now_utc - pd.Timedelta(hours=7)
     ecmwf_hour = (ecmwf_cutoff.hour // 12) * 12
     ecmwf_str = ecmwf_cutoff.replace(hour=ecmwf_hour, minute=0, second=0, microsecond=0).strftime("%m/%d %HZ")
-    
+
+    # NBM: hourly cycles (updated every UTC hour) with ~1.5 hour ingest lag
+    nbm_cutoff = now_utc - pd.Timedelta(hours=1, minutes=30)
+    nbm_str = nbm_cutoff.replace(minute=0, second=0, microsecond=0).strftime("%m/%d %HZ")
+
     return {
         "ECMWF Operational": ecmwf_str,
         "GFS Operational": gfs_str,
+        "NBM Operational": nbm_str,
         "EPS": ecmwf_str,
         "AIFS": ecmwf_str,
         "GEFS": gfs_str,
@@ -198,7 +203,7 @@ def fetch_deterministic_data(lat, lon, days=7):
     det_run_cycles = {
         "ECMWF Operational": all_cycles["ECMWF Operational"],
         "GFS Operational": all_cycles["GFS Operational"],
-        "NBM Operational": "Latest Available" # Open-Meteo stitches NBM seamlessly
+        "NBM Operational": all_cycles["NBM Operational"]
     }
 
     try:
@@ -521,7 +526,10 @@ with tab1:
 # --- TAB 2: DAILY DISTRIBUTION SPREAD ---
 with tab2:
     dates = list(daily_det_highs.index)
-    
+    # Display labels add the day of week (e.g. "Tue 08/25"); the underlying
+    # trace x-values stay as ISO date strings for correct grouping/sorting.
+    date_labels = {d: pd.to_datetime(d).strftime('%a %m/%d') for d in dates}
+
     # Common Axis Styling Options
     axis_style = dict(
         showgrid=True,
@@ -577,7 +585,15 @@ with tab2:
     chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
     fig_daily_high.update_layout(
         title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
-        xaxis=dict(title="Calendar Day", **axis_style),
+        xaxis=dict(
+            title="Calendar Day",
+            type='category',
+            categoryorder='array',
+            categoryarray=dates,
+            tickvals=dates,
+            ticktext=[date_labels[d] for d in dates],
+            **axis_style
+        ),
         yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
         boxmode='group',
         boxgap=0.3,
@@ -633,7 +649,15 @@ with tab2:
 
         fig_daily_low.update_layout(
             title=dict(text=f"Daily Low Temperature Spread ({var_cfg['unit']})", font=dict(size=18)),
-            xaxis=dict(title="Calendar Day", **axis_style),
+            xaxis=dict(
+                title="Calendar Day",
+                type='category',
+                categoryorder='array',
+                categoryarray=dates,
+                tickvals=dates,
+                ticktext=[date_labels[d] for d in dates],
+                **axis_style
+            ),
             yaxis=dict(title=f"Low Temperature ({var_cfg['unit']})", zeroline=False, **axis_style),
             boxmode='group',
             boxgap=0.3,
