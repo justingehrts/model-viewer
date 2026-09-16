@@ -47,6 +47,13 @@ WEATHER_VARS = {
         "hourly_param": "wind_gusts_10m",
         "daily_agg": "max",          # 'max' for daily peak gust
         "chart_title": "Daily High Wind Gust Spread"
+    },
+    "dew_point_2m": {
+        "label": "Dew Point",
+        "unit": "°F",
+        "hourly_param": "dew_point_2m"
+        # No daily_agg/chart_title: hourly line chart only, no daily
+        # box-and-whisker or high/low tracking for this variable.
     }
 }
 
@@ -128,6 +135,8 @@ def generate_mock_data(days=7):
     base_wind = 10 + 5 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
     # Gusts run stronger than sustained wind speed
     base_gust = base_wind * 1.4
+    # Dew point trails a few degrees below air temperature
+    base_dew_point = base_temp - 8
 
     dict_det = {
         "temperature_2m": pd.DataFrame({
@@ -149,6 +158,11 @@ def generate_mock_data(days=7):
             'time': dates,
             'ECMWF Operational': base_gust + 1.0,
             'GFS Operational': base_gust - 1.0
+        }),
+        "dew_point_2m": pd.DataFrame({
+            'time': dates,
+            'ECMWF Operational': base_dew_point + 1.0,
+            'GFS Operational': base_dew_point - 1.0
         })
     }
 
@@ -165,6 +179,7 @@ def generate_mock_data(days=7):
         df_p = pd.DataFrame({'time': dates})
         df_w = pd.DataFrame({'time': dates})
         df_g = pd.DataFrame({'time': dates})
+        df_d = pd.DataFrame({'time': dates})
 
         # Add synthetic ensemble member variation
         for m in range(1, 31):
@@ -172,12 +187,14 @@ def generate_mock_data(days=7):
             df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
             df_w[f"member_{m}"] = np.maximum(0, base_wind + np.random.normal(0, 2.0, len(dates)))
             df_g[f"member_{m}"] = np.maximum(0, base_gust + np.random.normal(0, 3.0, len(dates)))
+            df_d[f"member_{m}"] = base_dew_point + np.random.normal(0, 2.0, len(dates))
 
         dict_ens["temperature_2m"][nickname] = df_t
         dict_ens["precipitation"][nickname] = df_p
         dict_ens["wind_speed_10m"][nickname] = df_w
         if nickname in gust_capable_nicknames:
             dict_ens["wind_gusts_10m"][nickname] = df_g
+        dict_ens["dew_point_2m"][nickname] = df_d
         run_cycles[nickname] = "DEV-MOCK 00Z"
 
     det_run_cycles = {
@@ -379,31 +396,35 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
     daily_det_highs = pd.DataFrame()
     daily_det_lows = pd.DataFrame()
 
-    daily_agg = WEATHER_VARS[selected_var_key]["daily_agg"]
-    # A "max" aggregation implies a two-sided daily range (e.g. daily high/low
-    # temperature), so also compute the complementary "min" for the lows.
-    compute_lows = daily_agg == "max"
+    daily_agg = WEATHER_VARS[selected_var_key].get("daily_agg")
+    if daily_agg is not None:
+        # A "max" aggregation implies a two-sided daily range (e.g. daily
+        # high/low temperature), so also compute the complementary "min"
+        # for the lows.
+        compute_lows = daily_agg == "max"
 
-    df_det_daily = df_det.copy()
-    if not df_det_daily.empty and 'time' in df_det_daily.columns:
-        df_det_daily['date'] = df_det_daily['time'].dt.strftime('%Y-%m-%d')
-        det_cols = [c for c in df_det.columns if c != 'time']
+        df_det_daily = df_det.copy()
+        if not df_det_daily.empty and 'time' in df_det_daily.columns:
+            df_det_daily['date'] = df_det_daily['time'].dt.strftime('%Y-%m-%d')
+            det_cols = [c for c in df_det.columns if c != 'time']
 
-        for name in ENS_ORDER:
-            if name in dict_ens:
-                df = dict_ens[name]
-                member_cols = [c for c in df.columns if c != 'time']
-                df_daily = df.copy()
-                df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
-                grouped = df_daily.groupby('date')[member_cols]
-                daily_ens_highs[name] = getattr(grouped, daily_agg)()
-                if compute_lows:
-                    daily_ens_lows[name] = grouped.min()
+            for name in ENS_ORDER:
+                if name in dict_ens:
+                    df = dict_ens[name]
+                    member_cols = [c for c in df.columns if c != 'time']
+                    df_daily = df.copy()
+                    df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
+                    grouped = df_daily.groupby('date')[member_cols]
+                    daily_ens_highs[name] = getattr(grouped, daily_agg)()
+                    if compute_lows:
+                        daily_ens_lows[name] = grouped.min()
 
-        det_grouped = df_det_daily.groupby('date')[det_cols]
-        daily_det_highs = getattr(det_grouped, daily_agg)()
-        if compute_lows:
-            daily_det_lows = det_grouped.min()
+            det_grouped = df_det_daily.groupby('date')[det_cols]
+            daily_det_highs = getattr(det_grouped, daily_agg)()
+            if compute_lows:
+                daily_det_lows = det_grouped.min()
+    # else: this variable has no daily_agg configured (e.g. dew point) --
+    # it only gets the hourly line chart, so daily aggregates stay empty.
 
     return hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows
 
@@ -583,131 +604,69 @@ with tab1:
 
 # --- TAB 2: DAILY DISTRIBUTION SPREAD ---
 with tab2:
-    dates = list(daily_det_highs.index)
-    # Display labels add the day of week (e.g. "Tue 08/25"); the underlying
-    # trace x-values stay as ISO date strings for correct grouping/sorting.
-    date_labels = {d: pd.to_datetime(d).strftime('%a %m/%d') for d in dates}
+    if var_cfg.get("daily_agg") is None:
+        st.info(f"Daily distribution isn't tracked for {var_cfg['label']}.")
+    else:
+        dates = list(daily_det_highs.index)
+        # Display labels add the day of week (e.g. "Tue 08/25"); the underlying
+        # trace x-values stay as ISO date strings for correct grouping/sorting.
+        date_labels = {d: pd.to_datetime(d).strftime('%a %m/%d') for d in dates}
 
-    # Common Axis Styling Options
-    axis_style = dict(
-        showgrid=True,
-        gridcolor="rgba(128, 128, 128, 0.15)",
-        gridwidth=1,
-        showline=True,
-        linecolor="rgba(128, 128, 128, 0.4)",
-        linewidth=1.5,
-        tickfont=dict(size=12, family="sans-serif"),
-        title_font=dict(size=13, family="sans-serif", color="#555555")
-    )
+        # Common Axis Styling Options
+        axis_style = dict(
+            showgrid=True,
+            gridcolor="rgba(128, 128, 128, 0.15)",
+            gridwidth=1,
+            showline=True,
+            linecolor="rgba(128, 128, 128, 0.4)",
+            linewidth=1.5,
+            tickfont=dict(size=12, family="sans-serif"),
+            title_font=dict(size=13, family="sans-serif", color="#555555")
+        )
     
-    # 1. HIGH TEMPERATURE / PRECIPITATION CHART
-    fig_daily_high = go.Figure()
+        # 1. HIGH TEMPERATURE / PRECIPITATION CHART
+        fig_daily_high = go.Figure()
     
-    for ens_name in ENS_ORDER:
-        if ens_name in daily_ens_highs:
-            df_m = daily_ens_highs[ens_name]
-            color = MODEL_CONFIG[ens_name]["color"]
-            
-            x_vals = []
-            y_vals = []
-            for date_str in dates:
-                if date_str in df_m.index:
-                    vals = df_m.loc[date_str].values
-                    x_vals.extend([date_str] * len(vals))
-                    y_vals.extend(vals)
-                    
-            fig_daily_high.add_trace(go.Box(
-                x=x_vals,
-                y=y_vals,
-                name=ens_name,
-                marker_color=color,
-                line=dict(width=2),
-                whiskerwidth=0.8,
-                boxpoints='outliers',
-                legendgroup=ens_name,
-                hoverinfo="y+name"
-            ))
-
-    det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "NBM Operational": "#000000", "Deterministic": "#D55E00"}
-    for det_col in daily_det_highs.columns:
-        color = det_colors.get(det_col, "#D55E00")
-        fig_daily_high.add_trace(go.Scatter(
-            x=daily_det_highs.index,
-            y=daily_det_highs[det_col],
-            mode='markers',
-            name=det_col,
-            marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-            hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
-        ))
-
-    chart_a_title = var_cfg["chart_title"]
-    fig_daily_high.update_layout(
-        title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
-        xaxis=dict(
-            title="Calendar Day",
-            type='category',
-            categoryorder='array',
-            categoryarray=dates,
-            tickvals=dates,
-            ticktext=[date_labels[d] for d in dates],
-            **axis_style
-        ),
-        yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
-        boxmode='group',
-        boxgap=0.3,
-        boxgroupgap=0.08,
-        height=520,
-        hovermode="closest",
-        legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
-    )
-    st.plotly_chart(fig_daily_high, use_container_width=True)
-
-    # 2. LOW CHART (only meaningful for variables with a two-sided daily range, e.g. temperature)
-    if not daily_det_lows.empty:
-        st.divider()
-        fig_daily_low = go.Figure()
-        
         for ens_name in ENS_ORDER:
-            if ens_name in daily_ens_lows:
-                df_m_low = daily_ens_lows[ens_name]
+            if ens_name in daily_ens_highs:
+                df_m = daily_ens_highs[ens_name]
                 color = MODEL_CONFIG[ens_name]["color"]
-                
-                x_vals_low = []
-                y_vals_low = []
+            
+                x_vals = []
+                y_vals = []
                 for date_str in dates:
-                    if date_str in df_m_low.index:
-                        vals = df_m_low.loc[date_str].values
-                        x_vals_low.extend([date_str] * len(vals))
-                        y_vals_low.extend(vals)
-                        
-                fig_daily_low.add_trace(go.Box(
-                    x=x_vals_low,
-                    y=y_vals_low,
+                    if date_str in df_m.index:
+                        vals = df_m.loc[date_str].values
+                        x_vals.extend([date_str] * len(vals))
+                        y_vals.extend(vals)
+                    
+                fig_daily_high.add_trace(go.Box(
+                    x=x_vals,
+                    y=y_vals,
                     name=ens_name,
                     marker_color=color,
                     line=dict(width=2),
                     whiskerwidth=0.8,
                     boxpoints='outliers',
                     legendgroup=ens_name,
-                    showlegend=False,
                     hoverinfo="y+name"
                 ))
-                
-        for det_col in daily_det_lows.columns:
+
+        det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "NBM Operational": "#000000", "Deterministic": "#D55E00"}
+        for det_col in daily_det_highs.columns:
             color = det_colors.get(det_col, "#D55E00")
-            fig_daily_low.add_trace(go.Scatter(
-                x=daily_det_lows.index,
-                y=daily_det_lows[det_col],
+            fig_daily_high.add_trace(go.Scatter(
+                x=daily_det_highs.index,
+                y=daily_det_highs[det_col],
                 mode='markers',
                 name=det_col,
-                showlegend=False,
                 marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
                 hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
             ))
 
-        low_title = chart_a_title.replace("High", "Low")
-        fig_daily_low.update_layout(
-            title=dict(text=f"{low_title} ({var_cfg['unit']})", font=dict(size=18)),
+        chart_a_title = var_cfg["chart_title"]
+        fig_daily_high.update_layout(
+            title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
             xaxis=dict(
                 title="Calendar Day",
                 type='category',
@@ -717,63 +676,131 @@ with tab2:
                 ticktext=[date_labels[d] for d in dates],
                 **axis_style
             ),
-            yaxis=dict(title=f"Low {var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
+            yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
             boxmode='group',
             boxgap=0.3,
             boxgroupgap=0.08,
             height=520,
-            hovermode="closest"
+            hovermode="closest",
+            legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
         )
-        st.plotly_chart(fig_daily_low, use_container_width=True)
+        st.plotly_chart(fig_daily_high, use_container_width=True)
+
+        # 2. LOW CHART (only meaningful for variables with a two-sided daily range, e.g. temperature)
+        if not daily_det_lows.empty:
+            st.divider()
+            fig_daily_low = go.Figure()
+        
+            for ens_name in ENS_ORDER:
+                if ens_name in daily_ens_lows:
+                    df_m_low = daily_ens_lows[ens_name]
+                    color = MODEL_CONFIG[ens_name]["color"]
+                
+                    x_vals_low = []
+                    y_vals_low = []
+                    for date_str in dates:
+                        if date_str in df_m_low.index:
+                            vals = df_m_low.loc[date_str].values
+                            x_vals_low.extend([date_str] * len(vals))
+                            y_vals_low.extend(vals)
+                        
+                    fig_daily_low.add_trace(go.Box(
+                        x=x_vals_low,
+                        y=y_vals_low,
+                        name=ens_name,
+                        marker_color=color,
+                        line=dict(width=2),
+                        whiskerwidth=0.8,
+                        boxpoints='outliers',
+                        legendgroup=ens_name,
+                        showlegend=False,
+                        hoverinfo="y+name"
+                    ))
+                
+            for det_col in daily_det_lows.columns:
+                color = det_colors.get(det_col, "#D55E00")
+                fig_daily_low.add_trace(go.Scatter(
+                    x=daily_det_lows.index,
+                    y=daily_det_lows[det_col],
+                    mode='markers',
+                    name=det_col,
+                    showlegend=False,
+                    marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
+                    hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
+                ))
+
+            low_title = chart_a_title.replace("High", "Low")
+            fig_daily_low.update_layout(
+                title=dict(text=f"{low_title} ({var_cfg['unit']})", font=dict(size=18)),
+                xaxis=dict(
+                    title="Calendar Day",
+                    type='category',
+                    categoryorder='array',
+                    categoryarray=dates,
+                    tickvals=dates,
+                    ticktext=[date_labels[d] for d in dates],
+                    **axis_style
+                ),
+                yaxis=dict(title=f"Low {var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
+                boxmode='group',
+                boxgap=0.3,
+                boxgroupgap=0.08,
+                height=520,
+                hovermode="closest"
+            )
+            st.plotly_chart(fig_daily_low, use_container_width=True)
 
 # --- TAB 3: SUMMARY DATA TABLE & CSV DOWNLOAD ---
 with tab3:
-    summary_rows = []
-    dates = list(daily_det_highs.index)
+    if var_cfg.get("daily_agg") is None:
+        st.info(f"A daily summary table isn't available for {var_cfg['label']}.")
+    else:
+        summary_rows = []
+        dates = list(daily_det_highs.index)
     
-    for d in dates:
-        date_obj = pd.to_datetime(d)
-        row = {"Date": date_obj.strftime("%a %b %d, %Y")}
+        for d in dates:
+            date_obj = pd.to_datetime(d)
+            row = {"Date": date_obj.strftime("%a %b %d, %Y")}
         
-        # Populate deterministic run data dynamically
-        for det_col in daily_det_highs.columns:
-            if selected_var_key == "temperature_2m" and det_col in daily_det_lows.columns and d in daily_det_lows.index:
-                low_val = daily_det_lows.loc[d, det_col]
-                high_val = daily_det_highs.loc[d, det_col]
-                row[f"{det_col} (L/H)"] = f"{low_val:.1f}° / {high_val:.1f}°F"
-            else:
-                row[det_col] = round(daily_det_highs.loc[d, det_col], 2)
-                
-        for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
-            if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
-                high_vals = daily_ens_highs[ens_name].loc[d].values
-                if selected_var_key == "temperature_2m" and ens_name in daily_ens_lows and d in daily_ens_lows[ens_name].index:
-                    low_vals = daily_ens_lows[ens_name].loc[d].values
-                    row[f"{ens_name} Med (L/H)"] = f"{np.median(low_vals):.1f}° / {np.median(high_vals):.1f}°F"
+            # Populate deterministic run data dynamically
+            for det_col in daily_det_highs.columns:
+                if selected_var_key == "temperature_2m" and det_col in daily_det_lows.columns and d in daily_det_lows.index:
+                    low_val = daily_det_lows.loc[d, det_col]
+                    high_val = daily_det_highs.loc[d, det_col]
+                    row[f"{det_col} (L/H)"] = f"{low_val:.1f}° / {high_val:.1f}°F"
                 else:
-                    row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
+                    row[det_col] = round(daily_det_highs.loc[d, det_col], 2)
                 
-        if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
-            g_highs = daily_ens_highs["Grand Ensemble"].loc[d].values
-            if selected_var_key == "temperature_2m" and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
-                g_lows = daily_ens_lows["Grand Ensemble"].loc[d].values
-                row["Grand Ens Med (L/H)"] = f"{np.median(g_lows):.1f}° / {np.median(g_highs):.1f}°F"
-                row["High IQR Spread"] = f"{np.percentile(g_highs, 25):.1f}° to {np.percentile(g_highs, 75):.1f}°F"
-            else:
-                row["Grand Ens Median"] = round(float(np.median(g_highs)), 2)
-                row["Consensus IQR"] = f"{np.percentile(g_highs, 25):.2f} to {np.percentile(g_highs, 75):.2f} {var_cfg['unit']}"
+            for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
+                if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
+                    high_vals = daily_ens_highs[ens_name].loc[d].values
+                    if selected_var_key == "temperature_2m" and ens_name in daily_ens_lows and d in daily_ens_lows[ens_name].index:
+                        low_vals = daily_ens_lows[ens_name].loc[d].values
+                        row[f"{ens_name} Med (L/H)"] = f"{np.median(low_vals):.1f}° / {np.median(high_vals):.1f}°F"
+                    else:
+                        row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
+                
+            if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
+                g_highs = daily_ens_highs["Grand Ensemble"].loc[d].values
+                if selected_var_key == "temperature_2m" and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
+                    g_lows = daily_ens_lows["Grand Ensemble"].loc[d].values
+                    row["Grand Ens Med (L/H)"] = f"{np.median(g_lows):.1f}° / {np.median(g_highs):.1f}°F"
+                    row["High IQR Spread"] = f"{np.percentile(g_highs, 25):.1f}° to {np.percentile(g_highs, 75):.1f}°F"
+                else:
+                    row["Grand Ens Median"] = round(float(np.median(g_highs)), 2)
+                    row["Consensus IQR"] = f"{np.percentile(g_highs, 25):.2f} to {np.percentile(g_highs, 75):.2f} {var_cfg['unit']}"
             
-        summary_rows.append(row)
+            summary_rows.append(row)
         
-    df_summary_table = pd.DataFrame(summary_rows)
+        df_summary_table = pd.DataFrame(summary_rows)
     
-    st.subheader(f"Daily Consensus Summary Table ({var_cfg['unit']})")
-    st.dataframe(df_summary_table, use_container_width=True, hide_index=True)
+        st.subheader(f"Daily Consensus Summary Table ({var_cfg['unit']})")
+        st.dataframe(df_summary_table, use_container_width=True, hide_index=True)
     
-    csv = df_summary_table.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Download Daily Summary CSV",
-        data=csv,
-        file_name=f"weather_consensus_{selected_var_key}_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
+        csv = df_summary_table.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Download Daily Summary CSV",
+            data=csv,
+            file_name=f"weather_consensus_{selected_var_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv"
+        )
