@@ -25,7 +25,7 @@ WEATHER_VARS = {
         "unit": "°F",
         "hourly_param": "temperature_2m",
         "daily_agg": "max",          # 'max' for daily highs
-        "chart_title": "Daily Temperature Spread"
+        "chart_title": "Daily High Temperature Spread"
     },
     "precipitation": {
         "label": "Total Precipitation",
@@ -33,6 +33,13 @@ WEATHER_VARS = {
         "hourly_param": "precipitation",
         "daily_agg": "sum",          # 'sum' for total daily rainfall
         "chart_title": "Daily Total Precipitation Spread"
+    },
+    "wind_speed_10m": {
+        "label": "Wind Speed",
+        "unit": "mph",
+        "hourly_param": "wind_speed_10m",
+        "daily_agg": "max",          # 'max' for daily peak wind
+        "chart_title": "Daily High Wind Speed Spread"
     }
 }
 
@@ -104,7 +111,9 @@ def generate_mock_data(days=7):
     
     # Generate realistic diurnal temperature curve (60°F to 80°F)
     base_temp = 70 + 10 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
-    
+    # Generate a mild diurnal wind speed curve (5 to 15 mph)
+    base_wind = 10 + 5 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
+
     dict_det = {
         "temperature_2m": pd.DataFrame({
             'time': dates,
@@ -115,6 +124,11 @@ def generate_mock_data(days=7):
             'time': dates,
             'ECMWF Operational': np.zeros(len(dates)),
             'GFS Operational': np.zeros(len(dates))
+        }),
+        "wind_speed_10m": pd.DataFrame({
+            'time': dates,
+            'ECMWF Operational': base_wind + 1.0,
+            'GFS Operational': base_wind - 1.0
         })
     }
 
@@ -124,14 +138,17 @@ def generate_mock_data(days=7):
     for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
         df_t = pd.DataFrame({'time': dates})
         df_p = pd.DataFrame({'time': dates})
+        df_w = pd.DataFrame({'time': dates})
 
         # Add synthetic ensemble member variation
         for m in range(1, 31):
             df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
             df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
+            df_w[f"member_{m}"] = np.maximum(0, base_wind + np.random.normal(0, 2.0, len(dates)))
 
         dict_ens["temperature_2m"][nickname] = df_t
         dict_ens["precipitation"][nickname] = df_p
+        dict_ens["wind_speed_10m"][nickname] = df_w
         run_cycles[nickname] = "DEV-MOCK 00Z"
 
     det_run_cycles = {
@@ -194,6 +211,7 @@ def fetch_deterministic_data(lat, lon, days=7):
         "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values()),
         "models": ["ecmwf_ifs025", "gfs_seamless", "ncep_nbm_conus"], # Added NBM here
         "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
         "precipitation_unit": "inch",
         "timezone": "auto",  # Set to auto to ensure timestamps match local station time
         "forecast_days": days
@@ -252,6 +270,7 @@ def fetch_ensemble_data(lat, lon, days=7):
             "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values()),
             "models": m,
             "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
             "precipitation_unit": "inch",
             "timezone": "auto",  # Set to auto to ensure timestamps match local station time
             "forecast_days": days
@@ -582,7 +601,7 @@ with tab2:
             hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
         ))
 
-    chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
+    chart_a_title = var_cfg["chart_title"]
     fig_daily_high.update_layout(
         title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
         xaxis=dict(
@@ -604,8 +623,8 @@ with tab2:
     )
     st.plotly_chart(fig_daily_high, use_container_width=True)
 
-    # 2. LOW TEMPERATURE CHART
-    if selected_var_key == "temperature_2m" and not daily_det_lows.empty:
+    # 2. LOW CHART (only meaningful for variables with a two-sided daily range, e.g. temperature)
+    if not daily_det_lows.empty:
         st.divider()
         fig_daily_low = go.Figure()
         
@@ -647,8 +666,9 @@ with tab2:
                 hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
             ))
 
+        low_title = chart_a_title.replace("High", "Low")
         fig_daily_low.update_layout(
-            title=dict(text=f"Daily Low Temperature Spread ({var_cfg['unit']})", font=dict(size=18)),
+            title=dict(text=f"{low_title} ({var_cfg['unit']})", font=dict(size=18)),
             xaxis=dict(
                 title="Calendar Day",
                 type='category',
@@ -658,7 +678,7 @@ with tab2:
                 ticktext=[date_labels[d] for d in dates],
                 **axis_style
             ),
-            yaxis=dict(title=f"Low Temperature ({var_cfg['unit']})", zeroline=False, **axis_style),
+            yaxis=dict(title=f"Low {var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
             boxmode='group',
             boxgap=0.3,
             boxgroupgap=0.08,
