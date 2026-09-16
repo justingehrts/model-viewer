@@ -40,6 +40,13 @@ WEATHER_VARS = {
         "hourly_param": "wind_speed_10m",
         "daily_agg": "max",          # 'max' for daily peak wind
         "chart_title": "Daily High Wind Speed Spread"
+    },
+    "wind_gusts_10m": {
+        "label": "Wind Gust",
+        "unit": "mph",
+        "hourly_param": "wind_gusts_10m",
+        "daily_agg": "max",          # 'max' for daily peak gust
+        "chart_title": "Daily High Wind Gust Spread"
     }
 }
 
@@ -113,6 +120,8 @@ def generate_mock_data(days=7):
     base_temp = 70 + 10 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
     # Generate a mild diurnal wind speed curve (5 to 15 mph)
     base_wind = 10 + 5 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
+    # Gusts run stronger than sustained wind speed
+    base_gust = base_wind * 1.4
 
     dict_det = {
         "temperature_2m": pd.DataFrame({
@@ -129,26 +138,40 @@ def generate_mock_data(days=7):
             'time': dates,
             'ECMWF Operational': base_wind + 1.0,
             'GFS Operational': base_wind - 1.0
+        }),
+        "wind_gusts_10m": pd.DataFrame({
+            'time': dates,
+            'ECMWF Operational': base_gust + 1.0,
+            'GFS Operational': base_gust - 1.0
         })
     }
 
     dict_ens = {var_key: {} for var_key in WEATHER_VARS}
     run_cycles = {}
 
+    # AIFS and WeatherNext are AI-based models without gust parameterization,
+    # so they're left out of wind_gusts_10m here to mirror the live API's
+    # exclusion behavior for Dev Mode testing.
+    gust_capable_nicknames = {"EPS", "GEFS"}
+
     for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
         df_t = pd.DataFrame({'time': dates})
         df_p = pd.DataFrame({'time': dates})
         df_w = pd.DataFrame({'time': dates})
+        df_g = pd.DataFrame({'time': dates})
 
         # Add synthetic ensemble member variation
         for m in range(1, 31):
             df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
             df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
             df_w[f"member_{m}"] = np.maximum(0, base_wind + np.random.normal(0, 2.0, len(dates)))
+            df_g[f"member_{m}"] = np.maximum(0, base_gust + np.random.normal(0, 3.0, len(dates)))
 
         dict_ens["temperature_2m"][nickname] = df_t
         dict_ens["precipitation"][nickname] = df_p
         dict_ens["wind_speed_10m"][nickname] = df_w
+        if nickname in gust_capable_nicknames:
+            dict_ens["wind_gusts_10m"][nickname] = df_g
         run_cycles[nickname] = "DEV-MOCK 00Z"
 
     det_run_cycles = {
@@ -290,9 +313,16 @@ def fetch_ensemble_data(lat, lon, days=7):
 
             for var_key, cfg in WEATHER_VARS.items():
                 hourly_param = cfg["hourly_param"]
-                df_m_var = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-
                 var_keys = [k for k in hourly.keys() if k.startswith(hourly_param)]
+                if not var_keys:
+                    # This model's response has no columns for this variable
+                    # (e.g. AI-based models often lack diagnostic fields like
+                    # wind gusts) -- skip it here rather than adding an
+                    # empty/all-NaN series, so it's cleanly excluded from
+                    # this variable's charts instead of erroring downstream.
+                    continue
+
+                df_m_var = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
                 for k in var_keys:
                     col = k.replace(f"{hourly_param}_", "")
                     df_m_var[col] = hourly[k]
