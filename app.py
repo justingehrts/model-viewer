@@ -75,6 +75,12 @@ ENS_NAME_MAP = {
     "google_weathernext2_ensemble": "WeatherNext"
 }
 
+DET_MODEL_SLUGS = {
+    "ECMWF Operational": "ecmwf_ifs025",
+    "GFS Operational": "gfs_seamless",
+    "NBM Operational": "ncep_nbm_conus"
+}
+
 # ==============================================================================
 # HELPER 1: LIVE MODEL RUN CYCLE CALCULATOR (STRICTLY UTC)
 # ==============================================================================
@@ -232,7 +238,7 @@ def fetch_deterministic_data(lat, lon, days=7):
         "latitude": lat,
         "longitude": lon,
         "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values()),
-        "models": ["ecmwf_ifs025", "gfs_seamless", "ncep_nbm_conus"], # Added NBM here
+        "models": list(DET_MODEL_SLUGS.values()),
         "temperature_unit": "fahrenheit",
         "wind_speed_unit": "mph",
         "precipitation_unit": "inch",
@@ -256,12 +262,15 @@ def fetch_deterministic_data(lat, lon, days=7):
         dict_det = {}
         for var_key, cfg in WEATHER_VARS.items():
             hourly_param = cfg["hourly_param"]
-            dict_det[var_key] = pd.DataFrame({
-                "time": pd.to_datetime(hourly["time"]),
-                "ECMWF Operational": hourly.get(f"{hourly_param}_ecmwf_ifs025"),
-                "GFS Operational": hourly.get(f"{hourly_param}_gfs_seamless"),
-                "NBM Operational": hourly.get(f"{hourly_param}_ncep_nbm_conus") # Mapped here
-            })
+            df_var = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+            for model_name, slug in DET_MODEL_SLUGS.items():
+                key = f"{hourly_param}_{slug}"
+                if key in hourly:
+                    df_var[model_name] = hourly[key]
+                # else: this model doesn't return this variable -- leave it
+                # out entirely so it's excluded from charts/legends instead
+                # of showing an empty/all-NaN series.
+            dict_det[var_key] = df_var
 
         fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return dict_det, fetch_time, det_run_cycles, None
