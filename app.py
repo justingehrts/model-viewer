@@ -78,10 +78,15 @@ def get_actual_run_cycles():
     ecmwf_cutoff = now_utc - pd.Timedelta(hours=7)
     ecmwf_hour = (ecmwf_cutoff.hour // 12) * 12
     ecmwf_str = ecmwf_cutoff.replace(hour=ecmwf_hour, minute=0, second=0, microsecond=0).strftime("%m/%d %HZ")
-    
+
+    # NBM: hourly cycles (updated every UTC hour) with ~1.5 hour ingest lag
+    nbm_cutoff = now_utc - pd.Timedelta(hours=1, minutes=30)
+    nbm_str = nbm_cutoff.replace(minute=0, second=0, microsecond=0).strftime("%m/%d %HZ")
+
     return {
         "ECMWF Operational": ecmwf_str,
         "GFS Operational": gfs_str,
+        "NBM Operational": nbm_str,
         "EPS": ecmwf_str,
         "AIFS": ecmwf_str,
         "GEFS": gfs_str,
@@ -100,40 +105,41 @@ def generate_mock_data(days=7):
     # Generate realistic diurnal temperature curve (60°F to 80°F)
     base_temp = 70 + 10 * np.sin(np.linspace(0, days * 2 * np.pi, len(dates)))
     
-    df_det_temp = pd.DataFrame({
-        'time': dates, 
-        'ECMWF Operational': base_temp + 1.0,
-        'GFS Operational': base_temp - 1.0
-    })
-    df_det_precip = pd.DataFrame({
-        'time': dates, 
-        'ECMWF Operational': np.zeros(len(dates)),
-        'GFS Operational': np.zeros(len(dates))
-    })
-    
-    dict_ens_temp = {}
-    dict_ens_precip = {}
+    dict_det = {
+        "temperature_2m": pd.DataFrame({
+            'time': dates,
+            'ECMWF Operational': base_temp + 1.0,
+            'GFS Operational': base_temp - 1.0
+        }),
+        "precipitation": pd.DataFrame({
+            'time': dates,
+            'ECMWF Operational': np.zeros(len(dates)),
+            'GFS Operational': np.zeros(len(dates))
+        })
+    }
+
+    dict_ens = {var_key: {} for var_key in WEATHER_VARS}
     run_cycles = {}
-    
+
     for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
         df_t = pd.DataFrame({'time': dates})
         df_p = pd.DataFrame({'time': dates})
-        
+
         # Add synthetic ensemble member variation
         for m in range(1, 31):
             df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
             df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
-            
-        dict_ens_temp[nickname] = df_t
-        dict_ens_precip[nickname] = df_p
+
+        dict_ens["temperature_2m"][nickname] = df_t
+        dict_ens["precipitation"][nickname] = df_p
         run_cycles[nickname] = "DEV-MOCK 00Z"
-        
+
     det_run_cycles = {
         "ECMWF Operational": "DEV-MOCK 00Z",
         "GFS Operational": "DEV-MOCK 00Z"
     }
-        
-    return df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, det_run_cycles, run_cycles
+
+    return dict_det, dict_ens, det_run_cycles, run_cycles
 
 # ==============================================================================
 # HELPER 3: AIRPORT GEOCODING LOOKUP
@@ -185,55 +191,51 @@ def fetch_deterministic_data(lat, lon, days=7):
     params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": "temperature_2m,precipitation",
+        "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values()),
         "models": ["ecmwf_ifs025", "gfs_seamless", "ncep_nbm_conus"], # Added NBM here
         "temperature_unit": "fahrenheit",
         "precipitation_unit": "inch",
         "timezone": "auto",  # Set to auto to ensure timestamps match local station time
         "forecast_days": days
     }
-    
+
     all_cycles = get_actual_run_cycles()
     det_run_cycles = {
         "ECMWF Operational": all_cycles["ECMWF Operational"],
         "GFS Operational": all_cycles["GFS Operational"],
-        "NBM Operational": "Latest Available" # Open-Meteo stitches NBM seamlessly
+        "NBM Operational": all_cycles["NBM Operational"]
     }
-    
+
     try:
         res = requests.get(url, params=params, timeout=10)
         res.raise_for_status()
         data = res.json()
-        
+
         hourly = data["hourly"]
-        df_temp = pd.DataFrame({
-            "time": pd.to_datetime(hourly["time"]),
-            "ECMWF Operational": hourly.get("temperature_2m_ecmwf_ifs025"),
-            "GFS Operational": hourly.get("temperature_2m_gfs_seamless"),
-            "NBM Operational": hourly.get("temperature_2m_ncep_nbm_conus") # Mapped here
-        })
-        df_precip = pd.DataFrame({
-            "time": pd.to_datetime(hourly["time"]),
-            "ECMWF Operational": hourly.get("precipitation_ecmwf_ifs025"),
-            "GFS Operational": hourly.get("precipitation_gfs_seamless"),
-            "NBM Operational": hourly.get("precipitation_ncep_nbm_conus") # Mapped here
-        })
-        
+        dict_det = {}
+        for var_key, cfg in WEATHER_VARS.items():
+            hourly_param = cfg["hourly_param"]
+            dict_det[var_key] = pd.DataFrame({
+                "time": pd.to_datetime(hourly["time"]),
+                "ECMWF Operational": hourly.get(f"{hourly_param}_ecmwf_ifs025"),
+                "GFS Operational": hourly.get(f"{hourly_param}_gfs_seamless"),
+                "NBM Operational": hourly.get(f"{hourly_param}_ncep_nbm_conus") # Mapped here
+            })
+
         fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return df_temp, df_precip, fetch_time, det_run_cycles, None
+        return dict_det, fetch_time, det_run_cycles, None
     except Exception as e:
-        return pd.DataFrame(), pd.DataFrame(), "", {}, str(e)
+        return {var_key: pd.DataFrame() for var_key in WEATHER_VARS}, "", {}, str(e)
 
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
     """Fetches probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext."""
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
     models = ["ecmwf_ifs025", "ecmwf_aifs025", "gfs_seamless", "google_weathernext2_ensemble"]
-    
-    dict_temp = {}
-    dict_precip = {}
+
+    dict_ens = {var_key: {} for var_key in WEATHER_VARS}
     errors = []
-    
+
     all_cycles = get_actual_run_cycles()
     run_cycles = {
         "EPS": all_cycles["EPS"],
@@ -241,55 +243,50 @@ def fetch_ensemble_data(lat, lon, days=7):
         "GEFS": all_cycles["GEFS"],
         "WeatherNext": all_cycles["WeatherNext"]
     }
-    
+
     for m in models:
         nickname = ENS_NAME_MAP.get(m, m)
         params = {
             "latitude": lat,
             "longitude": lon,
-            "hourly": "temperature_2m,precipitation",
+            "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values()),
             "models": m,
             "temperature_unit": "fahrenheit",
             "precipitation_unit": "inch",
             "timezone": "auto",  # Set to auto to ensure timestamps match local station time
             "forecast_days": days
         }
-        
+
         try:
             res = requests.get(url, params=params, timeout=15)
             if res.status_code != 200:
                 errors.append(f"{nickname}: HTTP {res.status_code}")
                 continue
-                
+
             data = res.json()
             if "hourly" not in data or "time" not in data["hourly"]:
                 continue
-                
+
             hourly = data["hourly"]
-            df_m_temp = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-            df_m_precip = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-            
-            temp_keys = [k for k in hourly.keys() if k.startswith("temperature_2m")]
-            precip_keys = [k for k in hourly.keys() if k.startswith("precipitation")]
-            
-            for k in temp_keys:
-                col = k.replace("temperature_2m_", "")
-                df_m_temp[col] = hourly[k]
-                
-            for k in precip_keys:
-                col = k.replace("precipitation_", "")
-                df_m_precip[col] = hourly[k]
-                
-            dict_temp[nickname] = df_m_temp
-            dict_precip[nickname] = df_m_precip
+
+            for var_key, cfg in WEATHER_VARS.items():
+                hourly_param = cfg["hourly_param"]
+                df_m_var = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+
+                var_keys = [k for k in hourly.keys() if k.startswith(hourly_param)]
+                for k in var_keys:
+                    col = k.replace(f"{hourly_param}_", "")
+                    df_m_var[col] = hourly[k]
+
+                dict_ens[var_key][nickname] = df_m_var
 
             time.sleep(0.15)
 
         except Exception as e:
             errors.append(f"{nickname}: {str(e)}")
             continue
-        
-    return dict_temp, dict_precip, run_cycles, errors
+
+    return dict_ens, run_cycles, errors
 
 # ==============================================================================
 # LAYER 2 & 3: PROCESSING & GRAND ENSEMBLE BUILDER
@@ -320,37 +317,35 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
 
     daily_ens_highs = {}
     daily_ens_lows = {}
-    
+
     daily_det_highs = pd.DataFrame()
     daily_det_lows = pd.DataFrame()
+
+    daily_agg = WEATHER_VARS[selected_var_key]["daily_agg"]
+    # A "max" aggregation implies a two-sided daily range (e.g. daily high/low
+    # temperature), so also compute the complementary "min" for the lows.
+    compute_lows = daily_agg == "max"
 
     df_det_daily = df_det.copy()
     if not df_det_daily.empty and 'time' in df_det_daily.columns:
         df_det_daily['date'] = df_det_daily['time'].dt.strftime('%Y-%m-%d')
         det_cols = [c for c in df_det.columns if c != 'time']
 
-        if selected_var_key == "temperature_2m":
-            for name in ENS_ORDER:
-                if name in dict_ens:
-                    df = dict_ens[name]
-                    member_cols = [c for c in df.columns if c != 'time']
-                    df_daily = df.copy()
-                    df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
-                    daily_ens_highs[name] = df_daily.groupby('date')[member_cols].max()
-                    daily_ens_lows[name] = df_daily.groupby('date')[member_cols].min()
-                    
-            daily_det_highs = df_det_daily.groupby('date')[det_cols].max()
-            daily_det_lows = df_det_daily.groupby('date')[det_cols].min()
-        else:
-            for name in ENS_ORDER:
-                if name in dict_ens:
-                    df = dict_ens[name]
-                    member_cols = [c for c in df.columns if c != 'time']
-                    df_daily = df.copy()
-                    df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
-                    daily_ens_highs[name] = df_daily.groupby('date')[member_cols].sum()
-                    
-            daily_det_highs = df_det_daily.groupby('date')[det_cols].sum()
+        for name in ENS_ORDER:
+            if name in dict_ens:
+                df = dict_ens[name]
+                member_cols = [c for c in df.columns if c != 'time']
+                df_daily = df.copy()
+                df_daily['date'] = df_daily['time'].dt.strftime('%Y-%m-%d')
+                grouped = df_daily.groupby('date')[member_cols]
+                daily_ens_highs[name] = getattr(grouped, daily_agg)()
+                if compute_lows:
+                    daily_ens_lows[name] = grouped.min()
+
+        det_grouped = df_det_daily.groupby('date')[det_cols]
+        daily_det_highs = getattr(det_grouped, daily_agg)()
+        if compute_lows:
+            daily_det_lows = det_grouped.min()
 
     return hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows
 
@@ -407,15 +402,15 @@ with st.sidebar:
 # ==============================================================================
 
 if dev_mode:
-    df_det_temp, df_det_precip, dict_ens_temp, dict_ens_precip, det_run_cycles, run_cycles = generate_mock_data(days=forecast_days)
+    dict_det, dict_ens, det_run_cycles, run_cycles = generate_mock_data(days=forecast_days)
     fetch_time = "OFFLINE DEV MODE"
     det_err = None
 else:
     with st.spinner("Fetching multi-model ensemble payloads..."):
-        df_det_temp, df_det_precip, fetch_time, det_run_cycles, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
-        dict_ens_temp, dict_ens_precip, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
+        dict_det, fetch_time, det_run_cycles, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
+        dict_ens, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
 
-if not dev_mode and (det_err or df_det_temp.empty):
+if not dev_mode and (det_err or dict_det[selected_var_key].empty):
     st.error(f"⚠️ Unable to fetch weather data from Open-Meteo. Details: `{det_err}`")
     st.info("💡 **Tip:** Switch on '🛠️ Dev Mode' in the sidebar to test layout & charts offline without hitting API rate limits.")
     st.stop()
@@ -434,13 +429,8 @@ with st.sidebar:
         st.text(f"• {model_name:<18}: {cycle_str}")
 
 # Select Payload based on Dropdown
-if selected_var_key == "temperature_2m":
-    df_det_active = df_det_temp.copy()
-    dict_ens_active = dict_ens_temp.copy()
-else:
-    # Precipitation handling
-    df_det_active = df_det_precip.copy()
-    dict_ens_active = dict_ens_precip.copy()
+df_det_active = dict_det[selected_var_key].copy()
+dict_ens_active = dict_ens[selected_var_key].copy()
 
 # Process Data dynamically
 hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows = process_ensemble_data(
@@ -536,7 +526,10 @@ with tab1:
 # --- TAB 2: DAILY DISTRIBUTION SPREAD ---
 with tab2:
     dates = list(daily_det_highs.index)
-    
+    # Display labels add the day of week (e.g. "Tue 08/25"); the underlying
+    # trace x-values stay as ISO date strings for correct grouping/sorting.
+    date_labels = {d: pd.to_datetime(d).strftime('%a %m/%d') for d in dates}
+
     # Common Axis Styling Options
     axis_style = dict(
         showgrid=True,
@@ -592,7 +585,15 @@ with tab2:
     chart_a_title = "Daily High Temperature Spread" if selected_var_key == "temperature_2m" else "Daily Total Precipitation Spread"
     fig_daily_high.update_layout(
         title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
-        xaxis=dict(title="Calendar Day", **axis_style),
+        xaxis=dict(
+            title="Calendar Day",
+            type='category',
+            categoryorder='array',
+            categoryarray=dates,
+            tickvals=dates,
+            ticktext=[date_labels[d] for d in dates],
+            **axis_style
+        ),
         yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
         boxmode='group',
         boxgap=0.3,
@@ -648,7 +649,15 @@ with tab2:
 
         fig_daily_low.update_layout(
             title=dict(text=f"Daily Low Temperature Spread ({var_cfg['unit']})", font=dict(size=18)),
-            xaxis=dict(title="Calendar Day", **axis_style),
+            xaxis=dict(
+                title="Calendar Day",
+                type='category',
+                categoryorder='array',
+                categoryarray=dates,
+                tickvals=dates,
+                ticktext=[date_labels[d] for d in dates],
+                **axis_style
+            ),
             yaxis=dict(title=f"Low Temperature ({var_cfg['unit']})", zeroline=False, **axis_style),
             boxmode='group',
             boxgap=0.3,
