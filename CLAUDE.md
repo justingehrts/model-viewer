@@ -4,8 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 ## What this is
 
-A single-page Streamlit dashboard that compares weather forecast models for a
-general weather-watching audience (not an aviation/METAR/TAF tool — airport
+A single-page Streamlit dashboard that compares weather forecast models for broadcast meteorologists (not a detailed aviation/METAR/TAF tool — airport
 codes are only used as a convenient way to look up a location's lat/lon).
 
 It contrasts:
