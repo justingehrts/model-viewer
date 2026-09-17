@@ -476,6 +476,15 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+    st.divider()
+    tick_interval_label = st.radio(
+        "Hourly Chart Tick Interval",
+        ["6 Hours", "12 Hours"],
+        index=1,
+        horizontal=True
+    )
+    tick_interval_hours = 6 if tick_interval_label == "6 Hours" else 12
+
 # ==============================================================================
 # ROUTING: DEV MODE VS LIVE FETCH
 # ==============================================================================
@@ -564,7 +573,11 @@ with tab1:
 
     fig_hourly.update_layout(
         title=dict(text=f"Hourly {var_cfg['label']} Trajectory ({var_cfg['unit']})", font=dict(size=18)),
-        xaxis_title="Date / Time (Local)",
+        xaxis=dict(
+            title="Date / Time (Local)",
+            tickformat="%a %m/%d",
+            dtick=tick_interval_hours * 60 * 60 * 1000
+        ),
         yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
         hovermode="x unified",
         height=550,
