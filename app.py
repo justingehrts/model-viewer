@@ -27,6 +27,13 @@ WEATHER_VARS = {
         "daily_agg": "max",          # 'max' for daily highs
         "chart_title": "Daily High Temperature Spread"
     },
+    "dew_point_2m": {
+        "label": "Dew Point",
+        "unit": "°F",
+        "hourly_param": "dew_point_2m"
+        # No daily_agg/chart_title: hourly line chart only, no daily
+        # box-and-whisker or high/low tracking for this variable.
+    },
     "precipitation": {
         "label": "Total Precipitation",
         "unit": "in",
@@ -47,13 +54,6 @@ WEATHER_VARS = {
         "hourly_param": "wind_gusts_10m",
         "daily_agg": "max",          # 'max' for daily peak gust
         "chart_title": "Daily High Wind Gust Spread"
-    },
-    "dew_point_2m": {
-        "label": "Dew Point",
-        "unit": "°F",
-        "hourly_param": "dew_point_2m"
-        # No daily_agg/chart_title: hourly line chart only, no daily
-        # box-and-whisker or high/low tracking for this variable.
     }
 }
 
@@ -517,35 +517,6 @@ hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lo
     df_det_active, 
     selected_var_key=selected_var_key
 )
-
-# ==============================================================================
-# KEY METRICS SUMMARY CARDS
-# ==============================================================================
-
-if "Grand Ensemble" in daily_ens_highs and not daily_det_highs.empty:
-    grand_daily = daily_ens_highs["Grand Ensemble"]
-    dates = list(daily_det_highs.index)
-    
-    if len(dates) > 0:
-        peak_val = grand_daily.loc[dates[0]].median().max()
-        max_day_str = dates[0]
-        
-        for d in dates:
-            m_val = np.median(grand_daily.loc[d].values)
-            if m_val > peak_val:
-                peak_val = m_val
-                max_day_str = d
-                
-        first_day_spread = np.percentile(grand_daily.loc[dates[0]].values, 75) - np.percentile(grand_daily.loc[dates[0]].values, 25)
-        last_day_spread = np.percentile(grand_daily.loc[dates[-1]].values, 75) - np.percentile(grand_daily.loc[dates[-1]].values, 25)
-
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Location Coordinates", f"{lat:.2f}°, {lon:.2f}°")
-        col2.metric(f"Peak Consensus {var_cfg['label']}", f"{peak_val:.1f} {var_cfg['unit']}", f"Day: {max_day_str}")
-        col3.metric("Day 1 Consensus Spread (IQR)", f"{first_day_spread:.1f} {var_cfg['unit']}")
-        col4.metric(f"Day {forecast_days} Uncertainty Spread", f"{last_day_spread:.1f} {var_cfg['unit']}", f"+{last_day_spread - first_day_spread:.1f} {var_cfg['unit']} vs Day 1", delta_color="inverse")
-
-st.divider()
 
 # ==============================================================================
 # LAYER 4: PLOTLY VISUALIZATIONS
