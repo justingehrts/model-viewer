@@ -27,6 +27,13 @@ WEATHER_VARS = {
         "daily_agg": "max",          # 'max' for daily highs
         "chart_title": "Daily High Temperature Spread"
     },
+    "apparent_temperature": {
+        "label": "Feels Like",
+        "unit": "°F",
+        "hourly_param": "apparent_temperature",
+        "daily_agg": "max",          # 'max' for daily highs, same as temperature_2m
+        "chart_title": "Daily High Feels Like Spread"
+    },
     "dew_point_2m": {
         "label": "Dew Point",
         "unit": "°F",
@@ -152,12 +159,20 @@ def generate_mock_data(days=7):
     base_gust = base_wind * 1.4
     # Dew point trails a few degrees below air temperature
     base_dew_point = base_temp - 8
+    # Feels-like temperature runs a few degrees warmer than actual air
+    # temperature (humidity effect)
+    base_apparent_temp = base_temp + 4
 
     dict_det = {
         "temperature_2m": pd.DataFrame({
             'time': dates,
             'ECMWF Operational': base_temp + 1.0,
             'GFS Operational': base_temp - 1.0
+        }),
+        "apparent_temperature": pd.DataFrame({
+            'time': dates,
+            'ECMWF Operational': base_apparent_temp + 1.0,
+            'GFS Operational': base_apparent_temp - 1.0
         }),
         "precipitation": pd.DataFrame({
             'time': dates,
@@ -191,6 +206,7 @@ def generate_mock_data(days=7):
 
     for nickname in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
         df_t = pd.DataFrame({'time': dates})
+        df_a = pd.DataFrame({'time': dates})
         df_p = pd.DataFrame({'time': dates})
         df_w = pd.DataFrame({'time': dates})
         df_g = pd.DataFrame({'time': dates})
@@ -199,12 +215,14 @@ def generate_mock_data(days=7):
         # Add synthetic ensemble member variation
         for m in range(1, 31):
             df_t[f"member_{m}"] = base_temp + np.random.normal(0, 2.5, len(dates))
+            df_a[f"member_{m}"] = base_apparent_temp + np.random.normal(0, 2.5, len(dates))
             df_p[f"member_{m}"] = np.maximum(0, np.random.normal(0, 0.05, len(dates)))
             df_w[f"member_{m}"] = np.maximum(0, base_wind + np.random.normal(0, 2.0, len(dates)))
             df_g[f"member_{m}"] = np.maximum(0, base_gust + np.random.normal(0, 3.0, len(dates)))
             df_d[f"member_{m}"] = base_dew_point + np.random.normal(0, 2.0, len(dates))
 
         dict_ens["temperature_2m"][nickname] = df_t
+        dict_ens["apparent_temperature"][nickname] = df_a
         dict_ens["precipitation"][nickname] = df_p
         dict_ens["wind_speed_10m"][nickname] = df_w
         if nickname in gust_capable_nicknames:
@@ -757,7 +775,7 @@ with tab3:
         
             # Populate deterministic run data dynamically
             for det_col in daily_det_highs.columns:
-                if selected_var_key == "temperature_2m" and det_col in daily_det_lows.columns and d in daily_det_lows.index:
+                if selected_var_key in ("temperature_2m", "apparent_temperature") and det_col in daily_det_lows.columns and d in daily_det_lows.index:
                     low_val = daily_det_lows.loc[d, det_col]
                     high_val = daily_det_highs.loc[d, det_col]
                     row[f"{det_col} (L/H)"] = f"{low_val:.1f}° / {high_val:.1f}°F"
@@ -767,7 +785,7 @@ with tab3:
             for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
                 if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
                     high_vals = daily_ens_highs[ens_name].loc[d].values
-                    if selected_var_key == "temperature_2m" and ens_name in daily_ens_lows and d in daily_ens_lows[ens_name].index:
+                    if selected_var_key in ("temperature_2m", "apparent_temperature") and ens_name in daily_ens_lows and d in daily_ens_lows[ens_name].index:
                         low_vals = daily_ens_lows[ens_name].loc[d].values
                         row[f"{ens_name} Med (L/H)"] = f"{np.median(low_vals):.1f}° / {np.median(high_vals):.1f}°F"
                     else:
@@ -775,7 +793,7 @@ with tab3:
                 
             if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
                 g_highs = daily_ens_highs["Grand Ensemble"].loc[d].values
-                if selected_var_key == "temperature_2m" and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
+                if selected_var_key in ("temperature_2m", "apparent_temperature") and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
                     g_lows = daily_ens_lows["Grand Ensemble"].loc[d].values
                     row["Grand Ens Med (L/H)"] = f"{np.median(g_lows):.1f}° / {np.median(g_highs):.1f}°F"
                     row["High IQR Spread"] = f"{np.percentile(g_highs, 25):.1f}° to {np.percentile(g_highs, 75):.1f}°F"
