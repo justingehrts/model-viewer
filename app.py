@@ -73,6 +73,21 @@ MODEL_CONFIG = {
     "Grand Ensemble": {"color": "#888888"}   # Mid-Gray
 }
 
+# Shared axis styling: explicit, semi-transparent colors so gridlines/ticks
+# stay visible under both light and dark browser/OS themes, instead of
+# falling back to Streamlit's auto-theming (which can render them at
+# low-to-no contrast, e.g. near-invisible in dark mode).
+AXIS_STYLE = dict(
+    showgrid=True,
+    gridcolor="rgba(128, 128, 128, 0.15)",
+    gridwidth=1,
+    showline=True,
+    linecolor="rgba(128, 128, 128, 0.4)",
+    linewidth=1.5,
+    tickfont=dict(size=12, family="sans-serif"),
+    title_font=dict(size=13, family="sans-serif", color="rgba(128, 128, 128, 0.9)")
+)
+
 ENS_ORDER = ["EPS", "AIFS", "GEFS", "WeatherNext", "Grand Ensemble"]
 
 ENS_NAME_MAP = {
@@ -576,9 +591,10 @@ with tab1:
         xaxis=dict(
             title="Date / Time (Local)",
             tickformat="%a %m/%d",
-            dtick=tick_interval_hours * 60 * 60 * 1000
+            dtick=tick_interval_hours * 60 * 60 * 1000,
+            **AXIS_STYLE
         ),
-        yaxis_title=f"{var_cfg['label']} ({var_cfg['unit']})",
+        yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", **AXIS_STYLE),
         hovermode="x unified",
         height=550,
         legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
@@ -596,17 +612,7 @@ with tab2:
         # trace x-values stay as ISO date strings for correct grouping/sorting.
         date_labels = {d: pd.to_datetime(d).strftime('%a %m/%d') for d in dates}
 
-        # Common Axis Styling Options
-        axis_style = dict(
-            showgrid=True,
-            gridcolor="rgba(128, 128, 128, 0.15)",
-            gridwidth=1,
-            showline=True,
-            linecolor="rgba(128, 128, 128, 0.4)",
-            linewidth=1.5,
-            tickfont=dict(size=12, family="sans-serif"),
-            title_font=dict(size=13, family="sans-serif", color="#555555")
-        )
+        axis_style = AXIS_STYLE
     
         # 1. HIGH TEMPERATURE / PRECIPITATION CHART
         fig_daily_high = go.Figure()
