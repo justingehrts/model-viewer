@@ -590,14 +590,17 @@ with tab1:
         title=dict(text=f"Hourly {var_cfg['label']} Trajectory ({var_cfg['unit']})", font=dict(size=18)),
         xaxis=dict(
             title="Date / Time (Local)",
-            tickformat="%a %m/%d",
+            tickformat="%a %m/%d %I%p",
+            tickangle=-45,
+            automargin=True,
             dtick=tick_interval_hours * 60 * 60 * 1000,
             **AXIS_STYLE
         ),
         yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", **AXIS_STYLE),
         hovermode="x unified",
-        height=550,
-        legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
+        height=650,
+        margin=dict(b=160),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.55, xanchor="center", x=0.5)
     )
     st.plotly_chart(fig_hourly, use_container_width=True)
 
