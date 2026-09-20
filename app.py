@@ -365,7 +365,7 @@ def fetch_deterministic_data(lat, lon, days=7):
             for model_name, slug in DET_MODEL_SLUGS.items():
                 key = f"{hourly_param}_{slug}"
                 if key in hourly:
-                    df_var[model_name] = hourly[key]
+                    df_var[model_name] = pd.to_numeric(hourly[key], errors="coerce")
                 # else: this model doesn't return this variable -- leave it
                 # out entirely so it's excluded from charts/legends instead
                 # of showing an empty/all-NaN series.
@@ -433,7 +433,7 @@ def fetch_ensemble_data(lat, lon, days=7):
                 df_m_var = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
                 for k in var_keys:
                     col = k.replace(f"{hourly_param}_", "")
-                    df_m_var[col] = hourly[k]
+                    df_m_var[col] = pd.to_numeric(hourly[k], errors="coerce")
 
                 dict_ens[var_key][nickname] = df_m_var
 
@@ -521,7 +521,10 @@ def get_value_at_time(df, column, target_time):
     matched_time = df.loc[idx, 'time']
     if abs(matched_time - target_time) > VERIFICATION_MAX_GAP:
         return None, None
-    return df.loc[idx, column], matched_time
+    value = df.loc[idx, column]
+    if pd.isna(value):
+        return None, None
+    return value, matched_time
 
 
 def get_grand_ensemble_median_at_time(dict_ens_var, target_time):
@@ -547,7 +550,9 @@ def get_grand_ensemble_median_at_time(dict_ens_var, target_time):
             continue
         if matched_time is None:
             matched_time = row_time
-        pooled_values.extend(df_m.loc[idx, member_cols].tolist())
+        row_vals = [v for v in df_m.loc[idx, member_cols].tolist() if pd.notna(v)]
+        if row_vals:
+            pooled_values.extend(row_vals)
 
     if not pooled_values:
         return None, None
