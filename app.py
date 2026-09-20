@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 import time
 import re
 import math
+import os
+import subprocess
 
 # ==============================================================================
 # STREAMLIT PAGE CONFIGURATION
@@ -281,6 +283,21 @@ def get_coordinates_from_airport(airport_code):
         pass
 
     return 39.99, -82.89, "Default Location (KCMH)"
+
+@st.cache_data
+def get_deployed_commit():
+    """Short git commit SHA of the running code, so what's actually
+    deployed (e.g. on Streamlit Cloud) can be confirmed at a glance
+    instead of inferred from traceback line numbers."""
+    try:
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_dir, stderr=subprocess.DEVNULL, timeout=2
+        ).decode().strip()
+        return sha
+    except Exception:
+        return "unknown"
 
 # ==============================================================================
 # HELPER 4: MODEL VERIFICATION (LIVE METAR vs. FORECAST)
@@ -655,6 +672,8 @@ with st.sidebar:
     # Ensemble Run Cycles
     for model_name, cycle_str in run_cycles.items():
         st.text(f"• {model_name:<18}: {cycle_str}")
+
+    st.caption(f"Build: {get_deployed_commit()}")
 
 # Select Payload based on Dropdown
 df_det_active = dict_det[selected_var_key].copy()
