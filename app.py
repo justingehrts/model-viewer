@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone
 import time
 import re
+import math
 
 # ==============================================================================
 # STREAMLIT PAGE CONFIGURATION
@@ -109,6 +110,11 @@ DET_MODEL_SLUGS = {
     "GFS Operational": "gfs_seamless",
     "NBM Operational": "ncep_nbm_conus"
 }
+
+# Verification: if the nearest available forecast hour is farther than this
+# from the actual observation time, treat it as "not found" rather than
+# silently comparing mismatched hours.
+VERIFICATION_MAX_GAP = pd.Timedelta(hours=2)
 
 # ==============================================================================
 # HELPER 1: LIVE MODEL RUN CYCLE CALCULATOR (STRICTLY UTC)
@@ -277,6 +283,48 @@ def get_coordinates_from_airport(airport_code):
     return 39.99, -82.89, "Default Location (KCMH)"
 
 # ==============================================================================
+# HELPER 4: MODEL VERIFICATION (LIVE METAR vs. FORECAST)
+# ==============================================================================
+
+def calculate_apparent_temperature(temp_c, dewpoint_c, wind_speed_ms):
+    """Australian Bureau of Meteorology 'Apparent Temperature' formula --
+    the same one Open-Meteo uses for its apparent_temperature variable --
+    so a METAR-derived feels-like is comparable to the forecast models'
+    value. e (vapor pressure, hPa) comes from dewpoint via Magnus-Tetens;
+    wind_speed_ms must be m/s. Returns degrees C.
+    """
+    e = 6.1094 * math.exp(17.625 * dewpoint_c / (243.04 + dewpoint_c))
+    return temp_c + 0.33 * e - 0.70 * wind_speed_ms - 4.00
+
+@st.cache_data(ttl=600)
+def get_current_conditions(airport_code):
+    """Fetches the latest METAR observation for a station from
+    aviationweather.gov (same host/pattern as get_coordinates_from_airport).
+    600s TTL: obs post roughly hourly (sometimes half-hourly), so the 900s
+    forecast TTL would serve a stale "actual" for too long, while a much
+    shorter TTL would just add API calls with nothing new landing.
+    """
+    code = airport_code.strip().upper()
+    url = f"https://aviationweather.gov/api/data/metar?ids={code}&format=json"
+    try:
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list) and len(data) > 0:
+                ob = data[0]
+                if ob.get("obsTime") is not None and ob.get("temp") is not None:
+                    return {
+                        "temp_c": ob.get("temp"),
+                        "dewp_c": ob.get("dewp"),
+                        "wspd_kt": ob.get("wspd"),
+                        "wgst_kt": ob.get("wgst"),   # often absent -- no gust
+                        "obs_time": ob.get("obsTime"),
+                    }, None
+        return None, "No recent observation available"
+    except Exception as e:
+        return None, str(e)
+
+# ==============================================================================
 # LAYER 1: LIVE DATA INGESTION (CACHED FOR 15 MINUTES)
 # ==============================================================================
 
@@ -309,6 +357,7 @@ def fetch_deterministic_data(lat, lon, days=7):
         data = res.json()
 
         hourly = data["hourly"]
+        utc_offset_seconds = data.get("utc_offset_seconds", 0)
         dict_det = {}
         for var_key, cfg in WEATHER_VARS.items():
             hourly_param = cfg["hourly_param"]
@@ -323,9 +372,9 @@ def fetch_deterministic_data(lat, lon, days=7):
             dict_det[var_key] = df_var
 
         fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return dict_det, fetch_time, det_run_cycles, None
+        return dict_det, fetch_time, det_run_cycles, None, utc_offset_seconds
     except Exception as e:
-        return {var_key: pd.DataFrame() for var_key in WEATHER_VARS}, "", {}, str(e)
+        return {var_key: pd.DataFrame() for var_key in WEATHER_VARS}, "", {}, str(e), 0
 
 @st.cache_data(ttl=900)
 def fetch_ensemble_data(lat, lon, days=7):
@@ -461,6 +510,58 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
 
     return hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows
 
+
+def get_value_at_time(df, column, target_time):
+    """Nearest-hour lookup for a single deterministic model column. Returns
+    (value, matched_time) or (None, None) if missing or farther than
+    VERIFICATION_MAX_GAP from target_time."""
+    if df is None or df.empty or column not in df.columns or 'time' not in df.columns:
+        return None, None
+    idx = (df['time'] - target_time).abs().idxmin()
+    matched_time = df.loc[idx, 'time']
+    if abs(matched_time - target_time) > VERIFICATION_MAX_GAP:
+        return None, None
+    return df.loc[idx, column], matched_time
+
+
+def get_grand_ensemble_median_at_time(dict_ens_var, target_time):
+    """Pools every ensemble member column across all model families for one
+    variable's dict_ens[var_key] dict and returns the pooled median at the
+    nearest hour to target_time. Each model family finds its own nearest
+    row independently (simpler than process_ensemble_data's shared-index
+    concat approach above, since we only need one pooled number here, not
+    a column-addressable DataFrame). Returns (median_value, matched_time)
+    or (None, None).
+    """
+    pooled_values = []
+    matched_time = None
+    for df_m in dict_ens_var.values():
+        if df_m is None or df_m.empty or 'time' not in df_m.columns:
+            continue
+        member_cols = [c for c in df_m.columns if c != 'time']
+        if not member_cols:
+            continue
+        idx = (df_m['time'] - target_time).abs().idxmin()
+        row_time = df_m.loc[idx, 'time']
+        if abs(row_time - target_time) > VERIFICATION_MAX_GAP:
+            continue
+        if matched_time is None:
+            matched_time = row_time
+        pooled_values.extend(df_m.loc[idx, member_cols].tolist())
+
+    if not pooled_values:
+        return None, None
+    return float(np.median(pooled_values)), matched_time
+
+
+def format_value_with_unit(val, unit, signed=False):
+    """°F gets no space (matches Tab 3's existing '74.0°F' convention);
+    mph gets a space, since there's no existing precedent for it appearing
+    inline with a value."""
+    sep = "" if unit.startswith("°") else " "
+    fmt = "{:+.1f}" if signed else "{:.1f}"
+    return f"{fmt.format(val)}{sep}{unit}"
+
 # ==============================================================================
 # STREAMLIT UI & SIDEBAR
 # ==============================================================================
@@ -526,9 +627,10 @@ if dev_mode:
     dict_det, dict_ens, det_run_cycles, run_cycles = generate_mock_data(days=forecast_days)
     fetch_time = "OFFLINE DEV MODE"
     det_err = None
+    utc_offset_seconds = 0  # unused: verification panel is skipped in Dev Mode
 else:
     with st.spinner("Fetching multi-model ensemble payloads..."):
-        dict_det, fetch_time, det_run_cycles, det_err = fetch_deterministic_data(lat, lon, days=forecast_days)
+        dict_det, fetch_time, det_run_cycles, det_err, utc_offset_seconds = fetch_deterministic_data(lat, lon, days=forecast_days)
         dict_ens, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
 
 if not dev_mode and (det_err or dict_det[selected_var_key].empty):
@@ -555,10 +657,76 @@ dict_ens_active = dict_ens[selected_var_key].copy()
 
 # Process Data dynamically
 hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lows = process_ensemble_data(
-    dict_ens_active, 
-    df_det_active, 
+    dict_ens_active,
+    df_det_active,
     selected_var_key=selected_var_key
 )
+
+# ==============================================================================
+# MODEL VERIFICATION: RIGHT NOW VS. LATEST METAR
+# ==============================================================================
+
+if dev_mode:
+    with st.expander("✅ Model Verification vs. METAR", expanded=False):
+        st.info("Model verification is unavailable in Dev Mode, which makes zero live API calls.")
+elif loc_mode != "Airport Code":
+    with st.expander("✅ Model Verification vs. METAR", expanded=False):
+        st.info("Model verification requires Airport Code location mode (a station is needed for a live observation).")
+elif selected_var_key == "precipitation":
+    with st.expander(f"✅ Model Verification vs. METAR — {station_name}", expanded=False):
+        st.info("Verification isn't available for Total Precipitation.")
+else:
+    with st.expander(f"✅ Model Verification vs. METAR — {var_cfg['label']} at {station_name}", expanded=False):
+        obs, obs_err = get_current_conditions(airport_input)
+        if obs is None:
+            st.info(f"No current METAR available for {airport_input} right now. ({obs_err})")
+        else:
+            obs_dt_utc = datetime.fromtimestamp(obs["obs_time"], tz=timezone.utc)
+            obs_dt_local = (obs_dt_utc + pd.Timedelta(seconds=utc_offset_seconds)).replace(tzinfo=None)
+            temp_c, dewp_c, wspd_kt, wgst_kt = obs["temp_c"], obs["dewp_c"], obs["wspd_kt"], obs["wgst_kt"]
+
+            actual_val = None
+            if selected_var_key == "temperature_2m" and temp_c is not None:
+                actual_val = temp_c * 9 / 5 + 32
+            elif selected_var_key == "apparent_temperature" and None not in (temp_c, dewp_c, wspd_kt):
+                actual_val = calculate_apparent_temperature(temp_c, dewp_c, wspd_kt * 0.514444) * 9 / 5 + 32
+            elif selected_var_key == "dew_point_2m" and dewp_c is not None:
+                actual_val = dewp_c * 9 / 5 + 32
+            elif selected_var_key == "wind_speed_10m" and wspd_kt is not None:
+                actual_val = wspd_kt * 1.15078
+            elif selected_var_key == "wind_gusts_10m" and wgst_kt is not None:
+                actual_val = wgst_kt * 1.15078
+
+            if actual_val is None:
+                st.info(f"Current METAR for {airport_input} doesn't report {var_cfg['label']} right now.")
+            else:
+                cols = st.columns(5)
+                cols[0].metric("METAR Actual", format_value_with_unit(actual_val, var_cfg["unit"]))
+
+                for i, model_name in enumerate(DET_MODEL_SLUGS, start=1):
+                    val, _ = get_value_at_time(dict_det.get(selected_var_key, pd.DataFrame()), model_name, obs_dt_local)
+                    if val is None:
+                        cols[i].metric(model_name, "N/A")
+                    else:
+                        cols[i].metric(
+                            model_name,
+                            format_value_with_unit(val, var_cfg["unit"]),
+                            format_value_with_unit(val - actual_val, var_cfg["unit"], signed=True),
+                            delta_color="off"
+                        )
+
+                ens_median, _ = get_grand_ensemble_median_at_time(dict_ens.get(selected_var_key, {}), obs_dt_local)
+                if ens_median is None:
+                    cols[4].metric("Grand Ensemble", "N/A")
+                else:
+                    cols[4].metric(
+                        "Grand Ensemble",
+                        format_value_with_unit(ens_median, var_cfg["unit"]),
+                        format_value_with_unit(ens_median - actual_val, var_cfg["unit"], signed=True),
+                        delta_color="off"
+                    )
+
+                st.caption(f"METAR observed at {obs_dt_local.strftime('%a %I:%M %p')} local")
 
 # ==============================================================================
 # LAYER 4: PLOTLY VISUALIZATIONS

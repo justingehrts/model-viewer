@@ -33,10 +33,10 @@ or waiting on network latency).
 Everything lives in `app.py`, organized top-to-bottom as:
 
 1. **Config** — `WEATHER_VARS` (per-variable display/unit/aggregation metadata), `MODEL_CONFIG` (per-model color + display config), `ENS_ORDER`, `ENS_NAME_MAP`
-2. **Helpers** — live run-cycle estimation, offline mock data generator, airport→coordinates geocoding
+2. **Helpers** — live run-cycle estimation, offline mock data generator, airport→coordinates geocoding, model verification (`get_current_conditions` fetches the latest METAR for a station, `calculate_apparent_temperature` computes a comparable feels-like from it)
 3. **Data ingestion** (`fetch_deterministic_data`, `fetch_ensemble_data`) — `@st.cache_data(ttl=900)`-cached calls to Open-Meteo
-4. **Processing** (`process_ensemble_data`) — builds the Grand Ensemble, hourly median/mean/IQR summaries, and daily high/low aggregates
-5. **UI** — sidebar controls, metric cards, and three tabs (hourly time series, daily distribution box plots, summary table + CSV download) built with Plotly
+4. **Processing** (`process_ensemble_data`) — builds the Grand Ensemble, hourly median/mean/IQR summaries, and daily high/low aggregates; `get_value_at_time`/`get_grand_ensemble_median_at_time` do single-hour nearest-time lookups for the verification panel
+5. **UI** — sidebar controls, a model-verification expander (currently-selected variable vs. the station's latest METAR), and three tabs (hourly time series, daily distribution box plots, summary table + CSV download) built with Plotly
 
 ## Conventions
 
@@ -50,9 +50,9 @@ Everything lives in `app.py`, organized top-to-bottom as:
   dicts that duplicate the deterministic-model hex values instead of reading
   `MODEL_CONFIG` — when touching that code, prefer consolidating onto
   `MODEL_CONFIG` rather than adding a third copy.
-- **Audience**: this is for general weather watchers, not pilots/dispatchers.
-  Avoid introducing aviation jargon (METAR, TAF, ceiling/visibility, etc.)
-  into labels or copy — plain-language forecast terms only.
+- **Audience**: this is for broadcast meteorologists. Aviation terminology
+  (METAR, station observations, etc.) is fine in labels/copy where relevant
+  — this isn't a plain-language-only tool.
 - **Secrets**: never hardcode API keys, tokens, or credentials in `app.py`
   or anywhere else in the repo. The current data sources (Open-Meteo,
   aviationweather.gov) don't require auth, but if a future data source does,
