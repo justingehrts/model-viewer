@@ -307,7 +307,7 @@ def get_current_conditions(airport_code):
     code = airport_code.strip().upper()
     url = f"https://aviationweather.gov/api/data/metar?ids={code}&format=json"
     try:
-        res = requests.get(url, timeout=5)
+        res = requests.get(url, timeout=10)
         if res.status_code == 200:
             data = res.json()
             if isinstance(data, list) and len(data) > 0:
