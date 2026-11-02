@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timezone
 import time
 import re
@@ -576,6 +577,33 @@ def get_grand_ensemble_median_at_time(dict_ens_var, target_time):
     return float(np.median(pooled_values)), matched_time
 
 
+def build_hourly_grid(df_det, hourly_summaries, start_time, hours=48):
+    """Rows = models (deterministic first, then ensemble medians in ENS_ORDER),
+    columns = `hours` consecutive hours starting at start_time (naive
+    station-local, floored to the hour). Models with no data in the window are
+    skipped. Returns a DataFrame indexed by model name with a time-labelled
+    column per hour, or an empty DataFrame if nothing falls in the window."""
+    series = {}
+    for det_col in [c for c in df_det.columns if c != 'time']:
+        series[det_col] = pd.Series(
+            df_det[det_col].values, index=df_det['time'].dt.floor('h')
+        )
+    for ens_name in ENS_ORDER:
+        if ens_name in hourly_summaries:
+            df_sum = hourly_summaries[ens_name]
+            series[ens_name] = pd.Series(
+                df_sum['median'].values, index=df_sum['time'].dt.floor('h')
+            )
+
+    window = pd.date_range(start=start_time, periods=hours, freq='h')
+    rows = {}
+    for name, s in series.items():
+        s = s[~s.index.duplicated(keep='first')].reindex(window)
+        if s.notna().any():
+            rows[name] = s
+    return pd.DataFrame(rows).T
+
+
 def format_value_with_unit(val, unit, signed=False):
     """°F gets no space (matches Tab 3's existing '74.0°F' convention);
     mph gets a space, since there's no existing precedent for it appearing
@@ -756,7 +784,7 @@ else:
 # LAYER 4: PLOTLY VISUALIZATIONS
 # ==============================================================================
 
-tab1, tab2, tab3 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table"])
+tab1, tab2, tab3, tab4 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid"])
 
 # --- TAB 1: HOURLY TIME-SERIES ---
 with tab1:
@@ -1007,3 +1035,91 @@ with tab3:
             file_name=f"weather_consensus_{selected_var_key}_{datetime.now().strftime('%Y%m%d')}.csv",
             mime="text/csv"
         )
+
+
+# --- TAB 4: HOURLY GRID (TEMPERATURE) ---
+with tab4:
+    GRID_HOURS = 48
+    st.subheader("Hourly Temperature Grid (°F)")
+    st.caption(
+        f"Next {GRID_HOURS} hours, station-local time. Ensemble families show the median. "
+        "Always air temperature, regardless of the sidebar variable. One color scale is shared across all models."
+    )
+
+    # The grid is always temperature_2m, so reuse the sidebar summaries only
+    # when that's the selected variable; otherwise summarize it separately.
+    if selected_var_key == "temperature_2m":
+        grid_det, grid_summaries = df_det_active, hourly_summaries
+    else:
+        grid_det = dict_det["temperature_2m"]
+        grid_summaries, *_ = process_ensemble_data(
+            dict(dict_ens["temperature_2m"]), grid_det, selected_var_key="temperature_2m"
+        )
+
+    # "Now" in the station's local time (the API timestamps are naive local).
+    if dev_mode:
+        now_local = datetime.now()
+    else:
+        now_local = datetime.now(timezone.utc).replace(tzinfo=None) + pd.Timedelta(seconds=utc_offset_seconds)
+    grid_start = pd.Timestamp(now_local).floor('h')
+
+    df_grid = build_hourly_grid(grid_det, grid_summaries, grid_start, hours=GRID_HOURS)
+
+    if df_grid.empty:
+        st.info("No temperature data is available for the next 48 hours.")
+    else:
+        times = list(df_grid.columns)
+        models = list(df_grid.index)
+        z = df_grid.values.astype(float)
+
+        # Make_subplots lets the spread row use its own (neutral) color scale
+        # without sharing the temperature one.
+        show_spread = len(models) > 1
+        fig_grid = make_subplots(
+            rows=2 if show_spread else 1, cols=1, shared_xaxes=True,
+            row_heights=[len(models), 1.2] if show_spread else [1],
+            vertical_spacing=0.04
+        )
+        fig_grid.add_trace(go.Heatmap(
+            x=times, y=models, z=z,
+            colorscale="RdYlBu_r",
+            zmin=float(np.nanmin(z)), zmax=float(np.nanmax(z)),
+            xgap=1, ygap=1,
+            texttemplate="%{z:.0f}", textfont=dict(size=11),
+            colorbar=dict(title="°F", len=0.8, y=1, yanchor="top"),
+            hovertemplate="%{y}<br>%{x|%a %b %d, %I:%M %p}<br><b>%{z:.1f}°F</b><extra></extra>"
+        ), row=1, col=1)
+
+        if show_spread:
+            spread = np.nanmax(z, axis=0) - np.nanmin(z, axis=0)
+            fig_grid.add_trace(go.Heatmap(
+                x=times, y=["Spread (max − min)"], z=[spread],
+                colorscale="Greys", zmin=0, zmax=max(float(np.nanmax(spread)), 8.0),
+                xgap=1, ygap=1,
+                texttemplate="%{z:.0f}", textfont=dict(size=11),
+                showscale=False,
+                hovertemplate="Model spread<br>%{x|%a %b %d, %I:%M %p}<br><b>%{z:.1f}°F</b><extra></extra>"
+            ), row=2, col=1)
+
+        fig_grid.update_yaxes(autorange="reversed", showline=False, showgrid=False, tickfont=dict(size=12))
+        fig_grid.update_xaxes(
+            tickformat="%a %m/%d %I%p", tickangle=-45, automargin=True,
+            dtick=3 * 60 * 60 * 1000, showgrid=False, showline=False
+        )
+        if show_spread:
+            fig_grid.update_xaxes(showticklabels=False, row=1, col=1)
+
+        # Thin divider at each local midnight (cell edge = half an hour before).
+        for t in times:
+            if t.hour == 0 and t != times[0]:
+                edge = t - pd.Timedelta(minutes=30)
+                fig_grid.add_shape(
+                    type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
+                    line=dict(color="rgba(128, 128, 128, 0.9)", width=2)
+                )
+
+        fig_grid.update_layout(
+            height=110 + 42 * (len(models) + (1 if show_spread else 0)) + 90,
+            margin=dict(l=10, r=10, t=20, b=10)
+        )
+        st.plotly_chart(fig_grid, use_container_width=True)

@@ -36,7 +36,7 @@ Everything lives in `app.py`, organized top-to-bottom as:
 2. **Helpers** — live run-cycle estimation, offline mock data generator, airport→coordinates geocoding, model verification (`get_current_conditions` fetches the latest METAR for a station, `calculate_apparent_temperature` computes a comparable feels-like from it)
 3. **Data ingestion** (`fetch_deterministic_data`, `fetch_ensemble_data`) — `@st.cache_data(ttl=900)`-cached calls to Open-Meteo
 4. **Processing** (`process_ensemble_data`) — builds the Grand Ensemble, hourly median/mean/IQR summaries, and daily high/low aggregates; `get_value_at_time`/`get_grand_ensemble_median_at_time` do single-hour nearest-time lookups for the verification panel
-5. **UI** — sidebar controls, a model-verification expander (currently-selected variable vs. the station's latest METAR), and three tabs (hourly time series, daily distribution box plots, summary table + CSV download) built with Plotly
+5. **UI** — sidebar controls, a model-verification expander (currently-selected variable vs. the station's latest METAR), and four tabs (hourly time series, daily distribution box plots, summary table + CSV download, and a 48-hour hourly temperature grid heatmap with a model-spread row — `build_hourly_grid`) built with Plotly
 
 ## Conventions
 
