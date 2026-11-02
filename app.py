@@ -53,8 +53,33 @@ WEATHER_VARS = {
         "unit": "in",
         "hourly_param": "precipitation",
         "daily_agg": "sum",          # 'sum' for total daily rainfall
-        "chart_title": "Daily Total Precipitation Spread"
+        "chart_title": "Daily Total Precipitation Spread",
+        "verify": False
         # No "grid": the Hourly Grid tab isn't offered for precipitation.
+    },
+    # Snowfall is derived rather than requested directly ("derived": True):
+    # Open-Meteo's own `snowfall` assumes a fixed 7:1 ratio, so we back out the
+    # model's snow liquid equivalent and apply our own ratios. See
+    # compute_snowfall().
+    "snowfall_10to1": {
+        "label": "Snowfall (10:1)",
+        "unit": "in",
+        "derived": True,
+        "verify": False,
+        "daily_agg": "sum",
+        "chart_title": "Daily Snowfall Spread (10:1)",
+        "grid": {"colorscale": "Blues", "zmin": 0, "zmax_floor": 1, "spread_floor": 1,
+                 "cumulative": True, "decimals": 1}
+    },
+    "snowfall_kuchera": {
+        "label": "Snowfall (Kuchera)",
+        "unit": "in",
+        "derived": True,
+        "verify": False,
+        "daily_agg": "sum",
+        "chart_title": "Daily Snowfall Spread (Kuchera)",
+        "grid": {"colorscale": "Blues", "zmin": 0, "zmax_floor": 1, "spread_floor": 1,
+                 "cumulative": True, "decimals": 1}
     },
     "wind_speed_10m": {
         "label": "Wind Speed",
@@ -119,6 +144,15 @@ DET_MODEL_SLUGS = {
     "GFS Operational": "gfs_seamless",
     "NBM Operational": "ncep_nbm_conus"
 }
+
+# Inputs for the derived snowfall variables, fetched in a separate request so a
+# model that rejects them can't break the main fetch. The pressure levels
+# cover the surface-to-500 mb column Kuchera looks at; levels a model doesn't
+# return are simply skipped.
+SNOW_PRESSURE_LEVELS = [950, 925, 900, 850, 800, 700, 600, 500]
+SNOW_INPUT_PARAMS = ["snowfall", "temperature_2m", "surface_pressure"] + [
+    f"temperature_{p}hPa" for p in SNOW_PRESSURE_LEVELS
+]
 
 # Verification: if the nearest available forecast hour is farther than this
 # from the actual observation time, treat it as "not found" rather than
@@ -211,6 +245,21 @@ def generate_mock_data(days=7):
         })
     }
 
+    # Synthetic snow event (liquid equivalent, in/hr) about 30-50 hours out;
+    # Kuchera uses a fixed 14:1 here, standing in for a cold column.
+    snow_swe = np.zeros(len(dates))
+    snow_swe[30:50] = 0.03 * np.sin(np.linspace(0, np.pi, 20))
+    dict_det["snowfall_10to1"] = pd.DataFrame({
+        'time': dates,
+        'ECMWF Operational': snow_swe * 10 * 1.1,
+        'GFS Operational': snow_swe * 10 * 0.9
+    })
+    dict_det["snowfall_kuchera"] = pd.DataFrame({
+        'time': dates,
+        'ECMWF Operational': snow_swe * 14 * 1.1,
+        'GFS Operational': snow_swe * 14 * 0.9
+    })
+
     dict_ens = {var_key: {} for var_key in WEATHER_VARS}
     run_cycles = {}
 
@@ -243,6 +292,12 @@ def generate_mock_data(days=7):
         if nickname in gust_capable_nicknames:
             dict_ens["wind_gusts_10m"][nickname] = df_g
         dict_ens["dew_point_2m"][nickname] = df_d
+
+        member_swe = {f"member_{m}": snow_swe * np.random.uniform(0.5, 1.5) for m in range(1, 31)}
+        dict_ens["snowfall_10to1"][nickname] = pd.DataFrame(
+            {'time': dates, **{k: v * 10 for k, v in member_swe.items()}})
+        dict_ens["snowfall_kuchera"][nickname] = pd.DataFrame(
+            {'time': dates, **{k: v * np.random.uniform(11, 17) for k, v in member_swe.items()}})
         run_cycles[nickname] = "DEV-MOCK 00Z"
 
     det_run_cycles = {
@@ -359,7 +414,7 @@ def fetch_deterministic_data(lat, lon, days=7):
     params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values()),
+        "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values() if not cfg.get("derived")),
         "models": list(DET_MODEL_SLUGS.values()),
         "temperature_unit": "fahrenheit",
         "wind_speed_unit": "mph",
@@ -384,6 +439,8 @@ def fetch_deterministic_data(lat, lon, days=7):
         utc_offset_seconds = data.get("utc_offset_seconds", 0)
         dict_det = {}
         for var_key, cfg in WEATHER_VARS.items():
+            if cfg.get("derived"):
+                continue
             hourly_param = cfg["hourly_param"]
             df_var = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
             for model_name, slug in DET_MODEL_SLUGS.items():
@@ -394,6 +451,26 @@ def fetch_deterministic_data(lat, lon, days=7):
                 # out entirely so it's excluded from charts/legends instead
                 # of showing an empty/all-NaN series.
             dict_det[var_key] = df_var
+
+        # Snowfall inputs: separate request so a failure only costs snowfall.
+        snow_hourly = None
+        try:
+            res_snow = requests.get(url, params={**params, "hourly": ",".join(SNOW_INPUT_PARAMS)}, timeout=10)
+            res_snow.raise_for_status()
+            snow_hourly = res_snow.json()["hourly"]
+        except Exception:
+            pass
+        df_10 = pd.DataFrame({"time": pd.to_datetime((snow_hourly or hourly)["time"])})
+        df_k = df_10.copy()
+        if snow_hourly:
+            for model_name, slug in DET_MODEL_SLUGS.items():
+                snow_10, snow_k = compute_snowfall(lambda param: snow_hourly.get(f"{param}_{slug}"))
+                if snow_10 is not None:
+                    df_10[model_name] = snow_10
+                if snow_k is not None:
+                    df_k[model_name] = snow_k
+        dict_det["snowfall_10to1"] = df_10
+        dict_det["snowfall_kuchera"] = df_k
 
         fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return dict_det, fetch_time, det_run_cycles, None, utc_offset_seconds
@@ -422,7 +499,7 @@ def fetch_ensemble_data(lat, lon, days=7):
         params = {
             "latitude": lat,
             "longitude": lon,
-            "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values()),
+            "hourly": ",".join(cfg["hourly_param"] for cfg in WEATHER_VARS.values() if not cfg.get("derived")),
             "models": m,
             "temperature_unit": "fahrenheit",
             "wind_speed_unit": "mph",
@@ -444,6 +521,8 @@ def fetch_ensemble_data(lat, lon, days=7):
             hourly = data["hourly"]
 
             for var_key, cfg in WEATHER_VARS.items():
+                if cfg.get("derived"):
+                    continue
                 hourly_param = cfg["hourly_param"]
                 var_keys = [k for k in hourly.keys() if k.startswith(hourly_param)]
                 if not var_keys:
@@ -461,6 +540,31 @@ def fetch_ensemble_data(lat, lon, days=7):
 
                 dict_ens[var_key][nickname] = df_m_var
 
+            # Snowfall inputs: separate request so a model that rejects the
+            # pressure-level fields still keeps its other variables.
+            time.sleep(0.15)
+            try:
+                res_snow = requests.get(url, params={**params, "hourly": ",".join(SNOW_INPUT_PARAMS)}, timeout=15)
+                res_snow.raise_for_status()
+                snow_hourly = res_snow.json()["hourly"]
+                # Members are suffixed "_memberNN"; the control has no suffix.
+                suffixes = [k[len("snowfall"):] for k in snow_hourly if k == "snowfall" or k.startswith("snowfall_member")]
+                df_10 = pd.DataFrame({"time": pd.to_datetime(snow_hourly["time"])})
+                df_k = df_10.copy()
+                for sfx in suffixes:
+                    col = sfx.lstrip("_") or "control"
+                    snow_10, snow_k = compute_snowfall(lambda param: snow_hourly.get(f"{param}{sfx}"))
+                    if snow_10 is not None:
+                        df_10[col] = snow_10
+                    if snow_k is not None:
+                        df_k[col] = snow_k
+                if len(df_10.columns) > 1:
+                    dict_ens["snowfall_10to1"][nickname] = df_10
+                if len(df_k.columns) > 1:
+                    dict_ens["snowfall_kuchera"][nickname] = df_k
+            except Exception as e:
+                errors.append(f"{nickname} snowfall: {str(e)}")
+
             time.sleep(0.15)
 
         except Exception as e:
@@ -468,6 +572,60 @@ def fetch_ensemble_data(lat, lon, days=7):
             continue
 
     return dict_ens, run_cycles, errors
+
+# ==============================================================================
+# SNOWFALL: 10:1 AND KUCHERA RATIOS
+# ==============================================================================
+
+def kuchera_slr(tmax_k):
+    """Kuchera snow-to-liquid ratio from the warmest temperature (K) in the
+    surface-to-500 mb column. Floored at 0 for very warm columns."""
+    slr = np.where(tmax_k > 271.16, 12 + 2 * (271.16 - tmax_k), 12 + (271.16 - tmax_k))
+    return np.clip(slr, 0, None)
+
+
+def compute_snowfall(get_param):
+    """Derives hourly snowfall (in) for one model run or ensemble member.
+
+    get_param(name) returns that Open-Meteo hourly series (a list, °F for
+    temperatures) or None. Open-Meteo's `snowfall` is the model's frozen
+    liquid equivalent x 7, so dividing by 7 recovers the liquid equivalent; the
+    model still decides rain vs. snow, we only replace the ratio.
+
+    Returns (snow_10to1, snow_kuchera) as arrays, either None if unavailable.
+    Kuchera needs at least one pressure level: surface temperature alone isn't
+    Kuchera, so those models are left out rather than approximated."""
+    snow_api = get_param("snowfall")
+    if snow_api is None:
+        return None, None
+    swe = pd.to_numeric(pd.Series(snow_api), errors="coerce").to_numpy(dtype=float) / 7.0
+    snow_10 = swe * 10
+
+    sfc_p = get_param("surface_pressure")
+    sfc_p = None if sfc_p is None else pd.to_numeric(pd.Series(sfc_p), errors="coerce").to_numpy(dtype=float)
+    levels = []
+    for p in SNOW_PRESSURE_LEVELS:
+        t = get_param(f"temperature_{p}hPa")
+        if t is None:
+            continue
+        t = pd.to_numeric(pd.Series(t), errors="coerce").to_numpy(dtype=float)
+        if sfc_p is not None:
+            # Ignore levels that are below ground at this station.
+            t = np.where(sfc_p < p, np.nan, t)
+        levels.append(t)
+    if not levels or all(np.isnan(t).all() for t in levels):
+        return snow_10, None
+
+    t2m = get_param("temperature_2m")
+    if t2m is not None:
+        levels.append(pd.to_numeric(pd.Series(t2m), errors="coerce").to_numpy(dtype=float))
+    tmax_f = levels[0]
+    for t in levels[1:]:
+        tmax_f = np.fmax(tmax_f, t)  # NaN-skipping max across the column
+    tmax_k = (tmax_f - 32) * 5 / 9 + 273.15
+    snow_k = swe * kuchera_slr(tmax_k)
+    snow_k = np.where(swe == 0, 0.0, snow_k)  # no snow is no snow, temps or not
+    return snow_10, snow_k
 
 # ==============================================================================
 # LAYER 2 & 3: PROCESSING & GRAND ENSEMBLE BUILDER
@@ -730,9 +888,9 @@ if dev_mode:
 elif loc_mode != "Airport Code":
     with st.expander("✅ Model Verification vs. METAR", expanded=False):
         st.info("Model verification requires Airport Code location mode (a station is needed for a live observation).")
-elif selected_var_key == "precipitation":
+elif var_cfg.get("verify", True) is False:
     with st.expander(f"✅ Model Verification vs. METAR — {station_name}", expanded=False):
-        st.info("Verification isn't available for Total Precipitation.")
+        st.info(f"Verification isn't available for {var_cfg['label']}.")
 else:
     with st.expander(f"✅ Model Verification vs. METAR — {var_cfg['label']} at {station_name}", expanded=False):
         obs, obs_err = get_current_conditions(airport_input)
@@ -789,6 +947,17 @@ else:
 # ==============================================================================
 # LAYER 4: PLOTLY VISUALIZATIONS
 # ==============================================================================
+
+if selected_var_key in ("snowfall_10to1", "snowfall_kuchera"):
+    st.caption(
+        "Snowfall uses each model's own snow liquid equivalent (Open-Meteo's 7:1 snowfall ÷ 7). "
+        "10:1 multiplies it by 10; Kuchera uses a ratio from the warmest temperature between the surface and 500 mb."
+    )
+    if selected_var_key == "snowfall_kuchera":
+        no_upper_air = [c for c in dict_det["snowfall_10to1"].columns if c != 'time' and c not in df_det_active.columns]
+        no_upper_air += [n for n in dict_ens["snowfall_10to1"] if n not in dict_ens["snowfall_kuchera"]]
+        if no_upper_air:
+            st.caption(f"Not in the Kuchera view (no upper-air temperatures): {', '.join(no_upper_air)}")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid"])
 
@@ -1056,6 +1225,7 @@ with tab4:
         st.caption(
             f"Next {GRID_HOURS} hours, station-local time. Ensemble families show the median. "
             "One color scale is shared across all models."
+            + (" Values are a running total from the current hour." if grid_cfg.get("cumulative") else "")
         )
 
         # "Now" in the station's local time (the API timestamps are naive local).
@@ -1066,6 +1236,18 @@ with tab4:
         grid_start = pd.Timestamp(now_local).floor('h')
 
         df_grid = build_hourly_grid(df_det_active, hourly_summaries, grid_start, hours=GRID_HOURS)
+        if grid_cfg.get("cumulative") and not df_grid.empty:
+            df_grid = df_grid.cumsum(axis=1)
+        decimals = grid_cfg.get("decimals", 0)
+        cell_font = dict(size=10 if decimals else 11)
+
+        def format_cells(values):
+            """Cell labels: `decimals` places, but whole numbers from 10 up
+            so values like 10.5 still fit in the narrow hourly cells."""
+            return [[
+                "" if np.isnan(v) else f"{v:.0f}" if (decimals == 0 or abs(v) >= 10) else f"{v:.{decimals}f}"
+                for v in row
+            ] for row in np.asarray(values, dtype=float)]
 
         if df_grid.empty:
             st.info(f"No {var_cfg['label'].lower()} data is available for the next {GRID_HOURS} hours.")
@@ -1089,25 +1271,25 @@ with tab4:
                 vertical_spacing=0.04
             )
             fig_grid.add_trace(go.Heatmap(
-                x=times, y=models, z=z,
+                x=times, y=models, z=z, text=format_cells(z),
                 colorscale=grid_cfg["colorscale"],
-                zmin=grid_cfg.get("zmin", float(np.nanmin(z))), zmax=float(np.nanmax(z)),
+                zmin=grid_cfg.get("zmin", float(np.nanmin(z))), zmax=max(float(np.nanmax(z)), float(grid_cfg.get("zmax_floor", -np.inf))),
                 xgap=1, ygap=1,
-                texttemplate="%{z:.0f}", textfont=dict(size=11),
+                texttemplate="%{text}", textfont=cell_font,
                 colorbar=dict(title=unit, len=0.8, y=1, yanchor="top"),
-                hovertemplate=f"%{{y}}<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.1f}} {unit}</b><extra></extra>"
+                hovertemplate=f"%{{y}}<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.{decimals + 1}f}} {unit}</b><extra></extra>"
             ), row=1, col=1)
 
             if show_spread:
                 spread = np.nanmax(z, axis=0) - np.nanmin(z, axis=0)
                 fig_grid.add_trace(go.Heatmap(
-                    x=times, y=["Spread (max − min)"], z=[spread],
+                    x=times, y=["Spread (max − min)"], z=[spread], text=format_cells([spread]),
                     colorscale="Greys", zmin=0,
                     zmax=max(float(np.nanmax(spread)), float(grid_cfg["spread_floor"])),
                     xgap=1, ygap=1,
-                    texttemplate="%{z:.0f}", textfont=dict(size=11),
+                    texttemplate="%{text}", textfont=cell_font,
                     showscale=False,
-                    hovertemplate=f"Model spread<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.1f}} {unit}</b><extra></extra>"
+                    hovertemplate=f"Model spread<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.{decimals + 1}f}} {unit}</b><extra></extra>"
                 ), row=2, col=1)
 
             fig_grid.update_yaxes(autorange="reversed", showline=False, showgrid=False, tickfont=dict(size=12))
