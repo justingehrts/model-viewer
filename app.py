@@ -29,21 +29,24 @@ WEATHER_VARS = {
         "unit": "°F",
         "hourly_param": "temperature_2m",
         "daily_agg": "max",          # 'max' for daily highs
-        "chart_title": "Daily High Temperature Spread"
+        "chart_title": "Daily High Temperature Spread",
+        "grid": {"colorscale": "RdYlBu_r", "spread_floor": 8}
     },
     "apparent_temperature": {
         "label": "Feels Like",
         "unit": "°F",
         "hourly_param": "apparent_temperature",
         "daily_agg": "max",          # 'max' for daily highs, same as temperature_2m
-        "chart_title": "Daily High Feels Like Spread"
+        "chart_title": "Daily High Feels Like Spread",
+        "grid": {"colorscale": "RdYlBu_r", "spread_floor": 8}
     },
     "dew_point_2m": {
         "label": "Dew Point",
         "unit": "°F",
-        "hourly_param": "dew_point_2m"
+        "hourly_param": "dew_point_2m",
         # No daily_agg/chart_title: hourly line chart only, no daily
         # box-and-whisker or high/low tracking for this variable.
+        "grid": {"colorscale": "YlGnBu", "spread_floor": 8}
     },
     "precipitation": {
         "label": "Total Precipitation",
@@ -51,20 +54,23 @@ WEATHER_VARS = {
         "hourly_param": "precipitation",
         "daily_agg": "sum",          # 'sum' for total daily rainfall
         "chart_title": "Daily Total Precipitation Spread"
+        # No "grid": the Hourly Grid tab isn't offered for precipitation.
     },
     "wind_speed_10m": {
         "label": "Wind Speed",
         "unit": "mph",
         "hourly_param": "wind_speed_10m",
         "daily_agg": "max",          # 'max' for daily peak wind
-        "chart_title": "Daily High Wind Speed Spread"
+        "chart_title": "Daily High Wind Speed Spread",
+        "grid": {"colorscale": "YlOrRd", "zmin": 0, "spread_floor": 5}
     },
     "wind_gusts_10m": {
         "label": "Wind Gust",
         "unit": "mph",
         "hourly_param": "wind_gusts_10m",
         "daily_agg": "max",          # 'max' for daily peak gust
-        "chart_title": "Daily High Wind Gust Spread"
+        "chart_title": "Daily High Wind Gust Spread",
+        "grid": {"colorscale": "YlOrRd", "zmin": 0, "spread_floor": 5}
     }
 }
 
@@ -1037,89 +1043,92 @@ with tab3:
         )
 
 
-# --- TAB 4: HOURLY GRID (TEMPERATURE) ---
+# --- TAB 4: HOURLY GRID ---
 with tab4:
     GRID_HOURS = 48
-    st.subheader("Hourly Temperature Grid (°F)")
-    st.caption(
-        f"Next {GRID_HOURS} hours, station-local time. Ensemble families show the median. "
-        "Always air temperature, regardless of the sidebar variable. One color scale is shared across all models."
-    )
+    grid_cfg = var_cfg.get("grid")
+    unit = var_cfg["unit"]
 
-    # The grid is always temperature_2m, so reuse the sidebar summaries only
-    # when that's the selected variable; otherwise summarize it separately.
-    if selected_var_key == "temperature_2m":
-        grid_det, grid_summaries = df_det_active, hourly_summaries
+    if grid_cfg is None:
+        st.info(f"An hourly grid isn't available for {var_cfg['label']}.")
     else:
-        grid_det = dict_det["temperature_2m"]
-        grid_summaries, *_ = process_ensemble_data(
-            dict(dict_ens["temperature_2m"]), grid_det, selected_var_key="temperature_2m"
+        st.subheader(f"Hourly {var_cfg['label']} Grid ({unit})")
+        st.caption(
+            f"Next {GRID_HOURS} hours, station-local time. Ensemble families show the median. "
+            "One color scale is shared across all models."
         )
 
-    # "Now" in the station's local time (the API timestamps are naive local).
-    if dev_mode:
-        now_local = datetime.now()
-    else:
-        now_local = datetime.now(timezone.utc).replace(tzinfo=None) + pd.Timedelta(seconds=utc_offset_seconds)
-    grid_start = pd.Timestamp(now_local).floor('h')
+        # "Now" in the station's local time (the API timestamps are naive local).
+        if dev_mode:
+            now_local = datetime.now()
+        else:
+            now_local = datetime.now(timezone.utc).replace(tzinfo=None) + pd.Timedelta(seconds=utc_offset_seconds)
+        grid_start = pd.Timestamp(now_local).floor('h')
 
-    df_grid = build_hourly_grid(grid_det, grid_summaries, grid_start, hours=GRID_HOURS)
+        df_grid = build_hourly_grid(df_det_active, hourly_summaries, grid_start, hours=GRID_HOURS)
 
-    if df_grid.empty:
-        st.info("No temperature data is available for the next 48 hours.")
-    else:
-        times = list(df_grid.columns)
-        models = list(df_grid.index)
-        z = df_grid.values.astype(float)
+        if df_grid.empty:
+            st.info(f"No {var_cfg['label'].lower()} data is available for the next {GRID_HOURS} hours.")
+        else:
+            times = list(df_grid.columns)
+            models = list(df_grid.index)
+            z = df_grid.values.astype(float)
 
-        # Make_subplots lets the spread row use its own (neutral) color scale
-        # without sharing the temperature one.
-        show_spread = len(models) > 1
-        fig_grid = make_subplots(
-            rows=2 if show_spread else 1, cols=1, shared_xaxes=True,
-            row_heights=[len(models), 1.2] if show_spread else [1],
-            vertical_spacing=0.04
-        )
-        fig_grid.add_trace(go.Heatmap(
-            x=times, y=models, z=z,
-            colorscale="RdYlBu_r",
-            zmin=float(np.nanmin(z)), zmax=float(np.nanmax(z)),
-            xgap=1, ygap=1,
-            texttemplate="%{z:.0f}", textfont=dict(size=11),
-            colorbar=dict(title="°F", len=0.8, y=1, yanchor="top"),
-            hovertemplate="%{y}<br>%{x|%a %b %d, %I:%M %p}<br><b>%{z:.1f}°F</b><extra></extra>"
-        ), row=1, col=1)
+            # Models that returned nothing for this variable (e.g. AIFS and
+            # WeatherNext for gusts): say so rather than dropping them silently.
+            missing = [n for n in list(DET_MODEL_SLUGS) + ENS_ORDER if n not in models]
+            if missing and not dev_mode:
+                st.caption(f"No data for this variable from: {', '.join(missing)}")
 
-        if show_spread:
-            spread = np.nanmax(z, axis=0) - np.nanmin(z, axis=0)
+            # make_subplots lets the spread row use its own (neutral) color
+            # scale without sharing the variable's one.
+            show_spread = len(models) > 1
+            fig_grid = make_subplots(
+                rows=2 if show_spread else 1, cols=1, shared_xaxes=True,
+                row_heights=[len(models), 1.2] if show_spread else [1],
+                vertical_spacing=0.04
+            )
             fig_grid.add_trace(go.Heatmap(
-                x=times, y=["Spread (max − min)"], z=[spread],
-                colorscale="Greys", zmin=0, zmax=max(float(np.nanmax(spread)), 8.0),
+                x=times, y=models, z=z,
+                colorscale=grid_cfg["colorscale"],
+                zmin=grid_cfg.get("zmin", float(np.nanmin(z))), zmax=float(np.nanmax(z)),
                 xgap=1, ygap=1,
                 texttemplate="%{z:.0f}", textfont=dict(size=11),
-                showscale=False,
-                hovertemplate="Model spread<br>%{x|%a %b %d, %I:%M %p}<br><b>%{z:.1f}°F</b><extra></extra>"
-            ), row=2, col=1)
+                colorbar=dict(title=unit, len=0.8, y=1, yanchor="top"),
+                hovertemplate=f"%{{y}}<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.1f}} {unit}</b><extra></extra>"
+            ), row=1, col=1)
 
-        fig_grid.update_yaxes(autorange="reversed", showline=False, showgrid=False, tickfont=dict(size=12))
-        fig_grid.update_xaxes(
-            tickformat="%a %m/%d %I%p", tickangle=-45, automargin=True,
-            dtick=3 * 60 * 60 * 1000, showgrid=False, showline=False
-        )
-        if show_spread:
-            fig_grid.update_xaxes(showticklabels=False, row=1, col=1)
+            if show_spread:
+                spread = np.nanmax(z, axis=0) - np.nanmin(z, axis=0)
+                fig_grid.add_trace(go.Heatmap(
+                    x=times, y=["Spread (max − min)"], z=[spread],
+                    colorscale="Greys", zmin=0,
+                    zmax=max(float(np.nanmax(spread)), float(grid_cfg["spread_floor"])),
+                    xgap=1, ygap=1,
+                    texttemplate="%{z:.0f}", textfont=dict(size=11),
+                    showscale=False,
+                    hovertemplate=f"Model spread<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.1f}} {unit}</b><extra></extra>"
+                ), row=2, col=1)
 
-        # Thin divider at each local midnight (cell edge = half an hour before).
-        for t in times:
-            if t.hour == 0 and t != times[0]:
-                edge = t - pd.Timedelta(minutes=30)
-                fig_grid.add_shape(
-                    type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
-                    line=dict(color="rgba(128, 128, 128, 0.9)", width=2)
-                )
+            fig_grid.update_yaxes(autorange="reversed", showline=False, showgrid=False, tickfont=dict(size=12))
+            fig_grid.update_xaxes(
+                tickformat="%a %m/%d %I%p", tickangle=-45, automargin=True,
+                dtick=3 * 60 * 60 * 1000, showgrid=False, showline=False
+            )
+            if show_spread:
+                fig_grid.update_xaxes(showticklabels=False, row=1, col=1)
 
-        fig_grid.update_layout(
-            height=110 + 42 * (len(models) + (1 if show_spread else 0)) + 90,
-            margin=dict(l=10, r=10, t=20, b=10)
-        )
-        st.plotly_chart(fig_grid, use_container_width=True)
+            # Thin divider at each local midnight (cell edge = half an hour before).
+            for t in times:
+                if t.hour == 0 and t != times[0]:
+                    edge = t - pd.Timedelta(minutes=30)
+                    fig_grid.add_shape(
+                        type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
+                        line=dict(color="rgba(128, 128, 128, 0.9)", width=2)
+                    )
+
+            fig_grid.update_layout(
+                height=110 + 42 * (len(models) + (1 if show_spread else 0)) + 90,
+                margin=dict(l=10, r=10, t=20, b=10)
+            )
+            st.plotly_chart(fig_grid, use_container_width=True)
