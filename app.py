@@ -720,6 +720,73 @@ def compute_snowfall(get_param):
 # LAYER 2 & 3: PROCESSING & GRAND ENSEMBLE BUILDER
 # ==============================================================================
 
+ENS_FAMILIES = [n for n in ENS_ORDER if n != "Grand Ensemble"]
+
+
+def grand_family_of(col):
+    """Model family of a Grand Ensemble member column ("GEFS_member07" -> "GEFS")."""
+    return next((n for n in ENS_FAMILIES if col.startswith(f"{n}_")), col)
+
+
+def equal_share_weights(values, families):
+    """Member weights for the Grand Ensemble: every model family present in a
+    row gets an equal share, split evenly across its non-missing members, so a
+    64-member family doesn't outvote a 31-member one. values is a (rows,
+    members) array; families gives each column's family. Missing values get
+    weight 0, and a family with no data in a row drops out of that row."""
+    values = np.asarray(values, dtype=float)
+    valid = ~np.isnan(values)
+    fams = list(dict.fromkeys(families))
+    fam_idx = np.array([fams.index(f) for f in families])
+    counts = np.stack([valid[:, fam_idx == i].sum(axis=1) for i in range(len(fams))], axis=1)
+    per_member = np.where(counts > 0, 1.0 / np.maximum(counts, 1), 0.0)
+    n_present = np.maximum((counts > 0).sum(axis=1), 1)
+    return valid * per_member[:, fam_idx] / n_present[:, None]
+
+
+def weighted_quantile_rows(values, weights, q):
+    """Row-wise weighted quantile (midpoint-CDF interpolation; with equal
+    weights the median matches the ordinary median). NaN where a row has no
+    weight."""
+    values = np.asarray(values, dtype=float)
+    out = np.full(values.shape[0], np.nan)
+    for i in range(values.shape[0]):
+        keep = weights[i] > 0
+        if not keep.any():
+            continue
+        order = np.argsort(values[i, keep])
+        v, w = values[i, keep][order], weights[i, keep][order]
+        cdf = (np.cumsum(w) - 0.5 * w) / w.sum()
+        out[i] = np.interp(q, cdf, v)
+    return out
+
+
+def grand_stats(df_members, quantiles=(0.25, 0.5, 0.75)):
+    """Equal-share weighted quantiles and mean of Grand Ensemble member
+    columns (rows = hours or days). Returns {q: array, "mean": array}."""
+    cols = [c for c in df_members.columns if c not in ('time', 'date')]
+    values = df_members[cols].to_numpy(dtype=float)
+    weights = equal_share_weights(values, [grand_family_of(c) for c in cols])
+    stats = {q: weighted_quantile_rows(values, weights, q) for q in quantiles}
+    total = weights.sum(axis=1)
+    stats["mean"] = np.where(total > 0, np.nansum(values * weights, axis=1) / np.where(total > 0, total, 1), np.nan)
+    return stats
+
+
+def grand_box_stats(df_daily):
+    """Precomputed Plotly box stats for the Grand Ensemble (weighted
+    quartiles, whiskers at the most extreme members within 1.5 IQR)."""
+    stats = grand_stats(df_daily)
+    q1, med, q3 = stats[0.25], stats[0.5], stats[0.75]
+    iqr = q3 - q1
+    values = df_daily.to_numpy(dtype=float)
+    with np.errstate(invalid="ignore"):
+        lo = np.where(values >= (q1 - 1.5 * iqr)[:, None], values, np.inf).min(axis=1)
+        hi = np.where(values <= (q3 + 1.5 * iqr)[:, None], values, -np.inf).max(axis=1)
+    return dict(q1=q1, median=med, q3=q3,
+                lowerfence=np.where(np.isfinite(lo), lo, np.nan), upperfence=np.where(np.isfinite(hi), hi, np.nan))
+
+
 def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
     all_member_dfs = []
     for model_name, df_m in dict_ens.items():
@@ -737,10 +804,15 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
             df = dict_ens[name]
             member_cols = [c for c in df.columns if c != 'time']
             df_summary = pd.DataFrame({'time': df['time']})
-            df_summary['median'] = df[member_cols].median(axis=1)
-            df_summary['mean'] = df[member_cols].mean(axis=1)
-            df_summary['q25'] = df[member_cols].quantile(0.25, axis=1)
-            df_summary['q75'] = df[member_cols].quantile(0.75, axis=1)
+            if name == "Grand Ensemble":
+                stats = grand_stats(df)
+                df_summary['median'], df_summary['mean'] = stats[0.5], stats["mean"]
+                df_summary['q25'], df_summary['q75'] = stats[0.25], stats[0.75]
+            else:
+                df_summary['median'] = df[member_cols].median(axis=1)
+                df_summary['mean'] = df[member_cols].mean(axis=1)
+                df_summary['q25'] = df[member_cols].quantile(0.25, axis=1)
+                df_summary['q75'] = df[member_cols].quantile(0.75, axis=1)
             hourly_summaries[name] = df_summary
 
     daily_ens_highs = {}
@@ -800,16 +872,17 @@ def get_value_at_time(df, column, target_time):
 
 def get_grand_ensemble_median_at_time(dict_ens_var, target_time):
     """Pools every ensemble member column across all model families for one
-    variable's dict_ens[var_key] dict and returns the pooled median at the
-    nearest hour to target_time. Each model family finds its own nearest
+    variable's dict_ens[var_key] dict and returns the Grand Ensemble median
+    (equal share per family, see equal_share_weights) at the nearest hour to
+    target_time. Each model family finds its own nearest
     row independently (simpler than process_ensemble_data's shared-index
     concat approach above, since we only need one pooled number here, not
     a column-addressable DataFrame). Returns (median_value, matched_time)
     or (None, None).
     """
-    pooled_values = []
+    pooled_values, pooled_families = [], []
     matched_time = None
-    for df_m in dict_ens_var.values():
+    for family, df_m in dict_ens_var.items():
         if df_m is None or df_m.empty or 'time' not in df_m.columns:
             continue
         member_cols = [c for c in df_m.columns if c != 'time']
@@ -824,10 +897,13 @@ def get_grand_ensemble_median_at_time(dict_ens_var, target_time):
         row_vals = [v for v in df_m.loc[idx, member_cols].tolist() if pd.notna(v)]
         if row_vals:
             pooled_values.extend(row_vals)
+            pooled_families.extend([family] * len(row_vals))
 
     if not pooled_values:
         return None, None
-    return float(np.median(pooled_values)), matched_time
+    values = np.array([pooled_values], dtype=float)
+    weights = equal_share_weights(values, pooled_families)
+    return float(weighted_quantile_rows(values, weights, 0.5)[0]), matched_time
 
 
 def build_hourly_grid(df_det, hourly_summaries, start_time, hours=48):
@@ -1111,6 +1187,18 @@ with tab1:
 
 
 # --- TAB 2: DAILY DISTRIBUTION SPREAD ---
+def grand_box_trace(df_daily, dates, name, color, showlegend):
+    """Grand Ensemble box from equal-share weighted stats (Plotly can't weight
+    raw points, so the quartiles/whiskers are precomputed; no outlier dots)."""
+    df_days = df_daily.loc[[d for d in dates if d in df_daily.index]]
+    stats = grand_box_stats(df_days)
+    return go.Box(
+        x=list(df_days.index), name=name, marker_color=color, line=dict(width=2),
+        whiskerwidth=0.8, legendgroup=name, showlegend=showlegend, hoverinfo="y+name",
+        **stats
+    )
+
+
 with tab2:
     if var_cfg.get("daily_agg") is None:
         st.info(f"Daily distribution isn't tracked for {var_cfg['label']}.")
@@ -1130,6 +1218,9 @@ with tab2:
                 df_m = daily_ens_highs[ens_name]
                 color = MODEL_CONFIG[ens_name]["color"]
             
+                if ens_name == "Grand Ensemble":
+                    fig_daily_high.add_trace(grand_box_trace(df_m, dates, ens_name, color, showlegend=True))
+                    continue
                 x_vals = []
                 y_vals = []
                 for date_str in dates:
@@ -1194,6 +1285,9 @@ with tab2:
                     df_m_low = daily_ens_lows[ens_name]
                     color = MODEL_CONFIG[ens_name]["color"]
                 
+                    if ens_name == "Grand Ensemble":
+                        fig_daily_low.add_trace(grand_box_trace(df_m_low, dates, ens_name, color, showlegend=False))
+                        continue
                     x_vals_low = []
                     y_vals_low = []
                     for date_str in dates:
@@ -1279,14 +1373,15 @@ with tab3:
                         row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
                 
             if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
-                g_highs = daily_ens_highs["Grand Ensemble"].loc[d].values
+                # Equal share per model family (see equal_share_weights).
+                g_hi = {k: float(v[0]) for k, v in grand_stats(daily_ens_highs["Grand Ensemble"].loc[[d]]).items()}
                 if selected_var_key in ("temperature_2m", "apparent_temperature") and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
-                    g_lows = daily_ens_lows["Grand Ensemble"].loc[d].values
-                    row["Grand Ens Med (L/H)"] = f"{np.median(g_lows):.1f}° / {np.median(g_highs):.1f}°F"
-                    row["High IQR Spread"] = f"{np.percentile(g_highs, 25):.1f}° to {np.percentile(g_highs, 75):.1f}°F"
+                    g_lo_med = float(grand_stats(daily_ens_lows["Grand Ensemble"].loc[[d]])[0.5][0])
+                    row["Grand Ens Med (L/H)"] = f"{g_lo_med:.1f}° / {g_hi[0.5]:.1f}°F"
+                    row["High IQR Spread"] = f"{g_hi[0.25]:.1f}° to {g_hi[0.75]:.1f}°F"
                 else:
-                    row["Grand Ens Median"] = round(float(np.median(g_highs)), 2)
-                    row["Consensus IQR"] = f"{np.percentile(g_highs, 25):.2f} to {np.percentile(g_highs, 75):.2f} {var_cfg['unit']}"
+                    row["Grand Ens Median"] = round(g_hi[0.5], 2)
+                    row["Consensus IQR"] = f"{g_hi[0.25]:.2f} to {g_hi[0.75]:.2f} {var_cfg['unit']}"
             
             summary_rows.append(row)
         
