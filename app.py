@@ -82,6 +82,16 @@ WEATHER_VARS = {
         "grid": {"colorscale": "Blues", "zmin": 0, "zmax_floor": 1, "spread_floor": 1,
                  "cumulative": True, "decimals": 1}
     },
+    "snowfall_cobb": {
+        "label": "Snowfall (Cobb, approx.)",
+        "unit": "in",
+        "derived": True,
+        "verify": False,
+        "daily_agg": "sum",
+        "chart_title": "Daily Snowfall Spread (Cobb, approx.)",
+        "grid": {"colorscale": "Blues", "zmin": 0, "zmax_floor": 1, "spread_floor": 1,
+                 "cumulative": True, "decimals": 1}
+    },
     "wind_speed_10m": {
         "label": "Wind Speed",
         "unit": "mph",
@@ -147,13 +157,27 @@ DET_MODEL_SLUGS = {
 }
 
 # Inputs for the derived snowfall variables, fetched in a separate request so a
-# model that rejects them can't break the main fetch. The pressure levels
-# cover the surface-to-500 mb column Kuchera looks at; levels a model doesn't
-# return are simply skipped.
-SNOW_PRESSURE_LEVELS = [950, 925, 900, 850, 800, 700, 600, 500]
+# model that rejects them can't break the main fetch. These are the pressure
+# levels the ensemble API actually returns (checked live: nothing in between
+# has data). Kuchera uses the levels up to 500 mb; Cobb uses all of them.
+# Levels a model doesn't return are simply skipped.
+SNOW_DERIVED_VARS = ("snowfall_10to1", "snowfall_kuchera", "snowfall_cobb")
+SNOW_PRESSURE_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300]
+KUCHERA_TOP_HPA = 500
 SNOW_INPUT_PARAMS = ["snowfall", "temperature_2m", "surface_pressure"] + [
-    f"temperature_{p}hPa" for p in SNOW_PRESSURE_LEVELS
+    f"{var}_{p}hPa"
+    for var in ("temperature", "relative_humidity", "vertical_velocity", "geopotential_height")
+    for p in SNOW_PRESSURE_LEVELS
 ]
+
+# Cobb & Waldstreicher (2005) snow ratio vs. layer temperature (°C), read off
+# their Fig. 5 (the paper gives only the plotted curve), anchored to their
+# worked example: -25 °C -> 10, -15 °C -> 45, -8 °C -> 6. Approximate.
+COBB_SR_TEMPS_C = [-30, -22, -21, -20, -19, -18, -17, -16, -15, -14, -13, -12, -11, -10, -9, -8, -6, -4, -2, 0]
+COBB_SR_VALUES = [10, 10, 11, 14, 20, 29, 40, 50, 45, 36, 25, 15, 9, 7, 6, 6, 6.5, 6.5, 5, 3]
+# The column is resampled to 25 mb slices (as NBM's Cobb does) so the
+# -12 to -18 °C peak isn't averaged away across 100 mb gaps (700-500 mb).
+COBB_SLICE_HPA = 25
 
 # Verification: if the nearest available forecast hour is farther than this
 # from the actual observation time, treat it as "not found" rather than
@@ -260,6 +284,11 @@ def generate_mock_data(days=7):
         'ECMWF Operational': snow_swe * 14 * 1.1,
         'GFS Operational': snow_swe * 14 * 0.9
     })
+    dict_det["snowfall_cobb"] = pd.DataFrame({
+        'time': dates,
+        'ECMWF Operational': snow_swe * 17 * 1.1,
+        'GFS Operational': snow_swe * 17 * 0.9
+    })
 
     dict_ens = {var_key: {} for var_key in WEATHER_VARS}
     run_cycles = {}
@@ -299,6 +328,8 @@ def generate_mock_data(days=7):
             {'time': dates, **{k: v * 10 for k, v in member_swe.items()}})
         dict_ens["snowfall_kuchera"][nickname] = pd.DataFrame(
             {'time': dates, **{k: v * np.random.uniform(11, 17) for k, v in member_swe.items()}})
+        dict_ens["snowfall_cobb"][nickname] = pd.DataFrame(
+            {'time': dates, **{k: v * np.random.uniform(10, 25) for k, v in member_swe.items()}})
         run_cycles[nickname] = "DEV-MOCK 00Z"
 
     det_run_cycles = {
@@ -405,10 +436,10 @@ def get_current_conditions(airport_code):
         return None, str(e)
 
 # ==============================================================================
-# LAYER 1: LIVE DATA INGESTION (CACHED FOR 15 MINUTES)
+# LAYER 1: LIVE DATA INGESTION (CACHED FOR 1 HOUR)
 # ==============================================================================
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=3600)
 def fetch_deterministic_data(lat, lon, days=7):
     """Fetches explicit operational deterministic runs for ECMWF IFS, GFS, and NBM."""
     url = "https://api.open-meteo.com/v1/forecast"
@@ -461,24 +492,21 @@ def fetch_deterministic_data(lat, lon, days=7):
             snow_hourly = res_snow.json()["hourly"]
         except Exception:
             pass
-        df_10 = pd.DataFrame({"time": pd.to_datetime((snow_hourly or hourly)["time"])})
-        df_k = df_10.copy()
+        snow_times = pd.to_datetime((snow_hourly or hourly)["time"])
+        snow_frames = {k: pd.DataFrame({"time": snow_times}) for k in SNOW_DERIVED_VARS}
         if snow_hourly:
             for model_name, slug in DET_MODEL_SLUGS.items():
-                snow_10, snow_k = compute_snowfall(lambda param: snow_hourly.get(f"{param}_{slug}"))
-                if snow_10 is not None:
-                    df_10[model_name] = snow_10
-                if snow_k is not None:
-                    df_k[model_name] = snow_k
-        dict_det["snowfall_10to1"] = df_10
-        dict_det["snowfall_kuchera"] = df_k
+                derived = compute_snowfall(lambda param: snow_hourly.get(f"{param}_{slug}"))
+                for var_key, values in derived.items():
+                    snow_frames[var_key][model_name] = values
+        dict_det.update(snow_frames)
 
         fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return dict_det, fetch_time, det_run_cycles, None, utc_offset_seconds
     except Exception as e:
         return {var_key: pd.DataFrame() for var_key in WEATHER_VARS}, "", {}, str(e), 0
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=3600)
 def fetch_ensemble_data(lat, lon, days=7):
     """Fetches probabilistic ensemble members across EPS, AIFS, GEFS, WeatherNext."""
     url = "https://ensemble-api.open-meteo.com/v1/ensemble"
@@ -550,19 +578,16 @@ def fetch_ensemble_data(lat, lon, days=7):
                 snow_hourly = res_snow.json()["hourly"]
                 # Members are suffixed "_memberNN"; the control has no suffix.
                 suffixes = [k[len("snowfall"):] for k in snow_hourly if k == "snowfall" or k.startswith("snowfall_member")]
-                df_10 = pd.DataFrame({"time": pd.to_datetime(snow_hourly["time"])})
-                df_k = df_10.copy()
+                snow_times = pd.to_datetime(snow_hourly["time"])
+                snow_frames = {k: pd.DataFrame({"time": snow_times}) for k in SNOW_DERIVED_VARS}
                 for sfx in suffixes:
                     col = sfx.lstrip("_") or "control"
-                    snow_10, snow_k = compute_snowfall(lambda param: snow_hourly.get(f"{param}{sfx}"))
-                    if snow_10 is not None:
-                        df_10[col] = snow_10
-                    if snow_k is not None:
-                        df_k[col] = snow_k
-                if len(df_10.columns) > 1:
-                    dict_ens["snowfall_10to1"][nickname] = df_10
-                if len(df_k.columns) > 1:
-                    dict_ens["snowfall_kuchera"][nickname] = df_k
+                    derived = compute_snowfall(lambda param: snow_hourly.get(f"{param}{sfx}"))
+                    for var_key, values in derived.items():
+                        snow_frames[var_key][col] = values
+                for var_key, df_snow in snow_frames.items():
+                    if len(df_snow.columns) > 1:
+                        dict_ens[var_key][nickname] = df_snow
             except Exception as e:
                 errors.append(f"{nickname} snowfall: {str(e)}")
 
@@ -575,7 +600,7 @@ def fetch_ensemble_data(lat, lon, days=7):
     return dict_ens, run_cycles, errors
 
 # ==============================================================================
-# SNOWFALL: 10:1 AND KUCHERA RATIOS
+# SNOWFALL: 10:1, KUCHERA AND COBB RATIOS
 # ==============================================================================
 
 def kuchera_slr(tmax_k):
@@ -585,48 +610,111 @@ def kuchera_slr(tmax_k):
     return np.clip(slr, 0, None)
 
 
+def rh_wrt_ice(rh_water, t_c):
+    """Converts relative humidity over water (%) to over ice below 0 °C, using
+    Magnus-type saturation vapor pressures."""
+    es_water = 6.112 * np.exp(17.67 * t_c / (t_c + 243.5))
+    es_ice = 6.112 * np.exp(22.46 * t_c / (t_c + 272.62))
+    return np.where(t_c < 0, rh_water * es_water / es_ice, rh_water)
+
+
+def cobb_slr(profiles, sfc_p):
+    """Cobb & Waldstreicher (2005) snow ratio per hour.
+
+    profiles maps pressure (hPa) -> (temp °C, RH %, vertical velocity, height m)
+    arrays for the levels a model returned. The column is resampled to
+    COBB_SLICE_HPA slices (linear in log-pressure); slices below ground are
+    dropped. Cloudy slices (RH w.r.t. ice >= 90%) with rising air get weight
+    w * (w / w_max)^2 * thickness, and the ratio is the weighted average of
+    each slice's ratio from the temperature curve. The weights are normalized,
+    so vertical velocity units cancel; only its sign (positive up) matters.
+
+    Returns an array of ratios, NaN where no slice is cloudy and rising."""
+    known = sorted(profiles, reverse=True)  # surface-most level first
+    x_known = -np.log(np.array(known, dtype=float))
+    grid_p = np.arange(known[0], known[-1] - 1, -COBB_SLICE_HPA, dtype=float)
+    x_grid = -np.log(grid_p)
+    idx = np.clip(np.searchsorted(x_known, x_grid, side="right") - 1, 0, len(known) - 2)
+    frac = ((x_grid - x_known[idx]) / (x_known[idx + 1] - x_known[idx]))[:, None]
+
+    def to_grid(field):
+        stack = np.vstack([profiles[p][field] for p in known])
+        return stack[idx] * (1 - frac) + stack[idx + 1] * frac
+
+    t, rh, w, z = (to_grid(i) for i in range(4))
+    t_mid, rh_mid, w_mid = ((a[:-1] + a[1:]) / 2 for a in (t, rh, w))
+    thickness = z[1:] - z[:-1]
+    above_ground = ~(grid_p[:-1, None] > sfc_p[None, :]) if sfc_p is not None else True
+    with np.errstate(invalid="ignore"):
+        cloudy = above_ground & (rh_wrt_ice(rh_mid, t_mid) >= 90) & (w_mid > 0) & (thickness > 0)
+    w_cloudy = np.where(cloudy, w_mid, 0.0)
+    w_max = w_cloudy.max(axis=0)
+    weight = np.where(cloudy, w_cloudy * (w_cloudy / np.where(w_max > 0, w_max, 1.0)) ** 2 * thickness, 0.0)
+    slice_sr = np.where(cloudy, np.interp(np.nan_to_num(t_mid), COBB_SR_TEMPS_C, COBB_SR_VALUES), 0.0)
+    total = weight.sum(axis=0)
+    return np.where(total > 0, (slice_sr * weight).sum(axis=0) / np.where(total > 0, total, 1.0), np.nan)
+
+
 def compute_snowfall(get_param):
     """Derives hourly snowfall (in) for one model run or ensemble member.
 
     get_param(name) returns that Open-Meteo hourly series (a list, °F for
     temperatures) or None. Open-Meteo's `snowfall` is the model's frozen
-    liquid equivalent x 7, so dividing by 7 recovers the liquid equivalent; the
-    model still decides rain vs. snow, we only replace the ratio.
+    liquid equivalent x 7 (checked live: 0.7 cm per mm in all-snow hours), so
+    dividing by 7 recovers the liquid equivalent; the model still decides rain
+    vs. snow, we only replace the ratio.
 
-    Returns (snow_10to1, snow_kuchera) as arrays, either None if unavailable.
-    Kuchera needs at least one pressure level: surface temperature alone isn't
-    Kuchera, so those models are left out rather than approximated."""
-    snow_api = get_param("snowfall")
+    Returns {var_key: array} for whichever of SNOW_DERIVED_VARS this model can
+    support. Kuchera needs at least one pressure-level temperature; Cobb needs
+    at least two levels with temperature, RH, vertical velocity and height.
+    Models without those are left out rather than approximated. Hours with
+    snow but no cloudy, rising layer have no Cobb ratio, so those hours fall
+    back to Kuchera (or 10:1 without upper-air temperatures)."""
+    def series(name):
+        values = get_param(name)
+        if values is None:
+            return None
+        arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+        return None if np.isnan(arr).all() else arr
+
+    snow_api = series("snowfall")
     if snow_api is None:
-        return None, None
-    swe = pd.to_numeric(pd.Series(snow_api), errors="coerce").to_numpy(dtype=float) / 7.0
-    snow_10 = swe * 10
+        return {}
+    swe = snow_api / 7.0
+    derived = {"snowfall_10to1": swe * 10}
 
-    sfc_p = get_param("surface_pressure")
-    sfc_p = None if sfc_p is None else pd.to_numeric(pd.Series(sfc_p), errors="coerce").to_numpy(dtype=float)
-    levels = []
-    for p in SNOW_PRESSURE_LEVELS:
-        t = get_param(f"temperature_{p}hPa")
-        if t is None:
-            continue
-        t = pd.to_numeric(pd.Series(t), errors="coerce").to_numpy(dtype=float)
-        if sfc_p is not None:
-            # Ignore levels that are below ground at this station.
-            t = np.where(sfc_p < p, np.nan, t)
-        levels.append(t)
-    if not levels or all(np.isnan(t).all() for t in levels):
-        return snow_10, None
+    sfc_p = series("surface_pressure")
+    f_to_c = lambda f: (f - 32) * 5 / 9
+    temps_c = {p: f_to_c(t) for p in SNOW_PRESSURE_LEVELS if (t := series(f"temperature_{p}hPa")) is not None}
 
-    t2m = get_param("temperature_2m")
-    if t2m is not None:
-        levels.append(pd.to_numeric(pd.Series(t2m), errors="coerce").to_numpy(dtype=float))
-    tmax_f = levels[0]
-    for t in levels[1:]:
-        tmax_f = np.fmax(tmax_f, t)  # NaN-skipping max across the column
-    tmax_k = (tmax_f - 32) * 5 / 9 + 273.15
-    snow_k = swe * kuchera_slr(tmax_k)
-    snow_k = np.where(swe == 0, 0.0, snow_k)  # no snow is no snow, temps or not
-    return snow_10, snow_k
+    # Kuchera: warmest temperature from the surface to 500 mb, ignoring levels
+    # that are below ground at this station.
+    kuchera = None
+    column = [np.where(sfc_p < p, np.nan, t) if sfc_p is not None else t
+              for p, t in temps_c.items() if p >= KUCHERA_TOP_HPA]
+    if any(not np.isnan(t).all() for t in column):
+        t2m = series("temperature_2m")
+        if t2m is not None:
+            column.append(f_to_c(t2m))
+        tmax_c = column[0]
+        for t in column[1:]:
+            tmax_c = np.fmax(tmax_c, t)  # NaN-skipping max across the column
+        kuchera = kuchera_slr(tmax_c + 273.15)
+        derived["snowfall_kuchera"] = swe * kuchera
+
+    # Cobb: full profiles of temperature, RH, vertical velocity and height.
+    profiles = {}
+    for p, t in temps_c.items():
+        rh, w, z = (series(f"{var}_{p}hPa") for var in ("relative_humidity", "vertical_velocity", "geopotential_height"))
+        if rh is not None and w is not None and z is not None:
+            profiles[p] = (t, rh, w, z)
+    if len(profiles) >= 2:
+        cobb = cobb_slr(profiles, sfc_p)
+        fallback = kuchera if kuchera is not None else np.full_like(swe, 10.0)
+        derived["snowfall_cobb"] = swe * np.where(np.isnan(cobb), fallback, cobb)
+
+    # No snow is no snow, whatever the temperatures say.
+    return {k: np.where(swe == 0, 0.0, v) for k, v in derived.items()}
 
 # ==============================================================================
 # LAYER 2 & 3: PROCESSING & GRAND ENSEMBLE BUILDER
@@ -949,16 +1037,19 @@ else:
 # LAYER 4: PLOTLY VISUALIZATIONS
 # ==============================================================================
 
-if selected_var_key in ("snowfall_10to1", "snowfall_kuchera"):
+if selected_var_key in SNOW_DERIVED_VARS:
     st.caption(
         "Snowfall uses each model's own snow liquid equivalent (Open-Meteo's 7:1 snowfall ÷ 7). "
-        "10:1 multiplies it by 10; Kuchera uses a ratio from the warmest temperature between the surface and 500 mb."
+        "10:1 multiplies it by 10; Kuchera uses a ratio from the warmest temperature between the surface and 500 mb; "
+        "Cobb weights a temperature-based ratio by upward motion in saturated layers, on 25 mb slices interpolated from "
+        "Open-Meteo's pressure levels, falling back to Kuchera in hours with no saturated rising layer."
     )
-    if selected_var_key == "snowfall_kuchera":
-        no_upper_air = [c for c in dict_det["snowfall_10to1"].columns if c != 'time' and c not in df_det_active.columns]
-        no_upper_air += [n for n in dict_ens["snowfall_10to1"] if n not in dict_ens["snowfall_kuchera"]]
-        if no_upper_air:
-            st.caption(f"Not in the Kuchera view (no upper-air temperatures): {', '.join(no_upper_air)}")
+    if selected_var_key != "snowfall_10to1":
+        needs = "upper-air temperatures" if selected_var_key == "snowfall_kuchera" else "full upper-air profiles"
+        missing = [c for c in dict_det["snowfall_10to1"].columns if c != 'time' and c not in df_det_active.columns]
+        missing += [n for n in dict_ens["snowfall_10to1"] if n not in dict_ens[selected_var_key]]
+        if missing:
+            st.caption(f"Not in this view (no {needs}): {', '.join(missing)}")
 
 tab1, tab2, tab3, tab4 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid"])
 
