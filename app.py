@@ -1113,6 +1113,10 @@ else:
 # LAYER 4: PLOTLY VISUALIZATIONS
 # ==============================================================================
 
+st.caption(
+    "Grand Ensemble gives each ensemble family (EPS, AIFS, GEFS, WeatherNext) an equal share, "
+    "regardless of how many members it has."
+)
 if selected_var_key in SNOW_DERIVED_VARS:
     st.caption(
         "Snowfall uses each model's own snow liquid equivalent (Open-Meteo's 7:1 snowfall ÷ 7). "
