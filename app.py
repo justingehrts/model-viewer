@@ -54,8 +54,9 @@ WEATHER_VARS = {
         "hourly_param": "precipitation",
         "daily_agg": "sum",          # 'sum' for total daily rainfall
         "chart_title": "Daily Total Precipitation Spread",
-        "verify": False
-        # No "grid": the Hourly Grid tab isn't offered for precipitation.
+        "verify": False,
+        "grid": {"colorscale": "Greens", "zmin": 0, "zmax_floor": 0.5, "spread_floor": 0.25,
+                 "cumulative": True, "decimals": 2}
     },
     # Snowfall is derived rather than requested directly ("derived": True):
     # Open-Meteo's own `snowfall` assumes a fixed 7:1 ratio, so we back out the
@@ -1241,13 +1242,20 @@ with tab4:
         decimals = grid_cfg.get("decimals", 0)
         cell_font = dict(size=10 if decimals else 11)
 
+        def format_cell(v):
+            """Short labels that fit the narrow hourly cells: whole numbers
+            from 10 up, "0" for zero, and no leading zero below 1 (".25")."""
+            if np.isnan(v):
+                return ""
+            if decimals == 0 or abs(v) >= 10:
+                return f"{v:.0f}"
+            text = f"{v:.{decimals}f}"
+            if float(text) == 0:
+                return "0"
+            return text.replace("0.", ".", 1) if abs(v) < 1 else text
+
         def format_cells(values):
-            """Cell labels: `decimals` places, but whole numbers from 10 up
-            so values like 10.5 still fit in the narrow hourly cells."""
-            return [[
-                "" if np.isnan(v) else f"{v:.0f}" if (decimals == 0 or abs(v) >= 10) else f"{v:.{decimals}f}"
-                for v in row
-            ] for row in np.asarray(values, dtype=float)]
+            return [[format_cell(v) for v in row] for row in np.asarray(values, dtype=float)]
 
         if df_grid.empty:
             st.info(f"No {var_cfg['label'].lower()} data is available for the next {GRID_HOURS} hours.")
