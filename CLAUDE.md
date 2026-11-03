@@ -38,6 +38,23 @@ Everything lives in `app.py`, organized top-to-bottom as:
 4. **Processing** — `compute_snowfall` derives the 10:1, Kuchera (`kuchera_slr`: warmest temperature from the surface to 500 mb) and Cobb (`cobb_slr`: Cobb & Waldstreicher 2005 weighting of a temperature-based ratio by upward motion in layers with RH w.r.t. ice ≥ 90%, on 25 mb slices interpolated in log-pressure; falls back to Kuchera in hours with no saturated rising layer) snowfall variables from the model's snow liquid equivalent (Open-Meteo `snowfall` ÷ 7). Below-ground levels are skipped; models lacking the needed upper-air fields are left out of that view. Open-Meteo's `vertical_velocity` is positive-up m/s; the Cobb weights are normalized, so its units cancel. `process_ensemble_data` — builds the Grand Ensemble (pooled members, but summarized with equal share per model family via `equal_share_weights`/`grand_stats`, so a 64-member family doesn't outvote a 31-member one; Tab 2 draws its box from precomputed weighted stats), hourly median/mean/IQR summaries, and daily high/low aggregates; `get_value_at_time`/`get_grand_ensemble_median_at_time` do single-hour nearest-time lookups for the verification panel
 5. **UI** — sidebar controls, a model-verification expander (currently-selected variable vs. the station's latest METAR), and four tabs (hourly time series, daily distribution box plots, summary table + CSV download, and a 48-hour hourly grid heatmap with a model-spread row for the selected variable, with precipitation and snowfall shown as running totals — `build_hourly_grid`) built with Plotly
 
+## Forecast archive
+
+`scripts/archive_forecasts.py`, run daily at 13:37 UTC by
+`.github/workflows/archive-forecasts.yml` (also manually via
+`workflow_dispatch`), builds the verification history for a future
+skill-weighted Grand Ensemble. Scope: KCMH, temperature. It saves every
+model's forecast (all ensemble members plus ECMWF/GFS/NBM deterministic) at
+00/06/12/18 UTC valid times out to 14 days, KCMH observations from the IEM
+ASOS archive, and CRPS scores per run, model and lead bucket (day1-2, day3-5,
+day6+; deterministic runs score |forecast − obs|). Output goes only to the
+orphan `forecast-archive` branch (`forecasts/KCMH/*.csv.gz`,
+`observations/KCMH.csv`, `scores/KCMH_temperature.csv`), so daily commits
+never trigger a Streamlit Cloud redeploy. It stores raw Open-Meteo slugs plus
+a `kind` column (ensemble/deterministic); translate them with `ENS_NAME_MAP` /
+`DET_MODEL_SLUGS` when reading. The script is standalone; it must not import
+`app.py`.
+
 ## Conventions
 
 - **Units**: temperature is always **°F**, wind is always **mph**. Pass

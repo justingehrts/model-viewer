@@ -1,0 +1,59 @@
+name: Archive KCMH forecasts
+
+# Daily verification history for the future skill-weighted Grand Ensemble.
+# Data is committed to the orphan `forecast-archive` branch only, so the
+# branches Streamlit Community Cloud deploys from never get daily commits.
+on:
+  schedule:
+    # 13:37 UTC: after the 00Z ECMWF/EPS/AIFS and 06Z GFS/GEFS runs are out,
+    # and off the top of the hour, when GitHub delays scheduled runs most.
+    - cron: "37 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: forecast-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out (or create) the forecast-archive branch
+        run: |
+          if git ls-remote --exit-code --heads origin forecast-archive > /dev/null; then
+            git fetch --depth=1 origin forecast-archive:forecast-archive
+            git worktree add archive forecast-archive
+          else
+            git worktree add --detach archive
+            cd archive
+            git checkout --orphan forecast-archive
+            git rm -rfq .
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy
+
+      - name: Archive forecasts, observations and scores
+        run: python scripts/archive_forecasts.py --archive-dir archive
+
+      - name: Commit to forecast-archive
+        working-directory: archive
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit"
+            exit 0
+          fi
+          git commit -q -m "Archive KCMH forecasts $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push origin forecast-archive
