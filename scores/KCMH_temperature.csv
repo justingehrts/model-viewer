@@ -1,1 +1,8 @@
 issued_utc,kind,model_slug,lead_bucket,n,crps
+2026-11-03T20:00Z,deterministic,ecmwf_ifs025,day1-2,4,2.725
+2026-11-03T20:00Z,deterministic,gfs_seamless,day1-2,4,3.625
+2026-11-03T20:00Z,deterministic,ncep_nbm_conus,day1-2,4,2.425
+2026-11-03T20:00Z,ensemble,ecmwf_aifs025,day1-2,4,1.095
+2026-11-03T20:00Z,ensemble,ecmwf_ifs025,day1-2,4,2.579
+2026-11-03T20:00Z,ensemble,gfs_seamless,day1-2,4,1.618
+2026-11-03T20:00Z,ensemble,google_weathernext2_ensemble,day1-2,4,1.321
