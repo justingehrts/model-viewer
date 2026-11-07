@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timezone
 import time
 import re
+import io
 import math
 import os
 import subprocess
@@ -155,6 +156,15 @@ DET_MODEL_SLUGS = {
     "GFS Operational": "gfs_seamless",
     "NBM Operational": "ncep_nbm_conus"
 }
+
+# Trends tab: Open-Meteo's Previous Runs API returns each deterministic
+# model's forecast made 1..7 days before every valid hour.
+PREVIOUS_RUN_DAYS = 7
+# The daily forecast archive (scripts/archive_forecasts.py) lives on the
+# public forecast-archive branch; ensemble trends are available only for
+# stations it covers.
+ARCHIVE_RAW_URL = "https://raw.githubusercontent.com/justingehrts/model-viewer/forecast-archive"
+ARCHIVE_STATIONS = {"KCMH"}
 
 # Inputs for the derived snowfall variables, fetched in a separate request so a
 # model that rejects them can't break the main fetch. These are the pressure
@@ -338,6 +348,24 @@ def generate_mock_data(days=7):
     }
 
     return dict_det, dict_ens, det_run_cycles, run_cycles
+
+
+def generate_mock_previous_runs():
+    """Synthetic Previous Runs data for Dev Mode, shaped like
+    fetch_previous_runs(): columns n0 (latest) .. n7, where nN is the forecast
+    made N days before each hour; the error grows with N."""
+    rng = np.random.RandomState(7)
+    start = pd.Timestamp.now().normalize() - pd.Timedelta(days=PREVIOUS_RUN_DAYS)
+    times = pd.date_range(start, periods=(PREVIOUS_RUN_DAYS + 8) * 24, freq='h')
+    base = 55 + 10 * np.sin((times.hour.to_numpy() - 9) / 24 * 2 * np.pi)
+    runs = {}
+    for i, model_name in enumerate(["ECMWF Operational", "GFS Operational"]):
+        df = pd.DataFrame({'time': times})
+        for n in range(PREVIOUS_RUN_DAYS + 1):
+            drift = rng.normal(0, 0.8 * n + 0.3, size=len(times) // 24 + 1).repeat(24)[:len(times)]
+            df[f"n{n}"] = base + (i - 0.5) * 2 + drift
+        runs[model_name] = df
+    return runs
 
 # ==============================================================================
 # HELPER 3: AIRPORT GEOCODING LOOKUP
@@ -598,6 +626,69 @@ def fetch_ensemble_data(lat, lon, days=7):
             continue
 
     return dict_ens, run_cycles, errors
+
+@st.cache_data(ttl=3600)
+def fetch_previous_runs(lat, lon):
+    """Deterministic temperature forecasts from earlier runs via Open-Meteo's
+    Previous Runs API. Returns ({model_name: DataFrame(time, n0..n7)}, error),
+    where column nN is the forecast made N days before each (station-local)
+    hour and n0 is the latest run. Models or leads missing from the response
+    are left out."""
+    url = "https://previous-runs-api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": ",".join(["temperature_2m"] + [f"temperature_2m_previous_day{n}" for n in range(1, PREVIOUS_RUN_DAYS + 1)]),
+        "models": ",".join(DET_MODEL_SLUGS.values()),
+        "temperature_unit": "fahrenheit",
+        "timezone": "auto",
+        "past_days": PREVIOUS_RUN_DAYS,
+        "forecast_days": 8
+    }
+    try:
+        res = requests.get(url, params=params, timeout=15)
+        res.raise_for_status()
+        hourly = res.json()["hourly"]
+        runs = {}
+        for model_name, slug in DET_MODEL_SLUGS.items():
+            df = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+            for n in range(PREVIOUS_RUN_DAYS + 1):
+                key = f"temperature_2m_{slug}" if n == 0 else f"temperature_2m_previous_day{n}_{slug}"
+                if key in hourly:
+                    df[f"n{n}"] = pd.to_numeric(hourly[key], errors="coerce")
+            if "n0" in df.columns:
+                runs[model_name] = df
+        return runs, None
+    except Exception as e:
+        return {}, str(e)
+
+
+@st.cache_data(ttl=3600)
+def fetch_archive_daily(station, utc_offset_seconds):
+    """Per-member ensemble daily highs/lows from the last PREVIOUS_RUN_DAYS + 1
+    archive runs (forecast-archive branch, daily/<station>/<date>.csv.gz).
+    Adds run_day (the run's station-local date) and family (display name via
+    ENS_NAME_MAP). Returns an empty DataFrame if nothing is archived yet."""
+    today_utc = datetime.now(timezone.utc).date()
+    frames = []
+    for i in range(PREVIOUS_RUN_DAYS + 1):
+        day = today_utc - pd.Timedelta(days=i)
+        try:
+            res = requests.get(f"{ARCHIVE_RAW_URL}/daily/{station}/{day:%Y-%m-%d}.csv.gz", timeout=10)
+            if res.status_code != 200:
+                continue
+            frames.append(pd.read_csv(io.BytesIO(res.content), compression="gzip"))
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df = df[df["kind"] == "ensemble"].copy()
+    issued_local = pd.to_datetime(df["issued_utc"], utc=True).dt.tz_localize(None) + pd.Timedelta(seconds=utc_offset_seconds)
+    df["run_day"] = issued_local.dt.normalize()
+    df["target_day"] = pd.to_datetime(df["local_date"])
+    df["family"] = df["model_slug"].map(ENS_NAME_MAP)
+    return df.dropna(subset=["family"])
 
 # ==============================================================================
 # SNOWFALL: 10:1, KUCHERA AND COBB RATIOS
@@ -933,6 +1024,49 @@ def build_hourly_grid(df_det, hourly_summaries, start_time, hours=48):
     return pd.DataFrame(rows).T
 
 
+def station_now_local(dev_mode, utc_offset_seconds):
+    """"Now" in the station's local time (API timestamps are naive local;
+    Dev Mode's mock data uses this machine's clock)."""
+    if dev_mode:
+        return pd.Timestamp(datetime.now())
+    return pd.Timestamp(datetime.now(timezone.utc).replace(tzinfo=None)) + pd.Timedelta(seconds=utc_offset_seconds)
+
+
+def run_forecast_value(df_runs, target_day, run_day, today, how):
+    """One run's temperature forecast for a target day, from Previous Runs
+    data (see fetch_previous_runs). The run made on run_day is read from
+    column n{days between run and target}. how is "max" (daily high), "min"
+    (daily low) or an int local hour. NaN outside 0..PREVIOUS_RUN_DAYS days,
+    for future runs, or where data is missing."""
+    n = (target_day - run_day).days
+    col = f"n{n}"
+    if n < 0 or n > PREVIOUS_RUN_DAYS or run_day > today or col not in df_runs.columns:
+        return np.nan
+    in_day = (df_runs['time'] >= target_day) & (df_runs['time'] < target_day + pd.Timedelta(days=1))
+    values = df_runs.loc[in_day, ['time', col]].dropna()
+    if values.empty:
+        return np.nan
+    if how == "max":
+        return values[col].max()
+    if how == "min":
+        return values[col].min()
+    at_hour = values.loc[values['time'].dt.hour == how, col]
+    return at_hour.mean() if not at_hour.empty else np.nan
+
+
+def grand_trend_value(df_daily, target_day, run_day, how):
+    """Grand Ensemble daily high ("max") or low ("min") forecast for a target
+    day from one archived run: {0.25, 0.5, 0.75} quantiles with equal share
+    per model family (grand_stats). None if the run isn't archived."""
+    rows = df_daily[(df_daily["run_day"] == run_day) & (df_daily["target_day"] == target_day)]
+    if rows.empty:
+        return None
+    field = "tmax" if how == "max" else "tmin"
+    members = pd.DataFrame([rows[field].to_numpy()], columns=(rows["family"] + "_" + rows["member"].astype(str)).tolist())
+    stats = grand_stats(members)
+    return {q: float(stats[q][0]) for q in (0.25, 0.5, 0.75)}
+
+
 def format_value_with_unit(val, unit, signed=False):
     """°F gets no space (matches Tab 3's existing '74.0°F' convention);
     mph gets a space, since there's no existing precedent for it appearing
@@ -1006,11 +1140,17 @@ if dev_mode:
     dict_det, dict_ens, det_run_cycles, run_cycles = generate_mock_data(days=forecast_days)
     fetch_time = "OFFLINE DEV MODE"
     det_err = None
-    utc_offset_seconds = 0  # unused: verification panel is skipped in Dev Mode
+    utc_offset_seconds = 0  # Dev Mode's mock times use this machine's clock
+    prev_runs, prev_runs_err = generate_mock_previous_runs(), None
+    archive_daily = pd.DataFrame()
 else:
     with st.spinner("Fetching multi-model ensemble payloads..."):
         dict_det, fetch_time, det_run_cycles, det_err, utc_offset_seconds = fetch_deterministic_data(lat, lon, days=forecast_days)
         dict_ens, run_cycles, ens_errs = fetch_ensemble_data(lat, lon, days=forecast_days)
+        prev_runs, prev_runs_err = fetch_previous_runs(lat, lon)
+        archive_station = airport_input if loc_mode == "Airport Code" else None
+        archive_daily = (fetch_archive_daily(archive_station, utc_offset_seconds)
+                         if archive_station in ARCHIVE_STATIONS else pd.DataFrame())
 
 if not dev_mode and (det_err or dict_det[selected_var_key].empty):
     st.error(f"⚠️ Unable to fetch weather data from Open-Meteo. Details: `{det_err}`")
@@ -1131,7 +1271,7 @@ if selected_var_key in SNOW_DERIVED_VARS:
         if missing:
             st.caption(f"Not in this view (no {needs}): {', '.join(missing)}")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid", "📉 Trends"])
 
 # --- TAB 1: HOURLY TIME-SERIES ---
 with tab1:
@@ -1419,12 +1559,7 @@ with tab4:
             + (" Values are a running total from the current hour." if grid_cfg.get("cumulative") else "")
         )
 
-        # "Now" in the station's local time (the API timestamps are naive local).
-        if dev_mode:
-            now_local = datetime.now()
-        else:
-            now_local = datetime.now(timezone.utc).replace(tzinfo=None) + pd.Timedelta(seconds=utc_offset_seconds)
-        grid_start = pd.Timestamp(now_local).floor('h')
+        grid_start = station_now_local(dev_mode, utc_offset_seconds).floor('h')
 
         df_grid = build_hourly_grid(df_det_active, hourly_summaries, grid_start, hours=GRID_HOURS)
         if grid_cfg.get("cumulative") and not df_grid.empty:
@@ -1512,3 +1647,111 @@ with tab4:
                 margin=dict(l=10, r=10, t=20, b=10)
             )
             st.plotly_chart(fig_grid, use_container_width=True)
+
+
+# --- TAB 5: TRENDS (TEMPERATURE) ---
+with tab5:
+    st.subheader("Temperature Trends")
+    st.caption(
+        f"How each model's temperature forecast has changed over the last {PREVIOUS_RUN_DAYS} days of runs. "
+        "Always air temperature, regardless of the sidebar variable. A run's forecast for a day comes from "
+        "Open-Meteo's Previous Runs data: the forecast made N days before each hour, N = days between run and target."
+    )
+    if not prev_runs:
+        st.info(f"Previous-run data isn't available right now. ({prev_runs_err})")
+    else:
+        today = station_now_local(dev_mode, utc_offset_seconds).normalize()
+        day_lbl = lambda d: d.strftime("%a %m/%d")
+        target_days = [today + pd.Timedelta(days=i) for i in range(7)]
+        run_days = [today - pd.Timedelta(days=i) for i in range(PREVIOUS_RUN_DAYS - 1, -1, -1)]
+        has_ens_trend = not archive_daily.empty
+
+        c1, c2 = st.columns([2, 1])
+        value_mode = c1.radio("Value", ["High", "Low", "Specific hour"], horizontal=True, key="trend_value")
+        how = {"High": "max", "Low": "min"}.get(value_mode)
+        if how is None:
+            how = c2.selectbox("Local hour", list(range(24)), index=16, key="trend_hour",
+                               format_func=lambda hr: pd.Timestamp(2000, 1, 1, hr).strftime("%I %p").lstrip("0"))
+        value_lbl = {"max": "HIGH", "min": "LOW"}.get(how) or pd.Timestamp(2000, 1, 1, how).strftime("%I %p").lstrip("0")
+        ens_ok = has_ens_trend and how in ("max", "min")
+
+        # A. Trend grid: target days x runs, with change vs. the previous run.
+        model_options = list(prev_runs) + (["Grand Ensemble"] if ens_ok else [])
+        trend_model = st.selectbox("Model", model_options, key="trend_model")
+
+        def trend_cell(target_day, run_day):
+            if trend_model == "Grand Ensemble":
+                stats = grand_trend_value(archive_daily, target_day, run_day, how)
+                return np.nan if stats is None else stats[0.5]
+            return run_forecast_value(prev_runs[trend_model], target_day, run_day, today, how)
+
+        z = np.array([[trend_cell(d, r) for r in run_days] for d in target_days], dtype=float)
+        delta = z[:, -1] - z[:, -2]
+        arrows = ["" if np.isnan(v) else ("▲" if v > 0.5 else "▼" if v < -0.5 else "•") + f"{abs(v):.0f}" for v in delta]
+        fig_trend = make_subplots(rows=1, cols=2, column_widths=[0.88, 0.12], shared_yaxes=True, horizontal_spacing=0.01)
+        fig_trend.add_trace(go.Heatmap(
+            z=z, x=[day_lbl(r) for r in run_days], y=[day_lbl(d) for d in target_days],
+            text=[["" if np.isnan(v) else f"{v:.0f}" for v in row] for row in z], texttemplate="%{text}",
+            textfont=dict(size=14), colorscale=WEATHER_VARS["temperature_2m"]["grid"]["colorscale"],
+            xgap=2, ygap=2, colorbar=dict(title="°F", x=1.02),
+            hovertemplate="Target %{y}<br>Run %{x}<br><b>%{z:.1f}°F</b><extra></extra>"
+        ), 1, 1)
+        fig_trend.add_trace(go.Heatmap(
+            z=delta[:, None], x=["Δ vs prev run"], y=[day_lbl(d) for d in target_days],
+            text=[[a] for a in arrows], texttemplate="%{text}", textfont=dict(size=14),
+            colorscale="RdBu_r", zmid=0, zmin=-6, zmax=6, showscale=False, xgap=2, ygap=2,
+            hovertemplate="%{y}: %{z:+.1f}°F vs previous run<extra></extra>"
+        ), 1, 2)
+        fig_trend.update_yaxes(autorange="reversed", title_text="Target day", row=1, col=1)
+        fig_trend.update_xaxes(side="top", row=1, col=1)
+        fig_trend.update_xaxes(side="top", row=1, col=2)
+        fig_trend.update_layout(
+            title=dict(text=f"{trend_model} forecast {value_lbl} (°F) by run date (columns, latest at right)", font=dict(size=18)),
+            height=440, margin=dict(t=110, l=10, r=10, b=10)
+        )
+        st.plotly_chart(fig_trend, use_container_width=True)
+
+        st.divider()
+
+        # B. dprog/dt: one target day, every model's forecast by run date.
+        dprog_days = [today + pd.Timedelta(days=i) for i in range(1, 8)]
+        target = st.selectbox("Target day", dprog_days, index=2, format_func=day_lbl, key="trend_target")
+        dprog_runs = [target - pd.Timedelta(days=n) for n in range(PREVIOUS_RUN_DAYS, -1, -1)
+                      if target - pd.Timedelta(days=n) <= today]
+        x_lbls = [day_lbl(r) for r in dprog_runs]
+        fig_dprog = go.Figure()
+        if ens_ok:
+            ens = [grand_trend_value(archive_daily, target, r, how) for r in dprog_runs]
+            pts = [(x, e) for x, e in zip(x_lbls, ens) if e is not None]
+            if pts:
+                xs = [x for x, _ in pts]
+                fig_dprog.add_trace(go.Scatter(
+                    x=xs + xs[::-1], y=[e[0.75] for _, e in pts] + [e[0.25] for _, e in pts][::-1],
+                    fill="toself", fillcolor="rgba(136, 136, 136, 0.2)", line=dict(width=0), mode="lines",
+                    name="Grand Ensemble IQR", hoverinfo="skip"
+                ))
+                fig_dprog.add_trace(go.Scatter(
+                    x=xs, y=[e[0.5] for _, e in pts], mode="lines+markers", name="Grand Ensemble (Median)",
+                    line=dict(color=MODEL_CONFIG["Grand Ensemble"]["color"], width=3, dash="dash"),
+                    hovertemplate="Grand Ensemble<br>Run %{x}: <b>%{y:.0f}°F</b><extra></extra>"
+                ))
+        for model_name, df_runs in prev_runs.items():
+            fig_dprog.add_trace(go.Scatter(
+                x=x_lbls, y=[run_forecast_value(df_runs, target, r, today, how) for r in dprog_runs],
+                mode="lines+markers", name=model_name,
+                line=dict(color=MODEL_CONFIG[model_name]["color"], width=3), marker=dict(size=9),
+                hovertemplate=f"{model_name}<br>Run %{{x}}: <b>%{{y:.0f}}°F</b><extra></extra>"
+            ))
+        fig_dprog.update_layout(
+            title=dict(text=f"Forecast {value_lbl} for {target:%a %m/%d} by run date", font=dict(size=18)),
+            # Pin run-date order: the ensemble trace can start later than the
+            # deterministic ones, which would otherwise append early runs at the end.
+            xaxis=dict(title="Run date", type="category", categoryorder="array", categoryarray=x_lbls, **AXIS_STYLE),
+            yaxis=dict(title="Temperature (°F)", **AXIS_STYLE),
+            height=450, hovermode="x unified", legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5)
+        )
+        st.plotly_chart(fig_dprog, use_container_width=True)
+        if has_ens_trend and not ens_ok:
+            st.caption("The Grand Ensemble trend covers daily highs and lows only (the archive doesn't keep hourly members).")
+        elif not has_ens_trend and not dev_mode and loc_mode == "Airport Code" and airport_input in ARCHIVE_STATIONS:
+            st.caption("The Grand Ensemble trend will appear once the daily forecast archive has a run or two of history.")

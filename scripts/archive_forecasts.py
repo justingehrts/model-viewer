@@ -13,7 +13,10 @@ Each run:
    forecasts/KCMH/YYYY-MM-DD.csv.gz.
 2. Upserts the last few days of KCMH ASOS observations from the Iowa
    Environmental Mesonet into observations/KCMH.csv.
-3. Recomputes scores/KCMH_temperature.csv: CRPS per run, model and lead
+3. Saves each ensemble member's station-local daily high and low for every
+   complete local day in the run, to daily/KCMH/YYYY-MM-DD.csv.gz (the app's
+   Trends tab reads these for the Grand Ensemble trend).
+4. Recomputes scores/KCMH_temperature.csv: CRPS per run, model and lead
    bucket for every archived forecast that now has an observation
    (deterministic runs score |forecast - obs|, the CRPS of a single value).
 
@@ -34,6 +37,7 @@ import requests
 
 STATION = "KCMH"
 IEM_STATION = "CMH"
+STATION_TZ = "America/New_York"
 LAT, LON = 39.998, -82.892
 
 ENSEMBLE_SLUGS = ["ecmwf_ifs025", "ecmwf_aifs025", "gfs_seamless", "google_weathernext2_ensemble"]
@@ -51,6 +55,8 @@ LEAD_BUCKETS = [(0, 48, "day1-2"), (48, 120, "day3-5"), (120, np.inf, "day6+")]
 RETRY_WAITS_S = (10, 30, 90)
 
 FORECAST_COLUMNS = ["issued_utc", "kind", "model_slug", "member", "valid_utc", "lead_hours", "temp_f"]
+DAILY_COLUMNS = ["issued_utc", "kind", "model_slug", "member", "local_date", "tmax", "tmin"]
+MIN_HOURS_PER_DAY = 23  # a complete local day (23 on the spring DST change)
 
 
 def log(msg):
@@ -96,6 +102,21 @@ def to_rows(times, series_by_member, kind, slug, issued):
     return df[df["lead_hours"] >= 0][FORECAST_COLUMNS]
 
 
+def daily_extremes(times, series_by_member, kind, slug, issued):
+    """Each member's station-local daily high/low, complete local days only."""
+    local_date = pd.to_datetime(times, utc=True).tz_convert(STATION_TZ).date
+    frames = []
+    for member, values in series_by_member.items():
+        df = pd.DataFrame({"local_date": local_date, "temp_f": pd.to_numeric(pd.Series(values), errors="coerce")})
+        g = df.dropna().groupby("local_date")["temp_f"].agg(["max", "min", "count"])
+        g = g[g["count"] >= MIN_HOURS_PER_DAY]
+        frames.append(pd.DataFrame({"kind": kind, "model_slug": slug, "member": member,
+                                    "local_date": g.index, "tmax": g["max"].to_numpy(), "tmin": g["min"].to_numpy()}))
+    df = pd.concat(frames, ignore_index=True)
+    df.insert(0, "issued_utc", issued)
+    return df[DAILY_COLUMNS]
+
+
 def fetch_ensemble(slug, issued):
     params = {
         "latitude": LAT, "longitude": LON, "models": slug, "hourly": "temperature_2m",
@@ -107,7 +128,8 @@ def fetch_ensemble(slug, issued):
         (k[len("temperature_2m_"):] if k != "temperature_2m" else "control"): v
         for k, v in hourly.items() if k == "temperature_2m" or k.startswith("temperature_2m_member")
     }
-    return to_rows(hourly["time"], members, "ensemble", slug, issued)
+    return (to_rows(hourly["time"], members, "ensemble", slug, issued),
+            daily_extremes(hourly["time"], members, "ensemble", slug, issued))
 
 
 def fetch_deterministic(issued):
@@ -205,13 +227,14 @@ def main():
     issued = pd.Timestamp(now).floor("h")
     log(f"Archiving {STATION} temperature forecasts issued {issued:%Y-%m-%dT%H:%MZ}")
 
-    frames = []
+    frames, daily_frames = [], []
     for slug in ENSEMBLE_SLUGS:
         log(f"ensemble {slug}")
         try:
-            df = fetch_ensemble(slug, issued)
-            log(f"  {df['member'].nunique()} members, {len(df)} rows")
+            df, daily = fetch_ensemble(slug, issued)
+            log(f"  {df['member'].nunique()} members, {len(df)} rows, {daily['local_date'].nunique()} full local days")
             frames.append(df)
+            daily_frames.append(daily)
         except Exception as e:
             log(f"  skipped: {e}")
         time.sleep(1)
@@ -230,6 +253,13 @@ def main():
         out = forecast_dir / f"{issued:%Y-%m-%d}.csv.gz"
         forecasts.to_csv(out, index=False, date_format="%Y-%m-%dT%H:%MZ", compression="gzip")
         log(f"wrote {out} ({len(forecasts)} rows)")
+    if daily_frames:
+        daily_dir = root / "daily" / STATION
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        out = daily_dir / f"{issued:%Y-%m-%d}.csv.gz"
+        daily_all = pd.concat(daily_frames, ignore_index=True)
+        daily_all.to_csv(out, index=False, date_format="%Y-%m-%dT%H:%MZ", compression="gzip")
+        log(f"wrote {out} ({len(daily_all)} rows)")
 
     obs_path = root / "observations" / f"{STATION}.csv"
     obs = pd.DataFrame(columns=["valid_utc", "temp_f"])
