@@ -467,9 +467,21 @@ def get_current_conditions(airport_code):
 # LAYER 1: LIVE DATA INGESTION (CACHED FOR 1 HOUR)
 # ==============================================================================
 
-@st.cache_data(ttl=3600)
 def fetch_deterministic_data(lat, lon, days=7):
-    """Fetches explicit operational deterministic runs for ECMWF IFS, GFS, and NBM."""
+    """Fetches explicit operational deterministic runs for ECMWF IFS, GFS, and
+    NBM. Returns (dict_det, fetch_time, det_run_cycles, error, utc_offset_seconds).
+    Failures are returned here but never cached (see _fetch_deterministic_cached),
+    so the next rerun tries again instead of showing the error for an hour."""
+    try:
+        return _fetch_deterministic_cached(lat, lon, days)
+    except Exception as e:
+        return {var_key: pd.DataFrame() for var_key in WEATHER_VARS}, "", {}, str(e), 0
+
+
+@st.cache_data(ttl=3600)
+def _fetch_deterministic_cached(lat, lon, days):
+    """Cached body of fetch_deterministic_data. Raises on failure:
+    st.cache_data doesn't cache exceptions, only successful results."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -490,49 +502,46 @@ def fetch_deterministic_data(lat, lon, days=7):
         "NBM Operational": all_cycles["NBM Operational"]
     }
 
+    res = requests.get(url, params=params, timeout=10)
+    res.raise_for_status()
+    data = res.json()
+
+    hourly = data["hourly"]
+    utc_offset_seconds = data.get("utc_offset_seconds", 0)
+    dict_det = {}
+    for var_key, cfg in WEATHER_VARS.items():
+        if cfg.get("derived"):
+            continue
+        hourly_param = cfg["hourly_param"]
+        df_var = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+        for model_name, slug in DET_MODEL_SLUGS.items():
+            key = f"{hourly_param}_{slug}"
+            if key in hourly:
+                df_var[model_name] = pd.to_numeric(hourly[key], errors="coerce")
+            # else: this model doesn't return this variable -- leave it
+            # out entirely so it's excluded from charts/legends instead
+            # of showing an empty/all-NaN series.
+        dict_det[var_key] = df_var
+
+    # Snowfall inputs: separate request so a failure only costs snowfall.
+    snow_hourly = None
     try:
-        res = requests.get(url, params=params, timeout=10)
-        res.raise_for_status()
-        data = res.json()
+        res_snow = requests.get(url, params={**params, "hourly": ",".join(SNOW_INPUT_PARAMS)}, timeout=10)
+        res_snow.raise_for_status()
+        snow_hourly = res_snow.json()["hourly"]
+    except Exception:
+        pass
+    snow_times = pd.to_datetime((snow_hourly or hourly)["time"])
+    snow_frames = {k: pd.DataFrame({"time": snow_times}) for k in SNOW_DERIVED_VARS}
+    if snow_hourly:
+        for model_name, slug in DET_MODEL_SLUGS.items():
+            derived = compute_snowfall(lambda param: snow_hourly.get(f"{param}_{slug}"))
+            for var_key, values in derived.items():
+                snow_frames[var_key][model_name] = values
+    dict_det.update(snow_frames)
 
-        hourly = data["hourly"]
-        utc_offset_seconds = data.get("utc_offset_seconds", 0)
-        dict_det = {}
-        for var_key, cfg in WEATHER_VARS.items():
-            if cfg.get("derived"):
-                continue
-            hourly_param = cfg["hourly_param"]
-            df_var = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-            for model_name, slug in DET_MODEL_SLUGS.items():
-                key = f"{hourly_param}_{slug}"
-                if key in hourly:
-                    df_var[model_name] = pd.to_numeric(hourly[key], errors="coerce")
-                # else: this model doesn't return this variable -- leave it
-                # out entirely so it's excluded from charts/legends instead
-                # of showing an empty/all-NaN series.
-            dict_det[var_key] = df_var
-
-        # Snowfall inputs: separate request so a failure only costs snowfall.
-        snow_hourly = None
-        try:
-            res_snow = requests.get(url, params={**params, "hourly": ",".join(SNOW_INPUT_PARAMS)}, timeout=10)
-            res_snow.raise_for_status()
-            snow_hourly = res_snow.json()["hourly"]
-        except Exception:
-            pass
-        snow_times = pd.to_datetime((snow_hourly or hourly)["time"])
-        snow_frames = {k: pd.DataFrame({"time": snow_times}) for k in SNOW_DERIVED_VARS}
-        if snow_hourly:
-            for model_name, slug in DET_MODEL_SLUGS.items():
-                derived = compute_snowfall(lambda param: snow_hourly.get(f"{param}_{slug}"))
-                for var_key, values in derived.items():
-                    snow_frames[var_key][model_name] = values
-        dict_det.update(snow_frames)
-
-        fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return dict_det, fetch_time, det_run_cycles, None, utc_offset_seconds
-    except Exception as e:
-        return {var_key: pd.DataFrame() for var_key in WEATHER_VARS}, "", {}, str(e), 0
+    fetch_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return dict_det, fetch_time, det_run_cycles, None, utc_offset_seconds
 
 @st.cache_data(ttl=3600)
 def fetch_ensemble_data(lat, lon, days=7):
@@ -627,13 +636,23 @@ def fetch_ensemble_data(lat, lon, days=7):
 
     return dict_ens, run_cycles, errors
 
-@st.cache_data(ttl=3600)
 def fetch_previous_runs(lat, lon):
     """Deterministic temperature forecasts from earlier runs via Open-Meteo's
     Previous Runs API. Returns ({model_name: DataFrame(time, n0..n7)}, error),
     where column nN is the forecast made N days before each (station-local)
     hour and n0 is the latest run. Models or leads missing from the response
-    are left out."""
+    are left out. Failures are returned but never cached, so the next rerun
+    tries again."""
+    try:
+        return _fetch_previous_runs_cached(lat, lon), None
+    except Exception as e:
+        return {}, str(e)
+
+
+@st.cache_data(ttl=3600)
+def _fetch_previous_runs_cached(lat, lon):
+    """Cached body of fetch_previous_runs. Retries once on a timeout or
+    connection error, then raises (st.cache_data doesn't cache exceptions)."""
     url = "https://previous-runs-api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -645,22 +664,28 @@ def fetch_previous_runs(lat, lon):
         "past_days": PREVIOUS_RUN_DAYS,
         "forecast_days": 8
     }
-    try:
-        res = requests.get(url, params=params, timeout=15)
-        res.raise_for_status()
-        hourly = res.json()["hourly"]
-        runs = {}
-        for model_name, slug in DET_MODEL_SLUGS.items():
-            df = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-            for n in range(PREVIOUS_RUN_DAYS + 1):
-                key = f"temperature_2m_{slug}" if n == 0 else f"temperature_2m_previous_day{n}_{slug}"
-                if key in hourly:
-                    df[f"n{n}"] = pd.to_numeric(hourly[key], errors="coerce")
-            if "n0" in df.columns:
-                runs[model_name] = df
-        return runs, None
-    except Exception as e:
-        return {}, str(e)
+    for attempt in range(2):
+        try:
+            res = requests.get(url, params=params, timeout=30)
+            break
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 1:
+                raise
+            time.sleep(2)
+    res.raise_for_status()
+    hourly = res.json()["hourly"]
+    runs = {}
+    for model_name, slug in DET_MODEL_SLUGS.items():
+        df = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+        for n in range(PREVIOUS_RUN_DAYS + 1):
+            key = f"temperature_2m_{slug}" if n == 0 else f"temperature_2m_previous_day{n}_{slug}"
+            if key in hourly:
+                df[f"n{n}"] = pd.to_numeric(hourly[key], errors="coerce")
+        if "n0" in df.columns:
+            runs[model_name] = df
+    if not runs:
+        raise ValueError("no deterministic models in the Previous Runs response")
+    return runs
 
 
 @st.cache_data(ttl=3600)
