@@ -1388,138 +1388,68 @@ with tab2:
         # trace x-values stay as ISO date strings for correct grouping/sorting.
         date_labels = {d: pd.to_datetime(d).strftime('%a %m/%d') for d in dates}
 
-        axis_style = AXIS_STYLE
-    
-        # 1. HIGH TEMPERATURE / PRECIPITATION CHART
-        fig_daily_high = go.Figure()
-    
-        for ens_name in ENS_ORDER:
-            if ens_name in daily_ens_highs:
-                df_m = daily_ens_highs[ens_name]
-                color = model_color(ens_name)
-            
-                if ens_name == "Grand Ensemble":
-                    fig_daily_high.add_trace(grand_box_trace(df_m, dates, ens_name, color, showlegend=True))
+        def add_daily_traces(fig, daily_ens, daily_det, row, showlegend):
+            """One row of ensemble boxes + deterministic diamonds. Every trace
+            is in its model's legendgroup, so a legend click or double-click
+            hides/isolates that model in every row."""
+            for ens_name in ENS_ORDER:
+                if ens_name not in daily_ens:
                     continue
-                x_vals = []
-                y_vals = []
+                df_m = daily_ens[ens_name]
+                color = model_color(ens_name)
+                if ens_name == "Grand Ensemble":
+                    fig.add_trace(grand_box_trace(df_m, dates, ens_name, color, showlegend=showlegend), row=row, col=1)
+                    continue
+                x_vals, y_vals = [], []
                 for date_str in dates:
                     if date_str in df_m.index:
                         vals = df_m.loc[date_str].values
                         x_vals.extend([date_str] * len(vals))
                         y_vals.extend(vals)
-                    
-                fig_daily_high.add_trace(go.Box(
-                    x=x_vals,
-                    y=y_vals,
-                    name=ens_name,
-                    marker_color=color,
-                    line=dict(width=2),
-                    whiskerwidth=0.8,
-                    boxpoints='outliers',
-                    legendgroup=ens_name,
-                    hoverinfo="y+name"
-                ))
+                fig.add_trace(go.Box(
+                    x=x_vals, y=y_vals, name=ens_name, marker_color=color, line=dict(width=2),
+                    whiskerwidth=0.8, boxpoints='outliers', legendgroup=ens_name,
+                    showlegend=showlegend, hoverinfo="y+name"
+                ), row=row, col=1)
+            for det_col in daily_det.columns:
+                fig.add_trace(go.Scatter(
+                    x=daily_det.index, y=daily_det[det_col], mode='markers', name=det_col,
+                    legendgroup=det_col, showlegend=showlegend,
+                    marker=dict(color=model_color(det_col), size=11, symbol='diamond', line=dict(width=1.5, color='black')),
+                    hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
+                ), row=row, col=1)
 
-        for det_col in daily_det_highs.columns:
-            color = model_color(det_col)
-            fig_daily_high.add_trace(go.Scatter(
-                x=daily_det_highs.index,
-                y=daily_det_highs[det_col],
-                mode='markers',
-                name=det_col,
-                marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
-            ))
-
+        # Highs and (for two-sided variables like temperature) lows share one
+        # figure, so the legend controls both charts.
         chart_a_title = var_cfg["chart_title"]
-        fig_daily_high.update_layout(
-            title=dict(text=f"{chart_a_title} ({var_cfg['unit']})", font=dict(size=18)),
-            xaxis=dict(
-                title="Calendar Day",
-                type='category',
-                categoryorder='array',
-                categoryarray=dates,
-                tickvals=dates,
-                ticktext=[date_labels[d] for d in dates],
-                **axis_style
-            ),
-            yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
+        has_lows = not daily_det_lows.empty
+        titles = [f"{chart_a_title} ({var_cfg['unit']})"]
+        y_titles = [f"{var_cfg['label']} ({var_cfg['unit']})"]
+        if has_lows:
+            titles.append(f"{chart_a_title.replace('High', 'Low')} ({var_cfg['unit']})")
+            y_titles.append(f"Low {var_cfg['label']} ({var_cfg['unit']})")
+        fig_daily = make_subplots(rows=len(titles), cols=1, subplot_titles=titles, vertical_spacing=0.12)
+        add_daily_traces(fig_daily, daily_ens_highs, daily_det_highs, row=1, showlegend=True)
+        if has_lows:
+            add_daily_traces(fig_daily, daily_ens_lows, daily_det_lows, row=2, showlegend=False)
+
+        for row, y_title in enumerate(y_titles, start=1):
+            fig_daily.update_xaxes(
+                title_text="Calendar Day", type='category', categoryorder='array', categoryarray=dates,
+                tickvals=dates, ticktext=[date_labels[d] for d in dates], row=row, col=1, **AXIS_STYLE
+            )
+            fig_daily.update_yaxes(title_text=y_title, zeroline=False, row=row, col=1, **AXIS_STYLE)
+        fig_daily.update_annotations(font=dict(size=18))  # subplot titles
+        fig_daily.update_layout(
             boxmode='group',
             boxgap=0.3,
             boxgroupgap=0.08,
-            height=520,
+            height=1000 if has_lows else 520,
             hovermode="closest",
-            legend=dict(orientation="h", yanchor="bottom", y=-0.3, xanchor="center", x=0.5)
+            margin=dict(t=110),
+            legend=dict(orientation="h", yanchor="bottom", y=1.04 if has_lows else 1.08, xanchor="center", x=0.5)
         )
-        st.plotly_chart(fig_daily_high, use_container_width=True)
-
-        # 2. LOW CHART (only meaningful for variables with a two-sided daily range, e.g. temperature)
-        if not daily_det_lows.empty:
-            st.divider()
-            fig_daily_low = go.Figure()
-        
-            for ens_name in ENS_ORDER:
-                if ens_name in daily_ens_lows:
-                    df_m_low = daily_ens_lows[ens_name]
-                    color = model_color(ens_name)
-                
-                    if ens_name == "Grand Ensemble":
-                        fig_daily_low.add_trace(grand_box_trace(df_m_low, dates, ens_name, color, showlegend=False))
-                        continue
-                    x_vals_low = []
-                    y_vals_low = []
-                    for date_str in dates:
-                        if date_str in df_m_low.index:
-                            vals = df_m_low.loc[date_str].values
-                            x_vals_low.extend([date_str] * len(vals))
-                            y_vals_low.extend(vals)
-                        
-                    fig_daily_low.add_trace(go.Box(
-                        x=x_vals_low,
-                        y=y_vals_low,
-                        name=ens_name,
-                        marker_color=color,
-                        line=dict(width=2),
-                        whiskerwidth=0.8,
-                        boxpoints='outliers',
-                        legendgroup=ens_name,
-                        showlegend=False,
-                        hoverinfo="y+name"
-                    ))
-                
-            for det_col in daily_det_lows.columns:
-                color = model_color(det_col)
-                fig_daily_low.add_trace(go.Scatter(
-                    x=daily_det_lows.index,
-                    y=daily_det_lows[det_col],
-                    mode='markers',
-                    name=det_col,
-                    showlegend=False,
-                    marker=dict(color=color, size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                    hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
-                ))
-
-            low_title = chart_a_title.replace("High", "Low")
-            fig_daily_low.update_layout(
-                title=dict(text=f"{low_title} ({var_cfg['unit']})", font=dict(size=18)),
-                xaxis=dict(
-                    title="Calendar Day",
-                    type='category',
-                    categoryorder='array',
-                    categoryarray=dates,
-                    tickvals=dates,
-                    ticktext=[date_labels[d] for d in dates],
-                    **axis_style
-                ),
-                yaxis=dict(title=f"Low {var_cfg['label']} ({var_cfg['unit']})", zeroline=False, **axis_style),
-                boxmode='group',
-                boxgap=0.3,
-                boxgroupgap=0.08,
-                height=520,
-                hovermode="closest"
-            )
-            st.plotly_chart(fig_daily_low, use_container_width=True)
+        st.plotly_chart(fig_daily, use_container_width=True)
 
 # --- TAB 3: SUMMARY DATA TABLE & CSV DOWNLOAD ---
 with tab3:
