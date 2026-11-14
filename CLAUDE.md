@@ -61,12 +61,11 @@ a `kind` column (ensemble/deterministic); translate them with `ENS_NAME_MAP` /
   `temperature_unit=fahrenheit` (and the equivalent wind unit param) when
   calling Open-Meteo rather than converting client-side after the fact.
 - **Colors**: model colors follow the Okabe-Ito CVD-safe palette and are
-  centralized in `MODEL_CONFIG`. When adding a new model or chart trace,
-  read its color from `MODEL_CONFIG` rather than hardcoding a new hex value.
-  Note: the Plotly tab code currently has a couple of local `det_colors`
-  dicts that duplicate the deterministic-model hex values instead of reading
-  `MODEL_CONFIG` — when touching that code, prefer consolidating onto
-  `MODEL_CONFIG` rather than adding a third copy.
+  centralized in `MODEL_CONFIG` (NBM mid-gray, Grand Ensemble black). Read
+  them with `model_color(name)` rather than indexing `MODEL_CONFIG` or
+  hardcoding a hex value: it turns black into white in dark mode
+  (`is_dark_theme()`, via `st.context.theme`), so the Grand Ensemble stays
+  visible on a dark chart background.
 - **Audience**: this is for broadcast meteorologists. Aviation terminology
   (METAR, station observations, etc.) is fine in labels/copy where relevant
   — this isn't a plain-language-only tool.

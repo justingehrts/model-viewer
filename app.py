@@ -116,7 +116,7 @@ MODEL_CONFIG = {
     # Deterministic Operational Runs
     "ECMWF Operational": {"color": "#D55E00"},  # Vermilion
     "GFS Operational":   {"color": "#CC79A7"},  # Purple/Magenta
-    "NBM Operational":   {"color": "#000000"},
+    "NBM Operational":   {"color": "#888888"},  # Mid-Gray
     "Deterministic":     {"color": "#D55E00"},
     
     # Ensemble Model Families
@@ -124,8 +124,23 @@ MODEL_CONFIG = {
     "AIFS":           {"color": "#CC79A7"},  # Purple
     "GEFS":           {"color": "#E69F00"},  # Amber
     "WeatherNext":    {"color": "#009E73"},  # Teal
-    "Grand Ensemble": {"color": "#888888"}   # Mid-Gray
+    "Grand Ensemble": {"color": "#000000"}   # Black (white in dark mode, see model_color)
 }
+
+
+def is_dark_theme():
+    """Whether the viewer's Streamlit theme is dark (st.context.theme, newer
+    Streamlit; older versions report light). Read when the script runs, so a
+    mid-session theme switch applies on the next rerun."""
+    theme = getattr(getattr(st, "context", None), "theme", None)
+    return getattr(theme, "type", None) == "dark"
+
+
+def model_color(name):
+    """A model's chart color from MODEL_CONFIG. Black becomes white in dark
+    mode, where a black trace would vanish against the background."""
+    color = MODEL_CONFIG.get(name, MODEL_CONFIG["ECMWF Operational"])["color"]
+    return "#FFFFFF" if color == "#000000" and is_dark_theme() else color
 
 # Shared axis styling: explicit, semi-transparent colors so gridlines/ticks
 # stay visible under both light and dark browser/OS themes, instead of
@@ -1303,14 +1318,8 @@ with tab1:
     fig_hourly = go.Figure()
     
     # Render all available operational deterministic models
-    det_colors = {
-        "ECMWF Operational": "#D55E00", 
-        "GFS Operational": "#CC79A7", 
-        "NBM Operational": "#000000",
-        "Deterministic": "#D55E00"
-    }
     for det_col in [c for c in df_det_active.columns if c != 'time']:
-        color = det_colors.get(det_col, "#D55E00")
+        color = model_color(det_col)
         fig_hourly.add_trace(go.Scatter(
             x=df_det_active['time'],
             y=df_det_active[det_col],
@@ -1323,7 +1332,7 @@ with tab1:
     for ens_name in ENS_ORDER:
         if ens_name in hourly_summaries:
             df_sum = hourly_summaries[ens_name]
-            color = MODEL_CONFIG[ens_name]["color"]
+            color = model_color(ens_name)
             width = 3.5 if ens_name == "Grand Ensemble" else 2
             dash = 'solid' if ens_name == "Grand Ensemble" else 'dash'
             
@@ -1385,7 +1394,7 @@ with tab2:
         for ens_name in ENS_ORDER:
             if ens_name in daily_ens_highs:
                 df_m = daily_ens_highs[ens_name]
-                color = MODEL_CONFIG[ens_name]["color"]
+                color = model_color(ens_name)
             
                 if ens_name == "Grand Ensemble":
                     fig_daily_high.add_trace(grand_box_trace(df_m, dates, ens_name, color, showlegend=True))
@@ -1410,9 +1419,8 @@ with tab2:
                     hoverinfo="y+name"
                 ))
 
-        det_colors = {"ECMWF Operational": "#D55E00", "GFS Operational": "#CC79A7", "NBM Operational": "#000000", "Deterministic": "#D55E00"}
         for det_col in daily_det_highs.columns:
-            color = det_colors.get(det_col, "#D55E00")
+            color = model_color(det_col)
             fig_daily_high.add_trace(go.Scatter(
                 x=daily_det_highs.index,
                 y=daily_det_highs[det_col],
@@ -1452,7 +1460,7 @@ with tab2:
             for ens_name in ENS_ORDER:
                 if ens_name in daily_ens_lows:
                     df_m_low = daily_ens_lows[ens_name]
-                    color = MODEL_CONFIG[ens_name]["color"]
+                    color = model_color(ens_name)
                 
                     if ens_name == "Grand Ensemble":
                         fig_daily_low.add_trace(grand_box_trace(df_m_low, dates, ens_name, color, showlegend=False))
@@ -1479,7 +1487,7 @@ with tab2:
                     ))
                 
             for det_col in daily_det_lows.columns:
-                color = det_colors.get(det_col, "#D55E00")
+                color = model_color(det_col)
                 fig_daily_low.add_trace(go.Scatter(
                     x=daily_det_lows.index,
                     y=daily_det_lows[det_col],
@@ -1752,19 +1760,20 @@ with tab5:
                 xs = [x for x, _ in pts]
                 fig_dprog.add_trace(go.Scatter(
                     x=xs + xs[::-1], y=[e[0.75] for _, e in pts] + [e[0.25] for _, e in pts][::-1],
-                    fill="toself", fillcolor="rgba(136, 136, 136, 0.2)", line=dict(width=0), mode="lines",
+                    fill="toself", line=dict(width=0), mode="lines",
+                    fillcolor="rgba(255, 255, 255, 0.15)" if is_dark_theme() else "rgba(0, 0, 0, 0.15)",
                     name="Grand Ensemble IQR", hoverinfo="skip"
                 ))
                 fig_dprog.add_trace(go.Scatter(
                     x=xs, y=[e[0.5] for _, e in pts], mode="lines+markers", name="Grand Ensemble (Median)",
-                    line=dict(color=MODEL_CONFIG["Grand Ensemble"]["color"], width=3, dash="dash"),
+                    line=dict(color=model_color("Grand Ensemble"), width=3, dash="dash"),
                     hovertemplate="Grand Ensemble<br>Run %{x}: <b>%{y:.0f}°F</b><extra></extra>"
                 ))
         for model_name, df_runs in prev_runs.items():
             fig_dprog.add_trace(go.Scatter(
                 x=x_lbls, y=[run_forecast_value(df_runs, target, r, today, how) for r in dprog_runs],
                 mode="lines+markers", name=model_name,
-                line=dict(color=MODEL_CONFIG[model_name]["color"], width=3), marker=dict(size=9),
+                line=dict(color=model_color(model_name), width=3), marker=dict(size=9),
                 hovertemplate=f"{model_name}<br>Run %{{x}}: <b>%{{y:.0f}}°F</b><extra></extra>"
             ))
         fig_dprog.update_layout(
