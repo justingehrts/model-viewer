@@ -61,7 +61,7 @@ a `kind` column (ensemble/deterministic); translate them with `ENS_NAME_MAP` /
   `temperature_unit=fahrenheit` (and the equivalent wind unit param) when
   calling Open-Meteo rather than converting client-side after the fact.
 - **Colors**: model colors follow the Okabe-Ito CVD-safe palette and are
-  centralized in `MODEL_CONFIG` (NBM mid-gray, Grand Ensemble black). Read
+  centralized in `MODEL_CONFIG`, grouped by modeling center: ECMWF cool (ECMWF blue, EPS sky blue, AIFS bluish green), NOAA warm (GFS vermilion, GEFS orange), WeatherNext reddish purple, NBM mid-gray, Grand Ensemble black. Read
   them with `model_color(name)` rather than indexing `MODEL_CONFIG` or
   hardcoding a hex value: it turns black into white in dark mode
   (`is_dark_theme()`, via `st.context.theme`), so the Grand Ensemble stays

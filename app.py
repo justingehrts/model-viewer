@@ -111,19 +111,21 @@ WEATHER_VARS = {
     }
 }
 
-# Color Vision Deficiency (CVD) Safe Palette (Okabe-Ito Inspired)
+# Color Vision Deficiency (CVD) Safe Palette (Okabe-Ito), grouped by modeling
+# center: ECMWF models are cool (blues, bluish green), NOAA models warm
+# (vermilion, orange), Google's WeatherNext reddish purple.
 MODEL_CONFIG = {
     # Deterministic Operational Runs
-    "ECMWF Operational": {"color": "#D55E00"},  # Vermilion
-    "GFS Operational":   {"color": "#CC79A7"},  # Purple/Magenta
+    "ECMWF Operational": {"color": "#0072B2"},  # Blue
+    "GFS Operational":   {"color": "#D55E00"},  # Vermilion
     "NBM Operational":   {"color": "#888888"},  # Mid-Gray
-    "Deterministic":     {"color": "#D55E00"},
-    
+    "Deterministic":     {"color": "#0072B2"},
+
     # Ensemble Model Families
-    "EPS":            {"color": "#0072B2"},  # Blue
-    "AIFS":           {"color": "#CC79A7"},  # Purple
-    "GEFS":           {"color": "#E69F00"},  # Amber
-    "WeatherNext":    {"color": "#009E73"},  # Teal
+    "EPS":            {"color": "#56B4E9"},  # Sky Blue (ECMWF)
+    "AIFS":           {"color": "#009E73"},  # Bluish Green (ECMWF)
+    "GEFS":           {"color": "#E69F00"},  # Orange (NOAA)
+    "WeatherNext":    {"color": "#CC79A7"},  # Reddish Purple (Google)
     "Grand Ensemble": {"color": "#000000"}   # Black (white in dark mode, see model_color)
 }
 
