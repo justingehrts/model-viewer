@@ -183,6 +183,24 @@ PREVIOUS_RUN_DAYS = 7
 ARCHIVE_RAW_URL = "https://raw.githubusercontent.com/justingehrts/model-viewer/forecast-archive"
 ARCHIVE_STATIONS = {"KCMH"}
 
+# Hazards tab (fog potential). RRFS is NOAA's 3 km CONUS model, HRRR's
+# successor on Open-Meteo (HRRR is discontinued there end of Nov 2026); it's
+# optional, so the tab still works if it's unavailable.
+RRFS_SLUG = "ncep_rrfs_conus"
+HAZARD_HOURS = 72
+FOG_TIERS = {
+    "mist_mi": 3.0,             # visibility < 3 mi: mist (low)
+    "fog_mi": 1.0,              # < 1 mi: fog (high)
+    "dense_mi": 0.25,           # < 1/4 mi: dense fog (NWS Dense Fog Advisory)
+    "pct_bands": (10, 30, 60),  # % of members/models -> low / moderate / high
+    "dense_member_pct": 30,     # GEFS: % of members < dense_mi -> dense likely
+    "spread_f": 2.0,            # Signals: dew-point spread <= 2 F ...
+    "wind_mph": 10.0,           # ... and wind <= 10 mph
+    "radiation_wind_mph": 5.0,  # type: night + wind <= 5 mph -> radiation
+    "advection_wind_mph": 15.0, # type: wind 5-15 mph -> advection
+}
+FOG_LEVELS = ["None", "Low", "Moderate", "High", "Dense likely"]
+
 # Inputs for the derived snowfall variables, fetched in a separate request so a
 # model that rejects them can't break the main fetch. These are the pressure
 # levels the ensemble API actually returns (checked live: nothing in between
@@ -365,6 +383,31 @@ def generate_mock_data(days=7):
     }
 
     return dict_det, dict_ens, det_run_cycles, run_cycles
+
+
+def generate_mock_fog_inputs():
+    """Synthetic fog inputs for Dev Mode, shaped like fetch_fog_inputs(): an
+    overnight fog event roughly 30-40 hours out (dense in the middle)."""
+    rng = np.random.RandomState(11)
+    times = pd.date_range(pd.Timestamp.now().floor('h'), periods=HAZARD_HOURS + 24, freq='h')
+    hours = np.arange(len(times))
+    dip = np.clip(1 - np.abs(hours - 35) / 6, 0, 1)  # 0..1 peak at hour 35
+    base_vis = 10 - 9.9 * dip
+
+    def vis_frame(cols, noise):
+        df = pd.DataFrame({'time': times})
+        for c in cols:
+            df[c] = np.clip(base_vis + rng.normal(0, noise, len(times)) * (1 + 3 * dip), 0.05, 10)
+        return df
+
+    is_day = pd.DataFrame({'time': times, 'is_day': ((times.hour >= 7) & (times.hour < 18)).astype(int)})
+    low_cloud = pd.DataFrame({'time': times, 'GFS Operational': 100 * dip, 'NBM Operational': 100 * dip})
+    return {
+        "deterministic": {"vis": vis_frame(["GFS Operational", "NBM Operational"], 0.1),
+                          "low_cloud": low_cloud, "is_day": is_day},
+        "RRFS": {"vis": vis_frame(["RRFS"], 0.1)},
+        "GEFS": {"vis": vis_frame([f"member{m:02d}" for m in range(1, 31)], 0.6)},
+    }, []
 
 
 def generate_mock_previous_runs():
@@ -732,6 +775,86 @@ def fetch_archive_daily(station, utc_offset_seconds):
     df["family"] = df["model_slug"].map(ENS_NAME_MAP)
     return df.dropna(subset=["family"])
 
+def visibility_to_miles(values, unit):
+    """Open-Meteo visibility (meters by default, feet with imperial units) in miles."""
+    arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    return arr / 5280.0 if unit in ("ft", "feet") else arr / 1609.344
+
+
+def _fog_request(url, params):
+    res = requests.get(url, params=params, timeout=20)
+    res.raise_for_status()
+    data = res.json()
+    return data["hourly"], data.get("hourly_units", {})
+
+
+FOG_DET_MODELS = {"GFS Operational": "gfs_seamless", "NBM Operational": "ncep_nbm_conus", "ECMWF Operational": "ecmwf_ifs025"}
+
+
+@st.cache_data(ttl=3600)
+def _fetch_fog_det_cached(lat, lon):
+    hourly, units = _fog_request("https://api.open-meteo.com/v1/forecast", {
+        "latitude": lat, "longitude": lon, "hourly": "visibility,cloud_cover_low,is_day",
+        "models": ",".join(FOG_DET_MODELS.values()), "timezone": "auto", "forecast_days": 4
+    })
+    times = pd.to_datetime(hourly["time"])
+    vis, low_cloud = pd.DataFrame({"time": times}), pd.DataFrame({"time": times})
+    is_day = None
+    for name, slug in FOG_DET_MODELS.items():
+        key = f"visibility_{slug}"
+        if key in hourly and any(v is not None for v in hourly[key]):
+            vis[name] = visibility_to_miles(hourly[key], units.get(key))
+        key = f"cloud_cover_low_{slug}"
+        if key in hourly and any(v is not None for v in hourly[key]):
+            low_cloud[name] = pd.to_numeric(hourly[key], errors="coerce")
+        key = f"is_day_{slug}"
+        if is_day is None and key in hourly and any(v is not None for v in hourly[key]):
+            is_day = pd.DataFrame({"time": times, "is_day": pd.to_numeric(hourly[key], errors="coerce")})
+    return {"vis": vis, "low_cloud": low_cloud, "is_day": is_day}
+
+
+@st.cache_data(ttl=3600)
+def _fetch_fog_rrfs_cached(lat, lon):
+    hourly, units = _fog_request("https://api.open-meteo.com/v1/forecast", {
+        "latitude": lat, "longitude": lon, "hourly": "visibility", "models": RRFS_SLUG,
+        "timezone": "auto", "forecast_days": 4
+    })
+    if not any(v is not None for v in hourly.get("visibility", [])):
+        raise ValueError("no RRFS visibility for this location")
+    return {"vis": pd.DataFrame({"time": pd.to_datetime(hourly["time"]),
+                                 "RRFS": visibility_to_miles(hourly["visibility"], units.get("visibility"))})}
+
+
+@st.cache_data(ttl=3600)
+def _fetch_fog_gefs_cached(lat, lon):
+    hourly, units = _fog_request("https://ensemble-api.open-meteo.com/v1/ensemble", {
+        "latitude": lat, "longitude": lon, "hourly": "visibility", "models": "gfs_seamless",
+        "timezone": "auto", "forecast_days": 4
+    })
+    vis = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
+    for k, v in hourly.items():
+        if k == "visibility" or k.startswith("visibility_member"):
+            if any(x is not None for x in v):
+                vis[k[len("visibility_"):] if k != "visibility" else "control"] = visibility_to_miles(v, units.get(k))
+    if len(vis.columns) == 1:
+        raise ValueError("no GEFS member visibility for this location")
+    return {"vis": vis}
+
+
+def fetch_fog_inputs(lat, lon):
+    """Visibility (miles), low cloud and day/night for the Hazards tab:
+    {"deterministic": {...}, "RRFS": {...}, "GEFS": {...}}, plus a list of
+    errors for sources that failed. Each source is its own request (RRFS can
+    fail without affecting the others) and failures are never cached."""
+    data, errors = {}, []
+    for name, fetch in (("deterministic", _fetch_fog_det_cached), ("RRFS", _fetch_fog_rrfs_cached),
+                        ("GEFS", _fetch_fog_gefs_cached)):
+        try:
+            data[name] = fetch(lat, lon)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    return data, errors
+
 # ==============================================================================
 # SNOWFALL: 10:1, KUCHERA AND COBB RATIOS
 # ==============================================================================
@@ -1096,6 +1219,169 @@ def run_forecast_value(df_runs, target_day, run_day, today, how):
     return at_hour.mean() if not at_hour.empty else np.nan
 
 
+def vis_level(vis_mi):
+    """Fog level per hour from a visibility series (miles): >= 3 mi none,
+    mist low, fog high, dense fog dense likely. NaN stays NaN."""
+    v = np.asarray(vis_mi, dtype=float)
+    lvl = np.where(v < FOG_TIERS["dense_mi"], 4, np.where(v < FOG_TIERS["fog_mi"], 3,
+                   np.where(v < FOG_TIERS["mist_mi"], 1, 0))).astype(float)
+    return np.where(np.isnan(v), np.nan, lvl)
+
+
+def pct_level(pct):
+    """Fog level from a % of members/models: below the first band none, then
+    low / moderate / high."""
+    p = np.asarray(pct, dtype=float)
+    lo, mid, hi = FOG_TIERS["pct_bands"]
+    lvl = np.where(p >= hi, 3, np.where(p >= mid, 2, np.where(p >= lo, 1, 0))).astype(float)
+    return np.where(np.isnan(p), np.nan, lvl)
+
+
+def combine_fog_levels(rows):
+    """Overall level per hour: rounded mean of the available rows, capped at
+    high unless at least two rows say dense."""
+    stack = np.vstack(rows)
+    valid = ~np.isnan(stack)
+    count = valid.sum(axis=0)
+    mean = np.where(count > 0, np.nansum(np.where(valid, stack, 0), axis=0) / np.maximum(count, 1), np.nan)
+    overall = np.floor(mean + 0.5)
+    dense_votes = (stack == 4).sum(axis=0)
+    overall = np.where(dense_votes >= 2, 4, np.minimum(overall, 3))
+    return np.where(count > 0, overall, np.nan)
+
+
+def fog_type(is_night, wind_mph):
+    """Likely fog type for one hour: radiation (night, light wind), advection
+    (5-15 mph), else unclear."""
+    if np.isnan(wind_mph):
+        return "Unclear"
+    if is_night and wind_mph <= FOG_TIERS["radiation_wind_mph"]:
+        return "Radiation"
+    if FOG_TIERS["radiation_wind_mph"] < wind_mph <= FOG_TIERS["advection_wind_mph"]:
+        return "Advection"
+    return "Unclear"
+
+
+def _on_window(df, col, window):
+    """One column of a (time, ...) frame on an hourly window (NaN where missing)."""
+    if df is None or col not in df.columns:
+        return np.full(len(window), np.nan)
+    s = pd.Series(df[col].to_numpy(dtype=float), index=pd.to_datetime(df['time']).dt.floor('h'))
+    return s[~s.index.duplicated()].reindex(window).to_numpy()
+
+
+def _members(df_var, param):
+    """Ensemble member columns, with the control column (named after the
+    variable) renamed "control" so members line up across variables."""
+    return df_var.rename(columns={param: "control"}).set_index('time')
+
+
+def build_fog_rows(window, fog, dict_det, dict_ens):
+    """Hazards tab rows for an hourly window. Returns (rows, evidence):
+    rows is an ordered {label: level array}; evidence is a dict of per-hour
+    arrays/lists used for hover text and episode labels."""
+    rows, ev = {}, {}
+    det = fog.get("deterministic", {})
+    if det.get("vis") is not None and "NBM Operational" in det["vis"].columns:
+        ev["nbm_vis"] = _on_window(det["vis"], "NBM Operational", window)
+        if not np.isnan(ev["nbm_vis"]).all():
+            rows["NBM vis"] = vis_level(ev["nbm_vis"])
+    if "GEFS" in fog:
+        gv = fog["GEFS"]["vis"]
+        cols = [c for c in gv.columns if c != 'time']
+        mat = np.vstack([_on_window(gv, c, window) for c in cols])
+        n_valid = (~np.isnan(mat)).sum(axis=0)
+        ev["gefs_fog"] = (mat < FOG_TIERS["fog_mi"]).sum(axis=0)
+        ev["gefs_n"] = n_valid
+        with np.errstate(invalid="ignore", divide="ignore"):
+            pct_fog = np.where(n_valid > 0, 100 * ev["gefs_fog"] / n_valid, np.nan)
+            pct_dense = np.where(n_valid > 0, 100 * (mat < FOG_TIERS["dense_mi"]).sum(axis=0) / n_valid, np.nan)
+        lvl = pct_level(pct_fog)
+        rows["GEFS %"] = np.where(pct_dense >= FOG_TIERS["dense_member_pct"], 4, lvl)
+    if "RRFS" in fog:
+        ev["rrfs_vis"] = _on_window(fog["RRFS"]["vis"], "RRFS", window)
+        if not np.isnan(ev["rrfs_vis"]).all():
+            rows["RRFS vis"] = vis_level(ev["rrfs_vis"])
+
+    # Signals: dew-point spread and wind from every model/member that has
+    # both (WeatherNext has no dew point), each source an equal share.
+    t_all, td_all, w_all = dict_det.get("temperature_2m"), dict_det.get("dew_point_2m"), dict_det.get("wind_speed_10m")
+    spreads, winds, fams = [], [], []
+    if t_all is not None and td_all is not None and w_all is not None:
+        for model in [c for c in t_all.columns if c != 'time']:
+            if model in td_all.columns and model in w_all.columns:
+                spreads.append(_on_window(t_all, model, window) - _on_window(td_all, model, window))
+                winds.append(_on_window(w_all, model, window))
+                fams.append(model)
+    for fam in [n for n in ENS_ORDER if n != "Grand Ensemble"]:
+        frames = [dict_ens.get(v, {}).get(fam) for v in ("temperature_2m", "dew_point_2m", "wind_speed_10m")]
+        if any(f is None for f in frames):
+            continue
+        t, td, w = (_members(f, p) for f, p in zip(frames, ("temperature_2m", "dew_point_2m", "wind_speed_10m")))
+        for m in sorted(set(t.columns) & set(td.columns) & set(w.columns)):
+            to_w = lambda df: _on_window(df.reset_index(), m, window)
+            spreads.append(to_w(t) - to_w(td))
+            winds.append(to_w(w))
+            fams.append(fam)
+    if spreads:
+        spread_mat, wind_mat = np.vstack(spreads).T, np.vstack(winds).T  # (hours, sources)
+        with np.errstate(invalid="ignore"):
+            ok = (spread_mat <= FOG_TIERS["spread_f"]) & (wind_mat <= FOG_TIERS["wind_mph"])
+        ok = np.where(np.isnan(spread_mat) | np.isnan(wind_mat), np.nan, ok.astype(float))
+        weights = equal_share_weights(ok, fams)
+        total = weights.sum(axis=1)
+        pct = np.where(total > 0, 100 * np.nansum(np.nan_to_num(ok) * weights, axis=1) / np.where(total > 0, total, 1), np.nan)
+        rows["Signals"] = pct_level(pct)
+        ev["signals_pct"] = pct
+        with warnings_ignored():
+            ev["spread"] = np.nanmedian(spread_mat, axis=1)
+            ev["wind"] = np.nanmedian(wind_mat, axis=1)
+    if det.get("low_cloud") is not None:
+        lc_cols = [c for c in det["low_cloud"].columns if c != 'time']
+        if lc_cols:
+            lc = np.vstack([_on_window(det["low_cloud"], c, window) for c in lc_cols])
+            with warnings_ignored():
+                ev["low_cloud"] = np.nanmedian(lc, axis=0)
+    night = _on_window(det.get("is_day"), "is_day", window) == 0 if det.get("is_day") is not None \
+        else np.array([(t.hour >= 19 or t.hour < 7) for t in window])
+    ev["night"] = night
+
+    if rows:
+        rows["Overall"] = combine_fog_levels(list(rows.values()))
+        wind = ev.get("wind", np.full(len(window), np.nan))
+        ev["type"] = [fog_type(bool(n), w) if lvl >= 1 else "" for n, w, lvl in zip(night, wind, rows["Overall"])]
+    return rows, ev
+
+
+class warnings_ignored:
+    """Context manager: silence RuntimeWarnings from all-NaN reductions."""
+    def __enter__(self):
+        import warnings
+        self._cm = warnings.catch_warnings()
+        self._cm.__enter__()
+        warnings.simplefilter("ignore", RuntimeWarning)
+    def __exit__(self, *exc):
+        return self._cm.__exit__(*exc)
+
+
+def fog_episodes(window, overall, types):
+    """Contiguous hours at Low or above: [(start, end, peak level, dominant type)]."""
+    episodes, start = [], None
+    for i, lvl in enumerate(list(overall) + [np.nan]):
+        if not np.isnan(lvl) and lvl >= 1:
+            start = i if start is None else start
+        elif start is not None:
+            seg = range(start, i)
+            peak = int(np.nanmax([overall[j] for j in seg]))
+            # The episode's type is the one covering most of its hours;
+            # otherwise "Unclear" (e.g. mostly daytime with a short night tail).
+            kinds = [types[j] or "Unclear" for j in seg]
+            kind = max(set(kinds), key=kinds.count)
+            episodes.append((window[start], window[i - 1], peak, kind))
+            start = None
+    return episodes
+
+
 def grand_trend_value(df_daily, target_day, run_day, how):
     """Grand Ensemble daily high ("max") or low ("min") forecast for a target
     day from one archived run: {0.25, 0.5, 0.75} quantiles with equal share
@@ -1185,6 +1471,7 @@ if dev_mode:
     utc_offset_seconds = 0  # Dev Mode's mock times use this machine's clock
     prev_runs, prev_runs_err = generate_mock_previous_runs(), None
     archive_daily = pd.DataFrame()
+    fog_inputs, fog_errors = generate_mock_fog_inputs()
 else:
     with st.spinner("Fetching multi-model ensemble payloads..."):
         dict_det, fetch_time, det_run_cycles, det_err, utc_offset_seconds = fetch_deterministic_data(lat, lon, days=forecast_days)
@@ -1193,6 +1480,7 @@ else:
         archive_station = airport_input if loc_mode == "Airport Code" else None
         archive_daily = (fetch_archive_daily(archive_station, utc_offset_seconds)
                          if archive_station in ARCHIVE_STATIONS else pd.DataFrame())
+        fog_inputs, fog_errors = fetch_fog_inputs(lat, lon)
 
 if not dev_mode and (det_err or dict_det[selected_var_key].empty):
     st.error(f"⚠️ Unable to fetch weather data from Open-Meteo. Details: `{det_err}`")
@@ -1313,7 +1601,7 @@ if selected_var_key in SNOW_DERIVED_VARS:
         if missing:
             st.caption(f"Not in this view (no {needs}): {', '.join(missing)}")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid", "📉 Trends"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid", "📉 Trends", "⚠️ Hazards"])
 
 # --- TAB 1: HOURLY TIME-SERIES ---
 with tab1:
@@ -1721,3 +2009,93 @@ with tab5:
             st.caption("The Grand Ensemble trend covers daily highs and lows only (the archive doesn't keep hourly members).")
         elif not has_ens_trend and not dev_mode and loc_mode == "Airport Code" and airport_input in ARCHIVE_STATIONS:
             st.caption("The Grand Ensemble trend will appear once the daily forecast archive has a run or two of history.")
+
+
+# --- TAB 6: HAZARDS (FOG POTENTIAL) ---
+with tab6:
+    st.subheader(f"Fog Potential — next {HAZARD_HOURS} h")
+    st.caption(
+        f"Visibility tiers: mist < {FOG_TIERS['mist_mi']:g} mi, fog < {FOG_TIERS['fog_mi']:g} mi, "
+        f"dense < {FOG_TIERS['dense_mi']:g} mi (NWS Dense Fog Advisory). "
+        f"GEFS % = share of members with fog; Signals = share of models/members with dew-point spread ≤ "
+        f"{FOG_TIERS['spread_f']:g}°F and wind ≤ {FOG_TIERS['wind_mph']:g} mph (each model family an equal share). "
+        "Overall = average of the rows; dense only when two rows agree."
+    )
+    window = pd.date_range(station_now_local(dev_mode, utc_offset_seconds).floor('h'), periods=HAZARD_HOURS, freq='h')
+    fog_rows, fog_ev = build_fog_rows(window, fog_inputs, dict_det, dict_ens)
+    missing_rows = [r for r in ("NBM vis", "GEFS %", "RRFS vis", "Signals") if r not in fog_rows]
+    if not fog_rows:
+        st.info("No fog inputs are available for this location right now.")
+    else:
+        labels = list(fog_rows)
+        z = np.vstack([fog_rows[r] for r in labels])
+
+        def fmt(v, spec, suffix=""):
+            return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:{spec}}{suffix}"
+
+        hover = []
+        for r in labels:
+            row_text = []
+            for i, t in enumerate(window):
+                lvl = fog_rows[r][i]
+                parts = [f"<b>{r}</b> · {t:%a %b %d %I %p}", f"Level: {'—' if np.isnan(lvl) else FOG_LEVELS[int(lvl)]}"]
+                if "spread" in fog_ev:
+                    parts.append(f"Dew-point spread (median): {fmt(fog_ev['spread'][i], '.1f', '°F')}")
+                    parts.append(f"Wind (median): {fmt(fog_ev['wind'][i], '.0f', ' mph')}")
+                if "low_cloud" in fog_ev:
+                    parts.append(f"Low cloud (median): {fmt(fog_ev['low_cloud'][i], '.0f', '%')}")
+                if "nbm_vis" in fog_ev:
+                    parts.append(f"NBM vis: {fmt(fog_ev['nbm_vis'][i], '.2f', ' mi')}")
+                if "rrfs_vis" in fog_ev:
+                    parts.append(f"RRFS vis: {fmt(fog_ev['rrfs_vis'][i], '.2f', ' mi')}")
+                if "gefs_n" in fog_ev and fog_ev["gefs_n"][i]:
+                    parts.append(f"GEFS: {int(fog_ev['gefs_fog'][i])} of {int(fog_ev['gefs_n'][i])} members < {FOG_TIERS['fog_mi']:g} mi")
+                if fog_ev.get("type") and fog_ev["type"][i]:
+                    parts.append(f"Likely type: {fog_ev['type'][i]}")
+                row_text.append("<br>".join(parts))
+            hover.append(row_text)
+        cell_text = [[(fog_ev["type"][i][:1] if r == "Overall" and fog_ev.get("type") and fog_ev["type"][i] not in ("", "Unclear") else "")
+                      for i in range(len(window))] for r in labels]
+
+        # Discrete 5-step scale: none (faint gray) -> dense (deep red).
+        steps = ["rgba(128, 128, 128, 0.12)", "#FFE08A", "#FDAE61", "#F46D43", "#B2182B"]
+        colorscale = []
+        for k, c in enumerate(steps):
+            colorscale += [(k / len(steps), c), ((k + 1) / len(steps), c)]
+        fig_fog = go.Figure(go.Heatmap(
+            z=z, x=window, y=labels, zmin=-0.5, zmax=4.5, colorscale=colorscale, xgap=1, ygap=3,
+            customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+            text=cell_text, texttemplate="%{text}", textfont=dict(size=11),
+            colorbar=dict(tickvals=list(range(5)), ticktext=FOG_LEVELS, title="Fog")
+        ))
+        for t in window:
+            if t.hour == 0 and t != window[0]:
+                edge = t - pd.Timedelta(minutes=30)
+                fig_fog.add_shape(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
+                                  line=dict(color="rgba(128, 128, 128, 0.9)", width=2))
+        fig_fog.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(size=13))
+        fig_fog.update_xaxes(tickformat="%a %m/%d %I%p", dtick=6 * 3600 * 1000, tickangle=-45, showgrid=False, automargin=True)
+        fig_fog.update_layout(height=140 + 55 * len(labels), margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig_fog, use_container_width=True)
+        st.caption("Overall row letters: R = likely radiation fog (night, light wind), A = likely advection fog (5–15 mph).")
+
+        episodes = fog_episodes(window, fog_rows["Overall"], fog_ev.get("type", [""] * len(window)))
+        if episodes:
+            st.markdown("**Fog potential periods**")
+            for start, end, peak, kind in episodes:
+                span = f"{start:%a %I %p}" if start == end else f"{start:%a %I %p} – {end:%a %I %p}"
+                st.markdown(f"- {span}: peak **{FOG_LEVELS[peak]}**" + (f", likely {kind.lower()}" if kind != "Unclear" else ""))
+        else:
+            st.markdown("No fog potential flagged in the next 72 hours.")
+
+    notes = []
+    if missing_rows:
+        notes.append(f"Not shown (no data for this location/time): {', '.join(missing_rows)}.")
+    if fog_errors:
+        notes.append("Source errors: " + "; ".join(fog_errors))
+    if notes:
+        st.caption(" ".join(notes))
+    st.caption(
+        "These models are 3–25 km grids and fog is notoriously hard to forecast; treat a flag as a prompt to "
+        "check soundings and observations, not a forecast."
+    )
