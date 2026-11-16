@@ -110,5 +110,4 @@ to log things he should see, instead of only mentioning them in chat.
 - **Judgment:** log things Justin would want to find later, not routine progress. One item per
   thing, short titles, details in notes. No secrets, personal data or large pastes in notes.
   Before ending a session with loose ends, log them as `followup` or `todo` and say so in chat.
-- Full reference: `GET https://justin-project-manager.fly.dev/api/v1`.d say so in chat.
 - Full reference: `GET https://justin-project-manager.fly.dev/api/v1`.
