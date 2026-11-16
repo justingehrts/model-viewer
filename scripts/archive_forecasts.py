@@ -41,7 +41,7 @@ STATION_TZ = "America/New_York"
 LAT, LON = 39.998, -82.892
 
 ENSEMBLE_SLUGS = ["ecmwf_ifs025", "ecmwf_aifs025", "gfs_seamless", "google_weathernext2_ensemble"]
-DETERMINISTIC_SLUGS = ["ecmwf_ifs025", "gfs_seamless", "ncep_nbm_conus"]
+DETERMINISTIC_SLUGS = ["ecmwf_ifs025", "gfs_seamless", "ncep_nbm_conus", "ncep_rrfs_conus"]
 
 ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"

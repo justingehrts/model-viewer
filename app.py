@@ -119,6 +119,7 @@ MODEL_CONFIG = {
     "ECMWF Operational": {"color": "#0072B2"},  # Blue
     "GFS Operational":   {"color": "#D55E00"},  # Vermilion
     "NBM Operational":   {"color": "#888888"},  # Mid-Gray
+    "RRFS Operational":  {"color": "#882255"},  # Wine (NOAA, Paul Tol)
     "Deterministic":     {"color": "#0072B2"},
 
     # Ensemble Model Families
@@ -171,7 +172,10 @@ ENS_NAME_MAP = {
 DET_MODEL_SLUGS = {
     "ECMWF Operational": "ecmwf_ifs025",
     "GFS Operational": "gfs_seamless",
-    "NBM Operational": "ncep_nbm_conus"
+    "NBM Operational": "ncep_nbm_conus",
+    # NOAA RRFS 3 km CONUS (HRRR/NAM successor), 84 h, so it covers only
+    # the first ~3.5 days; later hours are simply empty.
+    "RRFS Operational": "ncep_rrfs_conus"
 }
 
 # Trends tab: Open-Meteo's Previous Runs API returns each deterministic
@@ -186,7 +190,7 @@ ARCHIVE_STATIONS = {"KCMH"}
 # Hazards tab (fog potential). RRFS is NOAA's 3 km CONUS model, HRRR's
 # successor on Open-Meteo (HRRR is discontinued there end of Nov 2026); it's
 # optional, so the tab still works if it's unavailable.
-RRFS_SLUG = "ncep_rrfs_conus"
+RRFS_SLUG = DET_MODEL_SLUGS["RRFS Operational"]
 HAZARD_HOURS = 72
 FOG_TIERS = {
     "mist_mi": 3.0,             # visibility < 3 mi: mist (low)
@@ -224,6 +228,9 @@ COBB_SR_VALUES = [10, 10, 11, 14, 20, 29, 40, 50, 45, 36, 25, 15, 9, 7, 6, 6, 6.
 # -12 to -18 °C peak isn't averaged away across 100 mb gaps (700-500 mb).
 COBB_SLICE_HPA = 25
 
+# Daily aggregates need at least this many hourly values in the day.
+MIN_HOURS_FOR_DAILY = 20
+
 # Verification: if the nearest available forecast hour is farther than this
 # from the actual observation time, treat it as "not found" rather than
 # silently comparing mismatched hours.
@@ -251,10 +258,15 @@ def get_actual_run_cycles():
     nbm_cutoff = now_utc - pd.Timedelta(hours=1, minutes=30)
     nbm_str = nbm_cutoff.replace(minute=0, second=0, microsecond=0).strftime("%m/%d %HZ")
 
+    # RRFS: 6-hour cycles (00Z, 06Z, 12Z, 18Z) with ~2.5 hour ingest lag (estimate)
+    rrfs_cutoff = now_utc - pd.Timedelta(hours=2, minutes=30)
+    rrfs_str = rrfs_cutoff.replace(hour=(rrfs_cutoff.hour // 6) * 6, minute=0, second=0, microsecond=0).strftime("%m/%d %HZ")
+
     return {
         "ECMWF Operational": ecmwf_str,
         "GFS Operational": gfs_str,
         "NBM Operational": nbm_str,
+        "RRFS Operational": rrfs_str,
         "EPS": ecmwf_str,
         "AIFS": ecmwf_str,
         "GEFS": gfs_str,
@@ -335,6 +347,12 @@ def generate_mock_data(days=7):
         'GFS Operational': snow_swe * 17 * 0.9
     })
 
+    # RRFS only runs 84 h; mirror that so Dev Mode shows its lines stopping.
+    rrfs_reach = np.arange(len(dates)) < 84
+    for var_key, df in dict_det.items():
+        if var_key != "precipitation" and "ECMWF Operational" in df.columns:
+            df["RRFS Operational"] = np.where(rrfs_reach, df["ECMWF Operational"] - 0.5, np.nan)
+
     dict_ens = {var_key: {} for var_key in WEATHER_VARS}
     run_cycles = {}
 
@@ -379,7 +397,8 @@ def generate_mock_data(days=7):
 
     det_run_cycles = {
         "ECMWF Operational": "DEV-MOCK 00Z",
-        "GFS Operational": "DEV-MOCK 00Z"
+        "GFS Operational": "DEV-MOCK 00Z",
+        "RRFS Operational": "DEV-MOCK 00Z"
     }
 
     return dict_det, dict_ens, det_run_cycles, run_cycles
@@ -559,7 +578,8 @@ def _fetch_deterministic_cached(lat, lon, days):
     det_run_cycles = {
         "ECMWF Operational": all_cycles["ECMWF Operational"],
         "GFS Operational": all_cycles["GFS Operational"],
-        "NBM Operational": all_cycles["NBM Operational"]
+        "NBM Operational": all_cycles["NBM Operational"],
+        "RRFS Operational": all_cycles["RRFS Operational"]
     }
 
     res = requests.get(url, params=params, timeout=10)
@@ -1101,9 +1121,13 @@ def process_ensemble_data(dict_ens, df_det, selected_var_key="temperature_2m"):
                         daily_ens_lows[name] = grouped.min()
 
             det_grouped = df_det_daily.groupby('date')[det_cols]
-            daily_det_highs = getattr(det_grouped, daily_agg)()
+            # A model that stops mid-day (RRFS at 84 h, or anyone's last
+            # partial day) would give a bogus daily high/low/total, so
+            # require most of the day's hours.
+            enough_hours = det_grouped.count() >= MIN_HOURS_FOR_DAILY
+            daily_det_highs = getattr(det_grouped, daily_agg)().where(enough_hours)
             if compute_lows:
-                daily_det_lows = det_grouped.min()
+                daily_det_lows = det_grouped.min().where(enough_hours)
     # else: this variable has no daily_agg configured (e.g. dew point) --
     # it only gets the hourly line chart, so daily aggregates stay empty.
 
@@ -1408,9 +1432,11 @@ def format_value_with_unit(val, unit, signed=False):
 # ==============================================================================
 
 st.title("🌤️ Multi-Model Ensemble Weather Consensus Dashboard")
-st.markdown("Comparing deterministic operational runs against **197 probabilistic ensemble members** across European (ECMWF/EPS/AIFS), American (GFS/GEFS), and AI (Google WeatherNext 2) forecasting systems.")
+st.markdown("Comparing deterministic operational runs against **197 probabilistic ensemble members** across European (ECMWF/EPS/AIFS), American (GFS/GEFS/NBM/RRFS), and AI (Google WeatherNext 2) forecasting systems.")
 
 with st.sidebar:
+    # Outside the form so switching views is instant.
+    view = st.radio("View", ["Forecast", "Hazards"], horizontal=True, key="view")
     st.header("⚙️ Location & Forecast Controls")
     
     with st.form("forecast_controls_form"):
@@ -1436,11 +1462,17 @@ with st.sidebar:
             
         forecast_days = st.slider("Forecast Horizon (Days)", min_value=3, max_value=14, value=7)
         
-        selected_var_key = st.selectbox(
-            "Forecast Parameter",
-            options=list(WEATHER_VARS.keys()),
-            format_func=lambda x: WEATHER_VARS[x]["label"]
-        )
+        if view == "Forecast":
+            selected_var_key = st.selectbox(
+                "Forecast Parameter",
+                options=list(WEATHER_VARS.keys()),
+                format_func=lambda x: WEATHER_VARS[x]["label"],
+                key="selected_var_key"
+            )
+        else:
+            # Hazards view: no parameter choice; temperature keeps the shared
+            # fetch/processing path happy (fog uses temp, dew point and wind).
+            selected_var_key = "temperature_2m"
         
         submitted = st.form_submit_button("🚀 Load / Update Forecast", use_container_width=True)
 
@@ -1451,14 +1483,16 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    st.divider()
-    tick_interval_label = st.radio(
-        "Hourly Chart Tick Interval",
-        ["6 Hours", "12 Hours"],
-        index=1,
-        horizontal=True
-    )
-    tick_interval_hours = 6 if tick_interval_label == "6 Hours" else 12
+    tick_interval_hours = 12
+    if view == "Forecast":
+        st.divider()
+        tick_interval_label = st.radio(
+            "Hourly Chart Tick Interval",
+            ["6 Hours", "12 Hours"],
+            index=1,
+            horizontal=True
+        )
+        tick_interval_hours = 6 if tick_interval_label == "6 Hours" else 12
 
 # ==============================================================================
 # ROUTING: DEV MODE VS LIVE FETCH
@@ -1514,588 +1548,601 @@ hourly_summaries, daily_ens_highs, daily_ens_lows, daily_det_highs, daily_det_lo
 )
 
 # ==============================================================================
-# MODEL VERIFICATION: RIGHT NOW VS. LATEST METAR
+# FORECAST VIEW: VERIFICATION PANEL + FORECAST TABS
 # ==============================================================================
 
-if dev_mode:
-    with st.expander("✅ Model Verification vs. METAR", expanded=False):
-        st.info("Model verification is unavailable in Dev Mode, which makes zero live API calls.")
-elif loc_mode != "Airport Code":
-    with st.expander("✅ Model Verification vs. METAR", expanded=False):
-        st.info("Model verification requires Airport Code location mode (a station is needed for a live observation).")
-elif var_cfg.get("verify", True) is False:
-    with st.expander(f"✅ Model Verification vs. METAR — {station_name}", expanded=False):
-        st.info(f"Verification isn't available for {var_cfg['label']}.")
-else:
-    with st.expander(f"✅ Model Verification vs. METAR — {var_cfg['label']} at {station_name}", expanded=False):
-        obs, obs_err = get_current_conditions(airport_input)
-        if obs is None:
-            st.info(f"No current METAR available for {airport_input} right now. ({obs_err})")
-        else:
-            obs_dt_utc = datetime.fromtimestamp(obs["obs_time"], tz=timezone.utc)
-            obs_dt_local = (obs_dt_utc + pd.Timedelta(seconds=utc_offset_seconds)).replace(tzinfo=None)
-            temp_c, dewp_c, wspd_kt, wgst_kt = obs["temp_c"], obs["dewp_c"], obs["wspd_kt"], obs["wgst_kt"]
+if view == "Forecast":
+    # ==============================================================================
+    # MODEL VERIFICATION: RIGHT NOW VS. LATEST METAR
+    # ==============================================================================
 
-            actual_val = None
-            if selected_var_key == "temperature_2m" and temp_c is not None:
-                actual_val = temp_c * 9 / 5 + 32
-            elif selected_var_key == "apparent_temperature" and None not in (temp_c, dewp_c, wspd_kt):
-                actual_val = calculate_apparent_temperature(temp_c, dewp_c, wspd_kt * 0.514444) * 9 / 5 + 32
-            elif selected_var_key == "dew_point_2m" and dewp_c is not None:
-                actual_val = dewp_c * 9 / 5 + 32
-            elif selected_var_key == "wind_speed_10m" and wspd_kt is not None:
-                actual_val = wspd_kt * 1.15078
-            elif selected_var_key == "wind_gusts_10m" and wgst_kt is not None:
-                actual_val = wgst_kt * 1.15078
-
-            if actual_val is None:
-                st.info(f"Current METAR for {airport_input} doesn't report {var_cfg['label']} right now.")
+    if dev_mode:
+        with st.expander("✅ Model Verification vs. METAR", expanded=False):
+            st.info("Model verification is unavailable in Dev Mode, which makes zero live API calls.")
+    elif loc_mode != "Airport Code":
+        with st.expander("✅ Model Verification vs. METAR", expanded=False):
+            st.info("Model verification requires Airport Code location mode (a station is needed for a live observation).")
+    elif var_cfg.get("verify", True) is False:
+        with st.expander(f"✅ Model Verification vs. METAR — {station_name}", expanded=False):
+            st.info(f"Verification isn't available for {var_cfg['label']}.")
+    else:
+        with st.expander(f"✅ Model Verification vs. METAR — {var_cfg['label']} at {station_name}", expanded=False):
+            obs, obs_err = get_current_conditions(airport_input)
+            if obs is None:
+                st.info(f"No current METAR available for {airport_input} right now. ({obs_err})")
             else:
-                cols = st.columns(5)
-                cols[0].metric("METAR Actual", format_value_with_unit(actual_val, var_cfg["unit"]))
+                obs_dt_utc = datetime.fromtimestamp(obs["obs_time"], tz=timezone.utc)
+                obs_dt_local = (obs_dt_utc + pd.Timedelta(seconds=utc_offset_seconds)).replace(tzinfo=None)
+                temp_c, dewp_c, wspd_kt, wgst_kt = obs["temp_c"], obs["dewp_c"], obs["wspd_kt"], obs["wgst_kt"]
 
-                for i, model_name in enumerate(DET_MODEL_SLUGS, start=1):
-                    val, _ = get_value_at_time(dict_det.get(selected_var_key, pd.DataFrame()), model_name, obs_dt_local)
-                    if val is None:
-                        cols[i].metric(model_name, "N/A")
+                actual_val = None
+                if selected_var_key == "temperature_2m" and temp_c is not None:
+                    actual_val = temp_c * 9 / 5 + 32
+                elif selected_var_key == "apparent_temperature" and None not in (temp_c, dewp_c, wspd_kt):
+                    actual_val = calculate_apparent_temperature(temp_c, dewp_c, wspd_kt * 0.514444) * 9 / 5 + 32
+                elif selected_var_key == "dew_point_2m" and dewp_c is not None:
+                    actual_val = dewp_c * 9 / 5 + 32
+                elif selected_var_key == "wind_speed_10m" and wspd_kt is not None:
+                    actual_val = wspd_kt * 1.15078
+                elif selected_var_key == "wind_gusts_10m" and wgst_kt is not None:
+                    actual_val = wgst_kt * 1.15078
+
+                if actual_val is None:
+                    st.info(f"Current METAR for {airport_input} doesn't report {var_cfg['label']} right now.")
+                else:
+                    cols = st.columns(len(DET_MODEL_SLUGS) + 2)
+                    cols[0].metric("METAR Actual", format_value_with_unit(actual_val, var_cfg["unit"]))
+
+                    for i, model_name in enumerate(DET_MODEL_SLUGS, start=1):
+                        val, _ = get_value_at_time(dict_det.get(selected_var_key, pd.DataFrame()), model_name, obs_dt_local)
+                        if val is None:
+                            cols[i].metric(model_name, "N/A")
+                        else:
+                            cols[i].metric(
+                                model_name,
+                                format_value_with_unit(val, var_cfg["unit"]),
+                                format_value_with_unit(val - actual_val, var_cfg["unit"], signed=True),
+                                delta_color="off"
+                            )
+
+                    ens_median, _ = get_grand_ensemble_median_at_time(dict_ens.get(selected_var_key, {}), obs_dt_local)
+                    if ens_median is None:
+                        cols[-1].metric("Grand Ensemble", "N/A")
                     else:
-                        cols[i].metric(
-                            model_name,
-                            format_value_with_unit(val, var_cfg["unit"]),
-                            format_value_with_unit(val - actual_val, var_cfg["unit"], signed=True),
+                        cols[-1].metric(
+                            "Grand Ensemble",
+                            format_value_with_unit(ens_median, var_cfg["unit"]),
+                            format_value_with_unit(ens_median - actual_val, var_cfg["unit"], signed=True),
                             delta_color="off"
                         )
 
-                ens_median, _ = get_grand_ensemble_median_at_time(dict_ens.get(selected_var_key, {}), obs_dt_local)
-                if ens_median is None:
-                    cols[4].metric("Grand Ensemble", "N/A")
-                else:
-                    cols[4].metric(
-                        "Grand Ensemble",
-                        format_value_with_unit(ens_median, var_cfg["unit"]),
-                        format_value_with_unit(ens_median - actual_val, var_cfg["unit"], signed=True),
-                        delta_color="off"
-                    )
+                    st.caption(f"METAR observed at {obs_dt_local.strftime('%a %I:%M %p')} local")
 
-                st.caption(f"METAR observed at {obs_dt_local.strftime('%a %I:%M %p')} local")
+    # ==============================================================================
+    # LAYER 4: PLOTLY VISUALIZATIONS
+    # ==============================================================================
 
-# ==============================================================================
-# LAYER 4: PLOTLY VISUALIZATIONS
-# ==============================================================================
-
-st.caption(
-    "Grand Ensemble gives each ensemble family (EPS, AIFS, GEFS, WeatherNext) an equal share, "
-    "regardless of how many members it has."
-)
-if selected_var_key in SNOW_DERIVED_VARS:
     st.caption(
-        "Snowfall uses each model's own snow liquid equivalent (Open-Meteo's 7:1 snowfall ÷ 7). "
-        "10:1 multiplies it by 10; Kuchera uses a ratio from the warmest temperature between the surface and 500 mb; "
-        "Cobb weights a temperature-based ratio by upward motion in saturated layers, on 25 mb slices interpolated from "
-        "Open-Meteo's pressure levels, falling back to Kuchera in hours with no saturated rising layer."
+        "Grand Ensemble gives each ensemble family (EPS, AIFS, GEFS, WeatherNext) an equal share, "
+        "regardless of how many members it has."
     )
-    if selected_var_key != "snowfall_10to1":
-        needs = "upper-air temperatures" if selected_var_key == "snowfall_kuchera" else "full upper-air profiles"
-        missing = [c for c in dict_det["snowfall_10to1"].columns if c != 'time' and c not in df_det_active.columns]
-        missing += [n for n in dict_ens["snowfall_10to1"] if n not in dict_ens[selected_var_key]]
-        if missing:
-            st.caption(f"Not in this view (no {needs}): {', '.join(missing)}")
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid", "📉 Trends", "⚠️ Hazards"])
-
-# --- TAB 1: HOURLY TIME-SERIES ---
-with tab1:
-    fig_hourly = go.Figure()
-    
-    # Render all available operational deterministic models
-    for det_col in [c for c in df_det_active.columns if c != 'time']:
-        color = model_color(det_col)
-        fig_hourly.add_trace(go.Scatter(
-            x=df_det_active['time'],
-            y=df_det_active[det_col],
-            mode='lines',
-            name=det_col,
-            line=dict(color=color, width=3),
-            hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{det_col}</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
-        ))
-            
-    for ens_name in ENS_ORDER:
-        if ens_name in hourly_summaries:
-            df_sum = hourly_summaries[ens_name]
-            color = model_color(ens_name)
-            width = 3.5 if ens_name == "Grand Ensemble" else 2
-            dash = 'solid' if ens_name == "Grand Ensemble" else 'dash'
-            
-            fig_hourly.add_trace(go.Scatter(
-                x=df_sum['time'],
-                y=df_sum['median'],
-                mode='lines',
-                name=f"{ens_name} (Median)",
-                line=dict(color=color, width=width, dash=dash),
-                hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{ens_name} (Median)</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
-            ))
-
-    fig_hourly.update_layout(
-        title=dict(text=f"Hourly {var_cfg['label']} Trajectory ({var_cfg['unit']})", font=dict(size=18)),
-        xaxis=dict(
-            title="Date / Time (Local)",
-            tickformat="%a %m/%d %I%p",
-            tickangle=-45,
-            automargin=True,
-            dtick=tick_interval_hours * 60 * 60 * 1000,
-            **AXIS_STYLE
-        ),
-        yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", **AXIS_STYLE),
-        hovermode="x unified",
-        height=650,
-        margin=dict(b=160),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.55, xanchor="center", x=0.5)
-    )
-    st.plotly_chart(fig_hourly, use_container_width=True)
-
-
-# --- TAB 2: DAILY DISTRIBUTION SPREAD ---
-def grand_box_trace(df_daily, dates, name, color, showlegend):
-    """Grand Ensemble box from equal-share weighted stats (Plotly can't weight
-    raw points, so the quartiles/whiskers are precomputed; no outlier dots)."""
-    df_days = df_daily.loc[[d for d in dates if d in df_daily.index]]
-    stats = grand_box_stats(df_days)
-    return go.Box(
-        x=list(df_days.index), name=name, marker_color=color, line=dict(width=2),
-        whiskerwidth=0.8, legendgroup=name, showlegend=showlegend, hoverinfo="y+name",
-        **stats
-    )
-
-
-with tab2:
-    if var_cfg.get("daily_agg") is None:
-        st.info(f"Daily distribution isn't tracked for {var_cfg['label']}.")
-    else:
-        dates = list(daily_det_highs.index)
-        # Display labels add the day of week (e.g. "Tue 08/25"); the underlying
-        # trace x-values stay as ISO date strings for correct grouping/sorting.
-        date_labels = {d: pd.to_datetime(d).strftime('%a %m/%d') for d in dates}
-
-        def add_daily_traces(fig, daily_ens, daily_det, row, showlegend):
-            """One row of ensemble boxes + deterministic diamonds. Every trace
-            is in its model's legendgroup, so a legend click or double-click
-            hides/isolates that model in every row."""
-            for ens_name in ENS_ORDER:
-                if ens_name not in daily_ens:
-                    continue
-                df_m = daily_ens[ens_name]
-                color = model_color(ens_name)
-                if ens_name == "Grand Ensemble":
-                    fig.add_trace(grand_box_trace(df_m, dates, ens_name, color, showlegend=showlegend), row=row, col=1)
-                    continue
-                x_vals, y_vals = [], []
-                for date_str in dates:
-                    if date_str in df_m.index:
-                        vals = df_m.loc[date_str].values
-                        x_vals.extend([date_str] * len(vals))
-                        y_vals.extend(vals)
-                fig.add_trace(go.Box(
-                    x=x_vals, y=y_vals, name=ens_name, marker_color=color, line=dict(width=2),
-                    whiskerwidth=0.8, boxpoints='outliers', legendgroup=ens_name,
-                    showlegend=showlegend, hoverinfo="y+name"
-                ), row=row, col=1)
-            for det_col in daily_det.columns:
-                fig.add_trace(go.Scatter(
-                    x=daily_det.index, y=daily_det[det_col], mode='markers', name=det_col,
-                    legendgroup=det_col, showlegend=showlegend,
-                    marker=dict(color=model_color(det_col), size=11, symbol='diamond', line=dict(width=1.5, color='black')),
-                    hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
-                ), row=row, col=1)
-
-        # Highs and (for two-sided variables like temperature) lows share one
-        # figure, so the legend controls both charts.
-        chart_a_title = var_cfg["chart_title"]
-        has_lows = not daily_det_lows.empty
-        titles = [f"{chart_a_title} ({var_cfg['unit']})"]
-        y_titles = [f"{var_cfg['label']} ({var_cfg['unit']})"]
-        if has_lows:
-            titles.append(f"{chart_a_title.replace('High', 'Low')} ({var_cfg['unit']})")
-            y_titles.append(f"Low {var_cfg['label']} ({var_cfg['unit']})")
-        fig_daily = make_subplots(rows=len(titles), cols=1, subplot_titles=titles, vertical_spacing=0.12)
-        add_daily_traces(fig_daily, daily_ens_highs, daily_det_highs, row=1, showlegend=True)
-        if has_lows:
-            add_daily_traces(fig_daily, daily_ens_lows, daily_det_lows, row=2, showlegend=False)
-
-        for row, y_title in enumerate(y_titles, start=1):
-            fig_daily.update_xaxes(
-                title_text="Calendar Day", type='category', categoryorder='array', categoryarray=dates,
-                tickvals=dates, ticktext=[date_labels[d] for d in dates], row=row, col=1, **AXIS_STYLE
-            )
-            fig_daily.update_yaxes(title_text=y_title, zeroline=False, row=row, col=1, **AXIS_STYLE)
-        fig_daily.update_annotations(font=dict(size=18))  # subplot titles
-        fig_daily.update_layout(
-            boxmode='group',
-            boxgap=0.3,
-            boxgroupgap=0.08,
-            height=1000 if has_lows else 520,
-            hovermode="closest",
-            margin=dict(t=110),
-            legend=dict(orientation="h", yanchor="bottom", y=1.04 if has_lows else 1.08, xanchor="center", x=0.5)
-        )
-        st.plotly_chart(fig_daily, use_container_width=True)
-
-# --- TAB 3: SUMMARY DATA TABLE & CSV DOWNLOAD ---
-with tab3:
-    if var_cfg.get("daily_agg") is None:
-        st.info(f"A daily summary table isn't available for {var_cfg['label']}.")
-    else:
-        summary_rows = []
-        dates = list(daily_det_highs.index)
-    
-        for d in dates:
-            date_obj = pd.to_datetime(d)
-            row = {"Date": date_obj.strftime("%a %b %d, %Y")}
-        
-            # Populate deterministic run data dynamically
-            for det_col in daily_det_highs.columns:
-                if selected_var_key in ("temperature_2m", "apparent_temperature") and det_col in daily_det_lows.columns and d in daily_det_lows.index:
-                    low_val = daily_det_lows.loc[d, det_col]
-                    high_val = daily_det_highs.loc[d, det_col]
-                    row[f"{det_col} (L/H)"] = f"{low_val:.1f}° / {high_val:.1f}°F"
-                else:
-                    row[det_col] = round(daily_det_highs.loc[d, det_col], 2)
-                
-            for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
-                if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
-                    high_vals = daily_ens_highs[ens_name].loc[d].values
-                    if selected_var_key in ("temperature_2m", "apparent_temperature") and ens_name in daily_ens_lows and d in daily_ens_lows[ens_name].index:
-                        low_vals = daily_ens_lows[ens_name].loc[d].values
-                        row[f"{ens_name} Med (L/H)"] = f"{np.median(low_vals):.1f}° / {np.median(high_vals):.1f}°F"
-                    else:
-                        row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
-                
-            if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
-                # Equal share per model family (see equal_share_weights).
-                g_hi = {k: float(v[0]) for k, v in grand_stats(daily_ens_highs["Grand Ensemble"].loc[[d]]).items()}
-                if selected_var_key in ("temperature_2m", "apparent_temperature") and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
-                    g_lo_med = float(grand_stats(daily_ens_lows["Grand Ensemble"].loc[[d]])[0.5][0])
-                    row["Grand Ens Med (L/H)"] = f"{g_lo_med:.1f}° / {g_hi[0.5]:.1f}°F"
-                    row["High IQR Spread"] = f"{g_hi[0.25]:.1f}° to {g_hi[0.75]:.1f}°F"
-                else:
-                    row["Grand Ens Median"] = round(g_hi[0.5], 2)
-                    row["Consensus IQR"] = f"{g_hi[0.25]:.2f} to {g_hi[0.75]:.2f} {var_cfg['unit']}"
-            
-            summary_rows.append(row)
-        
-        df_summary_table = pd.DataFrame(summary_rows)
-    
-        st.subheader(f"Daily Consensus Summary Table ({var_cfg['unit']})")
-        st.dataframe(df_summary_table, use_container_width=True, hide_index=True)
-    
-        csv = df_summary_table.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Download Daily Summary CSV",
-            data=csv,
-            file_name=f"weather_consensus_{selected_var_key}_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv"
-        )
-
-
-# --- TAB 4: HOURLY GRID ---
-with tab4:
-    GRID_HOURS = 48
-    grid_cfg = var_cfg.get("grid")
-    unit = var_cfg["unit"]
-
-    if grid_cfg is None:
-        st.info(f"An hourly grid isn't available for {var_cfg['label']}.")
-    else:
-        st.subheader(f"Hourly {var_cfg['label']} Grid ({unit})")
+    if selected_var_key in SNOW_DERIVED_VARS:
         st.caption(
-            f"Next {GRID_HOURS} hours, station-local time. Ensemble families show the median. "
-            "One color scale is shared across all models."
-            + (" Values are a running total from the current hour." if grid_cfg.get("cumulative") else "")
+            "Snowfall uses each model's own snow liquid equivalent (Open-Meteo's 7:1 snowfall ÷ 7). "
+            "10:1 multiplies it by 10; Kuchera uses a ratio from the warmest temperature between the surface and 500 mb; "
+            "Cobb weights a temperature-based ratio by upward motion in saturated layers, on 25 mb slices interpolated from "
+            "Open-Meteo's pressure levels, falling back to Kuchera in hours with no saturated rising layer."
+        )
+        if selected_var_key != "snowfall_10to1":
+            needs = "upper-air temperatures" if selected_var_key == "snowfall_kuchera" else "full upper-air profiles"
+            missing = [c for c in dict_det["snowfall_10to1"].columns if c != 'time' and c not in df_det_active.columns]
+            missing += [n for n in dict_ens["snowfall_10to1"] if n not in dict_ens[selected_var_key]]
+            if missing:
+                st.caption(f"Not in this view (no {needs}): {', '.join(missing)}")
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📈 Hourly Time-Series", "📊 Daily Distribution Spread", "📋 Consensus Summary Table", "🔲 Hourly Grid", "📉 Trends"])
+
+    # --- TAB 1: HOURLY TIME-SERIES ---
+    with tab1:
+        fig_hourly = go.Figure()
+    
+        # Render all available operational deterministic models
+        for det_col in [c for c in df_det_active.columns if c != 'time']:
+            color = model_color(det_col)
+            fig_hourly.add_trace(go.Scatter(
+                x=df_det_active['time'],
+                y=df_det_active[det_col],
+                mode='lines',
+                name=det_col,
+                line=dict(color=color, width=3),
+                hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{det_col}</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+            ))
+            
+        for ens_name in ENS_ORDER:
+            if ens_name in hourly_summaries:
+                df_sum = hourly_summaries[ens_name]
+                color = model_color(ens_name)
+                width = 3.5 if ens_name == "Grand Ensemble" else 2
+                dash = 'solid' if ens_name == "Grand Ensemble" else 'dash'
+            
+                fig_hourly.add_trace(go.Scatter(
+                    x=df_sum['time'],
+                    y=df_sum['median'],
+                    mode='lines',
+                    name=f"{ens_name} (Median)",
+                    line=dict(color=color, width=width, dash=dash),
+                    hovertemplate=f"%{{x|%a %b %d, %I:%M %p}}<br><b>{ens_name} (Median)</b>: %{{y:.2f}} {var_cfg['unit']}<extra></extra>"
+                ))
+
+        fig_hourly.update_layout(
+            title=dict(text=f"Hourly {var_cfg['label']} Trajectory ({var_cfg['unit']})", font=dict(size=18)),
+            xaxis=dict(
+                title="Date / Time (Local)",
+                tickformat="%a %m/%d %I%p",
+                tickangle=-45,
+                automargin=True,
+                dtick=tick_interval_hours * 60 * 60 * 1000,
+                **AXIS_STYLE
+            ),
+            yaxis=dict(title=f"{var_cfg['label']} ({var_cfg['unit']})", **AXIS_STYLE),
+            hovermode="x unified",
+            height=650,
+            margin=dict(b=160),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.55, xanchor="center", x=0.5)
+        )
+        st.plotly_chart(fig_hourly, use_container_width=True)
+
+
+    # --- TAB 2: DAILY DISTRIBUTION SPREAD ---
+    def grand_box_trace(df_daily, dates, name, color, showlegend):
+        """Grand Ensemble box from equal-share weighted stats (Plotly can't weight
+        raw points, so the quartiles/whiskers are precomputed; no outlier dots)."""
+        df_days = df_daily.loc[[d for d in dates if d in df_daily.index]]
+        stats = grand_box_stats(df_days)
+        return go.Box(
+            x=list(df_days.index), name=name, marker_color=color, line=dict(width=2),
+            whiskerwidth=0.8, legendgroup=name, showlegend=showlegend, hoverinfo="y+name",
+            **stats
         )
 
-        grid_start = station_now_local(dev_mode, utc_offset_seconds).floor('h')
 
-        df_grid = build_hourly_grid(df_det_active, hourly_summaries, grid_start, hours=GRID_HOURS)
-        if grid_cfg.get("cumulative") and not df_grid.empty:
-            df_grid = df_grid.cumsum(axis=1)
-        decimals = grid_cfg.get("decimals", 0)
-        cell_font = dict(size=10 if decimals else 11)
-
-        def format_cell(v):
-            """Short labels that fit the narrow hourly cells: whole numbers
-            from 10 up, "0" for zero, and no leading zero below 1 (".25")."""
-            if np.isnan(v):
-                return ""
-            if decimals == 0 or abs(v) >= 10:
-                return f"{v:.0f}"
-            text = f"{v:.{decimals}f}"
-            if float(text) == 0:
-                return "0"
-            return text.replace("0.", ".", 1) if abs(v) < 1 else text
-
-        def format_cells(values):
-            return [[format_cell(v) for v in row] for row in np.asarray(values, dtype=float)]
-
-        if df_grid.empty:
-            st.info(f"No {var_cfg['label'].lower()} data is available for the next {GRID_HOURS} hours.")
+    with tab2:
+        if var_cfg.get("daily_agg") is None:
+            st.info(f"Daily distribution isn't tracked for {var_cfg['label']}.")
         else:
-            times = list(df_grid.columns)
-            models = list(df_grid.index)
-            z = df_grid.values.astype(float)
+            dates = list(daily_det_highs.index)
+            # Display labels add the day of week (e.g. "Tue 08/25"); the underlying
+            # trace x-values stay as ISO date strings for correct grouping/sorting.
+            date_labels = {d: pd.to_datetime(d).strftime('%a %m/%d') for d in dates}
 
-            # Models that returned nothing for this variable (e.g. AIFS and
-            # WeatherNext for gusts): say so rather than dropping them silently.
-            missing = [n for n in list(DET_MODEL_SLUGS) + ENS_ORDER if n not in models]
-            if missing and not dev_mode:
-                st.caption(f"No data for this variable from: {', '.join(missing)}")
+            def add_daily_traces(fig, daily_ens, daily_det, row, showlegend):
+                """One row of ensemble boxes + deterministic diamonds. Every trace
+                is in its model's legendgroup, so a legend click or double-click
+                hides/isolates that model in every row."""
+                for ens_name in ENS_ORDER:
+                    if ens_name not in daily_ens:
+                        continue
+                    df_m = daily_ens[ens_name]
+                    color = model_color(ens_name)
+                    if ens_name == "Grand Ensemble":
+                        fig.add_trace(grand_box_trace(df_m, dates, ens_name, color, showlegend=showlegend), row=row, col=1)
+                        continue
+                    x_vals, y_vals = [], []
+                    for date_str in dates:
+                        if date_str in df_m.index:
+                            vals = df_m.loc[date_str].values
+                            x_vals.extend([date_str] * len(vals))
+                            y_vals.extend(vals)
+                    fig.add_trace(go.Box(
+                        x=x_vals, y=y_vals, name=ens_name, marker_color=color, line=dict(width=2),
+                        whiskerwidth=0.8, boxpoints='outliers', legendgroup=ens_name,
+                        showlegend=showlegend, hoverinfo="y+name"
+                    ), row=row, col=1)
+                for det_col in daily_det.columns:
+                    fig.add_trace(go.Scatter(
+                        x=daily_det.index, y=daily_det[det_col], mode='markers', name=det_col,
+                        legendgroup=det_col, showlegend=showlegend,
+                        marker=dict(color=model_color(det_col), size=11, symbol='diamond', line=dict(width=1.5, color='black')),
+                        hovertemplate=f"<b>{det_col}</b><br>%{{y:.1f}} " + var_cfg['unit'] + "<extra></extra>"
+                    ), row=row, col=1)
 
-            # make_subplots lets the spread row use its own (neutral) color
-            # scale without sharing the variable's one.
-            show_spread = len(models) > 1
-            fig_grid = make_subplots(
-                rows=2 if show_spread else 1, cols=1, shared_xaxes=True,
-                row_heights=[len(models), 1.2] if show_spread else [1],
-                vertical_spacing=0.04
+            # Highs and (for two-sided variables like temperature) lows share one
+            # figure, so the legend controls both charts.
+            chart_a_title = var_cfg["chart_title"]
+            has_lows = not daily_det_lows.empty
+            titles = [f"{chart_a_title} ({var_cfg['unit']})"]
+            y_titles = [f"{var_cfg['label']} ({var_cfg['unit']})"]
+            if has_lows:
+                titles.append(f"{chart_a_title.replace('High', 'Low')} ({var_cfg['unit']})")
+                y_titles.append(f"Low {var_cfg['label']} ({var_cfg['unit']})")
+            fig_daily = make_subplots(rows=len(titles), cols=1, subplot_titles=titles, vertical_spacing=0.12)
+            add_daily_traces(fig_daily, daily_ens_highs, daily_det_highs, row=1, showlegend=True)
+            if has_lows:
+                add_daily_traces(fig_daily, daily_ens_lows, daily_det_lows, row=2, showlegend=False)
+
+            for row, y_title in enumerate(y_titles, start=1):
+                fig_daily.update_xaxes(
+                    title_text="Calendar Day", type='category', categoryorder='array', categoryarray=dates,
+                    tickvals=dates, ticktext=[date_labels[d] for d in dates], row=row, col=1, **AXIS_STYLE
+                )
+                fig_daily.update_yaxes(title_text=y_title, zeroline=False, row=row, col=1, **AXIS_STYLE)
+            fig_daily.update_annotations(font=dict(size=18))  # subplot titles
+            fig_daily.update_layout(
+                boxmode='group',
+                boxgap=0.3,
+                boxgroupgap=0.08,
+                height=1000 if has_lows else 520,
+                hovermode="closest",
+                margin=dict(t=110),
+                legend=dict(orientation="h", yanchor="bottom", y=1.04 if has_lows else 1.08, xanchor="center", x=0.5)
             )
-            fig_grid.add_trace(go.Heatmap(
-                x=times, y=models, z=z, text=format_cells(z),
-                colorscale=grid_cfg["colorscale"],
-                zmin=grid_cfg.get("zmin", float(np.nanmin(z))), zmax=max(float(np.nanmax(z)), float(grid_cfg.get("zmax_floor", -np.inf))),
-                xgap=1, ygap=1,
-                texttemplate="%{text}", textfont=cell_font,
-                colorbar=dict(title=unit, len=0.8, y=1, yanchor="top"),
-                hovertemplate=f"%{{y}}<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.{decimals + 1}f}} {unit}</b><extra></extra>"
-            ), row=1, col=1)
+            st.plotly_chart(fig_daily, use_container_width=True)
 
-            if show_spread:
-                spread = np.nanmax(z, axis=0) - np.nanmin(z, axis=0)
+    # --- TAB 3: SUMMARY DATA TABLE & CSV DOWNLOAD ---
+    with tab3:
+        if var_cfg.get("daily_agg") is None:
+            st.info(f"A daily summary table isn't available for {var_cfg['label']}.")
+        else:
+            summary_rows = []
+            dates = list(daily_det_highs.index)
+    
+            for d in dates:
+                date_obj = pd.to_datetime(d)
+                row = {"Date": date_obj.strftime("%a %b %d, %Y")}
+        
+                # Populate deterministic run data dynamically
+                for det_col in daily_det_highs.columns:
+                    if selected_var_key in ("temperature_2m", "apparent_temperature") and det_col in daily_det_lows.columns and d in daily_det_lows.index:
+                        low_val = daily_det_lows.loc[d, det_col]
+                        high_val = daily_det_highs.loc[d, det_col]
+                        row[f"{det_col} (L/H)"] = ("—" if pd.isna(low_val) or pd.isna(high_val)
+                                                   else f"{low_val:.1f}° / {high_val:.1f}°F")
+                    else:
+                        v = daily_det_highs.loc[d, det_col]
+                        row[det_col] = "—" if pd.isna(v) else round(v, 2)
+                
+                for ens_name in ["EPS", "AIFS", "GEFS", "WeatherNext"]:
+                    if ens_name in daily_ens_highs and d in daily_ens_highs[ens_name].index:
+                        high_vals = daily_ens_highs[ens_name].loc[d].values
+                        if selected_var_key in ("temperature_2m", "apparent_temperature") and ens_name in daily_ens_lows and d in daily_ens_lows[ens_name].index:
+                            low_vals = daily_ens_lows[ens_name].loc[d].values
+                            row[f"{ens_name} Med (L/H)"] = f"{np.median(low_vals):.1f}° / {np.median(high_vals):.1f}°F"
+                        else:
+                            row[f"{ens_name} Median"] = round(float(np.median(high_vals)), 2)
+                
+                if "Grand Ensemble" in daily_ens_highs and d in daily_ens_highs["Grand Ensemble"].index:
+                    # Equal share per model family (see equal_share_weights).
+                    g_hi = {k: float(v[0]) for k, v in grand_stats(daily_ens_highs["Grand Ensemble"].loc[[d]]).items()}
+                    if selected_var_key in ("temperature_2m", "apparent_temperature") and "Grand Ensemble" in daily_ens_lows and d in daily_ens_lows["Grand Ensemble"].index:
+                        g_lo_med = float(grand_stats(daily_ens_lows["Grand Ensemble"].loc[[d]])[0.5][0])
+                        row["Grand Ens Med (L/H)"] = f"{g_lo_med:.1f}° / {g_hi[0.5]:.1f}°F"
+                        row["High IQR Spread"] = f"{g_hi[0.25]:.1f}° to {g_hi[0.75]:.1f}°F"
+                    else:
+                        row["Grand Ens Median"] = round(g_hi[0.5], 2)
+                        row["Consensus IQR"] = f"{g_hi[0.25]:.2f} to {g_hi[0.75]:.2f} {var_cfg['unit']}"
+            
+                summary_rows.append(row)
+        
+            df_summary_table = pd.DataFrame(summary_rows)
+    
+            st.subheader(f"Daily Consensus Summary Table ({var_cfg['unit']})")
+            st.dataframe(df_summary_table, use_container_width=True, hide_index=True)
+    
+            csv = df_summary_table.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Daily Summary CSV",
+                data=csv,
+                file_name=f"weather_consensus_{selected_var_key}_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+
+
+    # --- TAB 4: HOURLY GRID ---
+    with tab4:
+        GRID_HOURS = 48
+        grid_cfg = var_cfg.get("grid")
+        unit = var_cfg["unit"]
+
+        if grid_cfg is None:
+            st.info(f"An hourly grid isn't available for {var_cfg['label']}.")
+        else:
+            st.subheader(f"Hourly {var_cfg['label']} Grid ({unit})")
+            st.caption(
+                f"Next {GRID_HOURS} hours, station-local time. Ensemble families show the median. "
+                "One color scale is shared across all models."
+                + (" Values are a running total from the current hour." if grid_cfg.get("cumulative") else "")
+            )
+
+            grid_start = station_now_local(dev_mode, utc_offset_seconds).floor('h')
+
+            df_grid = build_hourly_grid(df_det_active, hourly_summaries, grid_start, hours=GRID_HOURS)
+            if grid_cfg.get("cumulative") and not df_grid.empty:
+                df_grid = df_grid.cumsum(axis=1)
+            decimals = grid_cfg.get("decimals", 0)
+            cell_font = dict(size=10 if decimals else 11)
+
+            def format_cell(v):
+                """Short labels that fit the narrow hourly cells: whole numbers
+                from 10 up, "0" for zero, and no leading zero below 1 (".25")."""
+                if np.isnan(v):
+                    return ""
+                if decimals == 0 or abs(v) >= 10:
+                    return f"{v:.0f}"
+                text = f"{v:.{decimals}f}"
+                if float(text) == 0:
+                    return "0"
+                return text.replace("0.", ".", 1) if abs(v) < 1 else text
+
+            def format_cells(values):
+                return [[format_cell(v) for v in row] for row in np.asarray(values, dtype=float)]
+
+            if df_grid.empty:
+                st.info(f"No {var_cfg['label'].lower()} data is available for the next {GRID_HOURS} hours.")
+            else:
+                times = list(df_grid.columns)
+                models = list(df_grid.index)
+                z = df_grid.values.astype(float)
+
+                # Models that returned nothing for this variable (e.g. AIFS and
+                # WeatherNext for gusts): say so rather than dropping them silently.
+                missing = [n for n in list(DET_MODEL_SLUGS) + ENS_ORDER if n not in models]
+                if missing and not dev_mode:
+                    st.caption(f"No data for this variable from: {', '.join(missing)}")
+
+                # make_subplots lets the spread row use its own (neutral) color
+                # scale without sharing the variable's one.
+                show_spread = len(models) > 1
+                fig_grid = make_subplots(
+                    rows=2 if show_spread else 1, cols=1, shared_xaxes=True,
+                    row_heights=[len(models), 1.2] if show_spread else [1],
+                    vertical_spacing=0.04
+                )
                 fig_grid.add_trace(go.Heatmap(
-                    x=times, y=["Spread (max − min)"], z=[spread], text=format_cells([spread]),
-                    colorscale="Greys", zmin=0,
-                    zmax=max(float(np.nanmax(spread)), float(grid_cfg["spread_floor"])),
+                    x=times, y=models, z=z, text=format_cells(z),
+                    colorscale=grid_cfg["colorscale"],
+                    zmin=grid_cfg.get("zmin", float(np.nanmin(z))), zmax=max(float(np.nanmax(z)), float(grid_cfg.get("zmax_floor", -np.inf))),
                     xgap=1, ygap=1,
                     texttemplate="%{text}", textfont=cell_font,
-                    showscale=False,
-                    hovertemplate=f"Model spread<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.{decimals + 1}f}} {unit}</b><extra></extra>"
-                ), row=2, col=1)
+                    colorbar=dict(title=unit, len=0.8, y=1, yanchor="top"),
+                    hovertemplate=f"%{{y}}<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.{decimals + 1}f}} {unit}</b><extra></extra>"
+                ), row=1, col=1)
 
-            fig_grid.update_yaxes(autorange="reversed", showline=False, showgrid=False, tickfont=dict(size=12))
-            fig_grid.update_xaxes(
-                tickformat="%a %m/%d %I%p", tickangle=-45, automargin=True,
-                dtick=3 * 60 * 60 * 1000, showgrid=False, showline=False
-            )
-            if show_spread:
-                fig_grid.update_xaxes(showticklabels=False, row=1, col=1)
+                if show_spread:
+                    spread = np.nanmax(z, axis=0) - np.nanmin(z, axis=0)
+                    fig_grid.add_trace(go.Heatmap(
+                        x=times, y=["Spread (max − min)"], z=[spread], text=format_cells([spread]),
+                        colorscale="Greys", zmin=0,
+                        zmax=max(float(np.nanmax(spread)), float(grid_cfg["spread_floor"])),
+                        xgap=1, ygap=1,
+                        texttemplate="%{text}", textfont=cell_font,
+                        showscale=False,
+                        hovertemplate=f"Model spread<br>%{{x|%a %b %d, %I:%M %p}}<br><b>%{{z:.{decimals + 1}f}} {unit}</b><extra></extra>"
+                    ), row=2, col=1)
 
-            # Thin divider at each local midnight (cell edge = half an hour before).
-            for t in times:
-                if t.hour == 0 and t != times[0]:
-                    edge = t - pd.Timedelta(minutes=30)
-                    fig_grid.add_shape(
-                        type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
-                        line=dict(color="rgba(128, 128, 128, 0.9)", width=2)
-                    )
+                fig_grid.update_yaxes(autorange="reversed", showline=False, showgrid=False, tickfont=dict(size=12))
+                fig_grid.update_xaxes(
+                    tickformat="%a %m/%d %I%p", tickangle=-45, automargin=True,
+                    dtick=3 * 60 * 60 * 1000, showgrid=False, showline=False
+                )
+                if show_spread:
+                    fig_grid.update_xaxes(showticklabels=False, row=1, col=1)
 
-            fig_grid.update_layout(
-                height=110 + 42 * (len(models) + (1 if show_spread else 0)) + 90,
-                margin=dict(l=10, r=10, t=20, b=10)
-            )
-            st.plotly_chart(fig_grid, use_container_width=True)
+                # Thin divider at each local midnight (cell edge = half an hour before).
+                for t in times:
+                    if t.hour == 0 and t != times[0]:
+                        edge = t - pd.Timedelta(minutes=30)
+                        fig_grid.add_shape(
+                            type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
+                            line=dict(color="rgba(128, 128, 128, 0.9)", width=2)
+                        )
+
+                fig_grid.update_layout(
+                    height=110 + 42 * (len(models) + (1 if show_spread else 0)) + 90,
+                    margin=dict(l=10, r=10, t=20, b=10)
+                )
+                st.plotly_chart(fig_grid, use_container_width=True)
 
 
-# --- TAB 5: TRENDS (TEMPERATURE) ---
-with tab5:
-    st.subheader("Temperature Trends")
-    st.caption(
-        f"How each model's temperature forecast has changed over the last {PREVIOUS_RUN_DAYS} days of runs. "
-        "Always air temperature, regardless of the sidebar variable. A run's forecast for a day comes from "
-        "Open-Meteo's Previous Runs data: the forecast made N days before each hour, N = days between run and target."
-    )
-    if not prev_runs:
-        st.info(f"Previous-run data isn't available right now. ({prev_runs_err})")
-    else:
-        today = station_now_local(dev_mode, utc_offset_seconds).normalize()
-        day_lbl = lambda d: d.strftime("%a %m/%d")
-        target_days = [today + pd.Timedelta(days=i) for i in range(7)]
-        run_days = [today - pd.Timedelta(days=i) for i in range(PREVIOUS_RUN_DAYS - 1, -1, -1)]
-        has_ens_trend = not archive_daily.empty
-
-        c1, c2 = st.columns([2, 1])
-        value_mode = c1.radio("Value", ["High", "Low", "Specific hour"], horizontal=True, key="trend_value")
-        how = {"High": "max", "Low": "min"}.get(value_mode)
-        if how is None:
-            how = c2.selectbox("Local hour", list(range(24)), index=16, key="trend_hour",
-                               format_func=lambda hr: pd.Timestamp(2000, 1, 1, hr).strftime("%I %p").lstrip("0"))
-        value_lbl = {"max": "HIGH", "min": "LOW"}.get(how) or pd.Timestamp(2000, 1, 1, how).strftime("%I %p").lstrip("0")
-        ens_ok = has_ens_trend and how in ("max", "min")
-
-        # A. Trend grid: target days x runs, with change vs. the previous run.
-        model_options = list(prev_runs) + (["Grand Ensemble"] if ens_ok else [])
-        trend_model = st.selectbox("Model", model_options, key="trend_model")
-
-        def trend_cell(target_day, run_day):
-            if trend_model == "Grand Ensemble":
-                stats = grand_trend_value(archive_daily, target_day, run_day, how)
-                return np.nan if stats is None else stats[0.5]
-            return run_forecast_value(prev_runs[trend_model], target_day, run_day, today, how)
-
-        z = np.array([[trend_cell(d, r) for r in run_days] for d in target_days], dtype=float)
-        delta = z[:, -1] - z[:, -2]
-        arrows = ["" if np.isnan(v) else ("▲" if v > 0.5 else "▼" if v < -0.5 else "•") + f"{abs(v):.0f}" for v in delta]
-        fig_trend = make_subplots(rows=1, cols=2, column_widths=[0.88, 0.12], shared_yaxes=True, horizontal_spacing=0.01)
-        fig_trend.add_trace(go.Heatmap(
-            z=z, x=[day_lbl(r) for r in run_days], y=[day_lbl(d) for d in target_days],
-            text=[["" if np.isnan(v) else f"{v:.0f}" for v in row] for row in z], texttemplate="%{text}",
-            textfont=dict(size=14), colorscale=WEATHER_VARS["temperature_2m"]["grid"]["colorscale"],
-            xgap=2, ygap=2, colorbar=dict(title="°F", x=1.02),
-            hovertemplate="Target %{y}<br>Run %{x}<br><b>%{z:.1f}°F</b><extra></extra>"
-        ), 1, 1)
-        fig_trend.add_trace(go.Heatmap(
-            z=delta[:, None], x=["Δ vs prev run"], y=[day_lbl(d) for d in target_days],
-            text=[[a] for a in arrows], texttemplate="%{text}", textfont=dict(size=14),
-            colorscale="RdBu_r", zmid=0, zmin=-6, zmax=6, showscale=False, xgap=2, ygap=2,
-            hovertemplate="%{y}: %{z:+.1f}°F vs previous run<extra></extra>"
-        ), 1, 2)
-        fig_trend.update_yaxes(autorange="reversed", title_text="Target day", row=1, col=1)
-        fig_trend.update_xaxes(side="top", row=1, col=1)
-        fig_trend.update_xaxes(side="top", row=1, col=2)
-        fig_trend.update_layout(
-            title=dict(text=f"{trend_model} forecast {value_lbl} (°F) by run date (columns, latest at right)", font=dict(size=18)),
-            height=440, margin=dict(t=110, l=10, r=10, b=10)
+    # --- TAB 5: TRENDS (TEMPERATURE) ---
+    with tab5:
+        st.subheader("Temperature Trends")
+        st.caption(
+            f"How each model's temperature forecast has changed over the last {PREVIOUS_RUN_DAYS} days of runs. "
+            "Always air temperature, regardless of the sidebar variable. A run's forecast for a day comes from "
+            "Open-Meteo's Previous Runs data: the forecast made N days before each hour, N = days between run and target."
         )
-        st.plotly_chart(fig_trend, use_container_width=True)
-
-        st.divider()
-
-        # B. dprog/dt: one target day, every model's forecast by run date.
-        dprog_days = [today + pd.Timedelta(days=i) for i in range(1, 8)]
-        target = st.selectbox("Target day", dprog_days, index=2, format_func=day_lbl, key="trend_target")
-        dprog_runs = [target - pd.Timedelta(days=n) for n in range(PREVIOUS_RUN_DAYS, -1, -1)
-                      if target - pd.Timedelta(days=n) <= today]
-        x_lbls = [day_lbl(r) for r in dprog_runs]
-        fig_dprog = go.Figure()
-        if ens_ok:
-            ens = [grand_trend_value(archive_daily, target, r, how) for r in dprog_runs]
-            pts = [(x, e) for x, e in zip(x_lbls, ens) if e is not None]
-            if pts:
-                xs = [x for x, _ in pts]
-                fig_dprog.add_trace(go.Scatter(
-                    x=xs + xs[::-1], y=[e[0.75] for _, e in pts] + [e[0.25] for _, e in pts][::-1],
-                    fill="toself", line=dict(width=0), mode="lines",
-                    fillcolor="rgba(255, 255, 255, 0.15)" if is_dark_theme() else "rgba(0, 0, 0, 0.15)",
-                    name="Grand Ensemble IQR", hoverinfo="skip"
-                ))
-                fig_dprog.add_trace(go.Scatter(
-                    x=xs, y=[e[0.5] for _, e in pts], mode="lines+markers", name="Grand Ensemble (Median)",
-                    line=dict(color=model_color("Grand Ensemble"), width=3, dash="dash"),
-                    hovertemplate="Grand Ensemble<br>Run %{x}: <b>%{y:.0f}°F</b><extra></extra>"
-                ))
-        for model_name, df_runs in prev_runs.items():
-            fig_dprog.add_trace(go.Scatter(
-                x=x_lbls, y=[run_forecast_value(df_runs, target, r, today, how) for r in dprog_runs],
-                mode="lines+markers", name=model_name,
-                line=dict(color=model_color(model_name), width=3), marker=dict(size=9),
-                hovertemplate=f"{model_name}<br>Run %{{x}}: <b>%{{y:.0f}}°F</b><extra></extra>"
-            ))
-        fig_dprog.update_layout(
-            title=dict(text=f"Forecast {value_lbl} for {target:%a %m/%d} by run date", font=dict(size=18)),
-            # Pin run-date order: the ensemble trace can start later than the
-            # deterministic ones, which would otherwise append early runs at the end.
-            xaxis=dict(title="Run date", type="category", categoryorder="array", categoryarray=x_lbls, **AXIS_STYLE),
-            yaxis=dict(title="Temperature (°F)", **AXIS_STYLE),
-            height=450, hovermode="x unified", legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5)
-        )
-        st.plotly_chart(fig_dprog, use_container_width=True)
-        if has_ens_trend and not ens_ok:
-            st.caption("The Grand Ensemble trend covers daily highs and lows only (the archive doesn't keep hourly members).")
-        elif not has_ens_trend and not dev_mode and loc_mode == "Airport Code" and airport_input in ARCHIVE_STATIONS:
-            st.caption("The Grand Ensemble trend will appear once the daily forecast archive has a run or two of history.")
-
-
-# --- TAB 6: HAZARDS (FOG POTENTIAL) ---
-with tab6:
-    st.subheader(f"Fog Potential — next {HAZARD_HOURS} h")
-    st.caption(
-        f"Visibility tiers: mist < {FOG_TIERS['mist_mi']:g} mi, fog < {FOG_TIERS['fog_mi']:g} mi, "
-        f"dense < {FOG_TIERS['dense_mi']:g} mi (NWS Dense Fog Advisory). "
-        f"GEFS % = share of members with fog; Signals = share of models/members with dew-point spread ≤ "
-        f"{FOG_TIERS['spread_f']:g}°F and wind ≤ {FOG_TIERS['wind_mph']:g} mph (each model family an equal share). "
-        "Overall = average of the rows; dense only when two rows agree."
-    )
-    window = pd.date_range(station_now_local(dev_mode, utc_offset_seconds).floor('h'), periods=HAZARD_HOURS, freq='h')
-    fog_rows, fog_ev = build_fog_rows(window, fog_inputs, dict_det, dict_ens)
-    missing_rows = [r for r in ("NBM vis", "GEFS %", "RRFS vis", "Signals") if r not in fog_rows]
-    if not fog_rows:
-        st.info("No fog inputs are available for this location right now.")
-    else:
-        labels = list(fog_rows)
-        z = np.vstack([fog_rows[r] for r in labels])
-
-        def fmt(v, spec, suffix=""):
-            return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:{spec}}{suffix}"
-
-        hover = []
-        for r in labels:
-            row_text = []
-            for i, t in enumerate(window):
-                lvl = fog_rows[r][i]
-                parts = [f"<b>{r}</b> · {t:%a %b %d %I %p}", f"Level: {'—' if np.isnan(lvl) else FOG_LEVELS[int(lvl)]}"]
-                if "spread" in fog_ev:
-                    parts.append(f"Dew-point spread (median): {fmt(fog_ev['spread'][i], '.1f', '°F')}")
-                    parts.append(f"Wind (median): {fmt(fog_ev['wind'][i], '.0f', ' mph')}")
-                if "low_cloud" in fog_ev:
-                    parts.append(f"Low cloud (median): {fmt(fog_ev['low_cloud'][i], '.0f', '%')}")
-                if "nbm_vis" in fog_ev:
-                    parts.append(f"NBM vis: {fmt(fog_ev['nbm_vis'][i], '.2f', ' mi')}")
-                if "rrfs_vis" in fog_ev:
-                    parts.append(f"RRFS vis: {fmt(fog_ev['rrfs_vis'][i], '.2f', ' mi')}")
-                if "gefs_n" in fog_ev and fog_ev["gefs_n"][i]:
-                    parts.append(f"GEFS: {int(fog_ev['gefs_fog'][i])} of {int(fog_ev['gefs_n'][i])} members < {FOG_TIERS['fog_mi']:g} mi")
-                if fog_ev.get("type") and fog_ev["type"][i]:
-                    parts.append(f"Likely type: {fog_ev['type'][i]}")
-                row_text.append("<br>".join(parts))
-            hover.append(row_text)
-        cell_text = [[(fog_ev["type"][i][:1] if r == "Overall" and fog_ev.get("type") and fog_ev["type"][i] not in ("", "Unclear") else "")
-                      for i in range(len(window))] for r in labels]
-
-        # Discrete 5-step scale: none (faint gray) -> dense (deep red).
-        steps = ["rgba(128, 128, 128, 0.12)", "#FFE08A", "#FDAE61", "#F46D43", "#B2182B"]
-        colorscale = []
-        for k, c in enumerate(steps):
-            colorscale += [(k / len(steps), c), ((k + 1) / len(steps), c)]
-        fig_fog = go.Figure(go.Heatmap(
-            z=z, x=window, y=labels, zmin=-0.5, zmax=4.5, colorscale=colorscale, xgap=1, ygap=3,
-            customdata=hover, hovertemplate="%{customdata}<extra></extra>",
-            text=cell_text, texttemplate="%{text}", textfont=dict(size=11),
-            colorbar=dict(tickvals=list(range(5)), ticktext=FOG_LEVELS, title="Fog")
-        ))
-        for t in window:
-            if t.hour == 0 and t != window[0]:
-                edge = t - pd.Timedelta(minutes=30)
-                fig_fog.add_shape(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
-                                  line=dict(color="rgba(128, 128, 128, 0.9)", width=2))
-        fig_fog.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(size=13))
-        fig_fog.update_xaxes(tickformat="%a %m/%d %I%p", dtick=6 * 3600 * 1000, tickangle=-45, showgrid=False, automargin=True)
-        fig_fog.update_layout(height=140 + 55 * len(labels), margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(fig_fog, use_container_width=True)
-        st.caption("Overall row letters: R = likely radiation fog (night, light wind), A = likely advection fog (5–15 mph).")
-
-        episodes = fog_episodes(window, fog_rows["Overall"], fog_ev.get("type", [""] * len(window)))
-        if episodes:
-            st.markdown("**Fog potential periods**")
-            for start, end, peak, kind in episodes:
-                span = f"{start:%a %I %p}" if start == end else f"{start:%a %I %p} – {end:%a %I %p}"
-                st.markdown(f"- {span}: peak **{FOG_LEVELS[peak]}**" + (f", likely {kind.lower()}" if kind != "Unclear" else ""))
+        if not prev_runs:
+            st.info(f"Previous-run data isn't available right now. ({prev_runs_err})")
         else:
-            st.markdown("No fog potential flagged in the next 72 hours.")
+            today = station_now_local(dev_mode, utc_offset_seconds).normalize()
+            day_lbl = lambda d: d.strftime("%a %m/%d")
+            target_days = [today + pd.Timedelta(days=i) for i in range(7)]
+            run_days = [today - pd.Timedelta(days=i) for i in range(PREVIOUS_RUN_DAYS - 1, -1, -1)]
+            has_ens_trend = not archive_daily.empty
 
-    notes = []
-    if missing_rows:
-        notes.append(f"Not shown (no data for this location/time): {', '.join(missing_rows)}.")
-    if fog_errors:
-        notes.append("Source errors: " + "; ".join(fog_errors))
-    if notes:
-        st.caption(" ".join(notes))
-    st.caption(
-        "These models are 3–25 km grids and fog is notoriously hard to forecast; treat a flag as a prompt to "
-        "check soundings and observations, not a forecast."
-    )
+            c1, c2 = st.columns([2, 1])
+            value_mode = c1.radio("Value", ["High", "Low", "Specific hour"], horizontal=True, key="trend_value")
+            how = {"High": "max", "Low": "min"}.get(value_mode)
+            if how is None:
+                how = c2.selectbox("Local hour", list(range(24)), index=16, key="trend_hour",
+                                   format_func=lambda hr: pd.Timestamp(2000, 1, 1, hr).strftime("%I %p").lstrip("0"))
+            value_lbl = {"max": "HIGH", "min": "LOW"}.get(how) or pd.Timestamp(2000, 1, 1, how).strftime("%I %p").lstrip("0")
+            ens_ok = has_ens_trend and how in ("max", "min")
+
+            # A. Trend grid: target days x runs, with change vs. the previous run.
+            model_options = list(prev_runs) + (["Grand Ensemble"] if ens_ok else [])
+            trend_model = st.selectbox("Model", model_options, key="trend_model")
+
+            def trend_cell(target_day, run_day):
+                if trend_model == "Grand Ensemble":
+                    stats = grand_trend_value(archive_daily, target_day, run_day, how)
+                    return np.nan if stats is None else stats[0.5]
+                return run_forecast_value(prev_runs[trend_model], target_day, run_day, today, how)
+
+            z = np.array([[trend_cell(d, r) for r in run_days] for d in target_days], dtype=float)
+            delta = z[:, -1] - z[:, -2]
+            arrows = ["" if np.isnan(v) else ("▲" if v > 0.5 else "▼" if v < -0.5 else "•") + f"{abs(v):.0f}" for v in delta]
+            fig_trend = make_subplots(rows=1, cols=2, column_widths=[0.88, 0.12], shared_yaxes=True, horizontal_spacing=0.01)
+            fig_trend.add_trace(go.Heatmap(
+                z=z, x=[day_lbl(r) for r in run_days], y=[day_lbl(d) for d in target_days],
+                text=[["" if np.isnan(v) else f"{v:.0f}" for v in row] for row in z], texttemplate="%{text}",
+                textfont=dict(size=14), colorscale=WEATHER_VARS["temperature_2m"]["grid"]["colorscale"],
+                xgap=2, ygap=2, colorbar=dict(title="°F", x=1.02),
+                hovertemplate="Target %{y}<br>Run %{x}<br><b>%{z:.1f}°F</b><extra></extra>"
+            ), 1, 1)
+            fig_trend.add_trace(go.Heatmap(
+                z=delta[:, None], x=["Δ vs prev run"], y=[day_lbl(d) for d in target_days],
+                text=[[a] for a in arrows], texttemplate="%{text}", textfont=dict(size=14),
+                colorscale="RdBu_r", zmid=0, zmin=-6, zmax=6, showscale=False, xgap=2, ygap=2,
+                hovertemplate="%{y}: %{z:+.1f}°F vs previous run<extra></extra>"
+            ), 1, 2)
+            fig_trend.update_yaxes(autorange="reversed", title_text="Target day", row=1, col=1)
+            fig_trend.update_xaxes(side="top", row=1, col=1)
+            fig_trend.update_xaxes(side="top", row=1, col=2)
+            fig_trend.update_layout(
+                title=dict(text=f"{trend_model} forecast {value_lbl} (°F) by run date (columns, latest at right)", font=dict(size=18)),
+                height=440, margin=dict(t=110, l=10, r=10, b=10)
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+            st.divider()
+
+            # B. dprog/dt: one target day, every model's forecast by run date.
+            dprog_days = [today + pd.Timedelta(days=i) for i in range(1, 8)]
+            target = st.selectbox("Target day", dprog_days, index=2, format_func=day_lbl, key="trend_target")
+            dprog_runs = [target - pd.Timedelta(days=n) for n in range(PREVIOUS_RUN_DAYS, -1, -1)
+                          if target - pd.Timedelta(days=n) <= today]
+            x_lbls = [day_lbl(r) for r in dprog_runs]
+            fig_dprog = go.Figure()
+            if ens_ok:
+                ens = [grand_trend_value(archive_daily, target, r, how) for r in dprog_runs]
+                pts = [(x, e) for x, e in zip(x_lbls, ens) if e is not None]
+                if pts:
+                    xs = [x for x, _ in pts]
+                    fig_dprog.add_trace(go.Scatter(
+                        x=xs + xs[::-1], y=[e[0.75] for _, e in pts] + [e[0.25] for _, e in pts][::-1],
+                        fill="toself", line=dict(width=0), mode="lines",
+                        fillcolor="rgba(255, 255, 255, 0.15)" if is_dark_theme() else "rgba(0, 0, 0, 0.15)",
+                        name="Grand Ensemble IQR", hoverinfo="skip"
+                    ))
+                    fig_dprog.add_trace(go.Scatter(
+                        x=xs, y=[e[0.5] for _, e in pts], mode="lines+markers", name="Grand Ensemble (Median)",
+                        line=dict(color=model_color("Grand Ensemble"), width=3, dash="dash"),
+                        hovertemplate="Grand Ensemble<br>Run %{x}: <b>%{y:.0f}°F</b><extra></extra>"
+                    ))
+            for model_name, df_runs in prev_runs.items():
+                fig_dprog.add_trace(go.Scatter(
+                    x=x_lbls, y=[run_forecast_value(df_runs, target, r, today, how) for r in dprog_runs],
+                    mode="lines+markers", name=model_name,
+                    line=dict(color=model_color(model_name), width=3), marker=dict(size=9),
+                    hovertemplate=f"{model_name}<br>Run %{{x}}: <b>%{{y:.0f}}°F</b><extra></extra>"
+                ))
+            fig_dprog.update_layout(
+                title=dict(text=f"Forecast {value_lbl} for {target:%a %m/%d} by run date", font=dict(size=18)),
+                # Pin run-date order: the ensemble trace can start later than the
+                # deterministic ones, which would otherwise append early runs at the end.
+                xaxis=dict(title="Run date", type="category", categoryorder="array", categoryarray=x_lbls, **AXIS_STYLE),
+                yaxis=dict(title="Temperature (°F)", **AXIS_STYLE),
+                height=450, hovermode="x unified", legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5)
+            )
+            st.plotly_chart(fig_dprog, use_container_width=True)
+            if has_ens_trend and not ens_ok:
+                st.caption("The Grand Ensemble trend covers daily highs and lows only (the archive doesn't keep hourly members).")
+            elif not has_ens_trend and not dev_mode and loc_mode == "Airport Code" and airport_input in ARCHIVE_STATIONS:
+                st.caption("The Grand Ensemble trend will appear once the daily forecast archive has a run or two of history.")
+
+
+# ==============================================================================
+# HAZARDS VIEW (tabs per hazard; drizzle / freezing drizzle to come)
+# ==============================================================================
+
+if view == "Hazards":
+    # --- HAZARDS VIEW: FOG TAB ---
+    (fog_tab,) = st.tabs(["🌫️ Fog"])
+    with fog_tab:
+        st.subheader(f"Fog Potential — next {HAZARD_HOURS} h")
+        st.caption(
+            f"Visibility tiers: mist < {FOG_TIERS['mist_mi']:g} mi, fog < {FOG_TIERS['fog_mi']:g} mi, "
+            f"dense < {FOG_TIERS['dense_mi']:g} mi (NWS Dense Fog Advisory). "
+            f"GEFS % = share of members with fog; Signals = share of models/members with dew-point spread ≤ "
+            f"{FOG_TIERS['spread_f']:g}°F and wind ≤ {FOG_TIERS['wind_mph']:g} mph (each model family an equal share). "
+            "Overall = average of the rows; dense only when two rows agree."
+        )
+        window = pd.date_range(station_now_local(dev_mode, utc_offset_seconds).floor('h'), periods=HAZARD_HOURS, freq='h')
+        fog_rows, fog_ev = build_fog_rows(window, fog_inputs, dict_det, dict_ens)
+        missing_rows = [r for r in ("NBM vis", "GEFS %", "RRFS vis", "Signals") if r not in fog_rows]
+        if not fog_rows:
+            st.info("No fog inputs are available for this location right now.")
+        else:
+            labels = list(fog_rows)
+            z = np.vstack([fog_rows[r] for r in labels])
+
+            def fmt(v, spec, suffix=""):
+                return "—" if v is None or (isinstance(v, float) and np.isnan(v)) else f"{v:{spec}}{suffix}"
+
+            hover = []
+            for r in labels:
+                row_text = []
+                for i, t in enumerate(window):
+                    lvl = fog_rows[r][i]
+                    parts = [f"<b>{r}</b> · {t:%a %b %d %I %p}", f"Level: {'—' if np.isnan(lvl) else FOG_LEVELS[int(lvl)]}"]
+                    if "spread" in fog_ev:
+                        parts.append(f"Dew-point spread (median): {fmt(fog_ev['spread'][i], '.1f', '°F')}")
+                        parts.append(f"Wind (median): {fmt(fog_ev['wind'][i], '.0f', ' mph')}")
+                    if "low_cloud" in fog_ev:
+                        parts.append(f"Low cloud (median): {fmt(fog_ev['low_cloud'][i], '.0f', '%')}")
+                    if "nbm_vis" in fog_ev:
+                        parts.append(f"NBM vis: {fmt(fog_ev['nbm_vis'][i], '.2f', ' mi')}")
+                    if "rrfs_vis" in fog_ev:
+                        parts.append(f"RRFS vis: {fmt(fog_ev['rrfs_vis'][i], '.2f', ' mi')}")
+                    if "gefs_n" in fog_ev and fog_ev["gefs_n"][i]:
+                        parts.append(f"GEFS: {int(fog_ev['gefs_fog'][i])} of {int(fog_ev['gefs_n'][i])} members < {FOG_TIERS['fog_mi']:g} mi")
+                    if fog_ev.get("type") and fog_ev["type"][i]:
+                        parts.append(f"Likely type: {fog_ev['type'][i]}")
+                    row_text.append("<br>".join(parts))
+                hover.append(row_text)
+            cell_text = [[(fog_ev["type"][i][:1] if r == "Overall" and fog_ev.get("type") and fog_ev["type"][i] not in ("", "Unclear") else "")
+                          for i in range(len(window))] for r in labels]
+
+            # Discrete 5-step scale: none (faint gray) -> dense (deep red).
+            steps = ["rgba(128, 128, 128, 0.12)", "#FFE08A", "#FDAE61", "#F46D43", "#B2182B"]
+            colorscale = []
+            for k, c in enumerate(steps):
+                colorscale += [(k / len(steps), c), ((k + 1) / len(steps), c)]
+            fig_fog = go.Figure(go.Heatmap(
+                z=z, x=window, y=labels, zmin=-0.5, zmax=4.5, colorscale=colorscale, xgap=1, ygap=3,
+                customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+                text=cell_text, texttemplate="%{text}", textfont=dict(size=11),
+                colorbar=dict(tickvals=list(range(5)), ticktext=FOG_LEVELS, title="Fog")
+            ))
+            for t in window:
+                if t.hour == 0 and t != window[0]:
+                    edge = t - pd.Timedelta(minutes=30)
+                    fig_fog.add_shape(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
+                                      line=dict(color="rgba(128, 128, 128, 0.9)", width=2))
+            fig_fog.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(size=13))
+            fig_fog.update_xaxes(tickformat="%a %m/%d %I%p", dtick=6 * 3600 * 1000, tickangle=-45, showgrid=False, automargin=True)
+            fig_fog.update_layout(height=140 + 55 * len(labels), margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig_fog, use_container_width=True)
+            st.caption("Overall row letters: R = likely radiation fog (night, light wind), A = likely advection fog (5–15 mph).")
+
+            episodes = fog_episodes(window, fog_rows["Overall"], fog_ev.get("type", [""] * len(window)))
+            if episodes:
+                st.markdown("**Fog potential periods**")
+                for start, end, peak, kind in episodes:
+                    span = f"{start:%a %I %p}" if start == end else f"{start:%a %I %p} – {end:%a %I %p}"
+                    st.markdown(f"- {span}: peak **{FOG_LEVELS[peak]}**" + (f", likely {kind.lower()}" if kind != "Unclear" else ""))
+            else:
+                st.markdown("No fog potential flagged in the next 72 hours.")
+
+        notes = []
+        if missing_rows:
+            notes.append(f"Not shown (no data for this location/time): {', '.join(missing_rows)}.")
+        if fog_errors:
+            notes.append("Source errors: " + "; ".join(fog_errors))
+        if notes:
+            st.caption(" ".join(notes))
+        st.caption(
+            "These models are 3–25 km grids and fog is notoriously hard to forecast; treat a flag as a prompt to "
+            "check soundings and observations, not a forecast."
+        )
