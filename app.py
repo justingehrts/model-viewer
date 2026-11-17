@@ -205,6 +205,32 @@ FOG_TIERS = {
 }
 FOG_LEVELS = ["None", "Low", "Moderate", "High", "Dense likely"]
 
+# Hazards view: drizzle and freezing drizzle. Drizzle falls from a shallow,
+# saturated layer with little or no deep moisture above it (no ice crystals
+# to grow into snow/rain), and only a little model QPF. Freezing drizzle also
+# needs a subfreezing surface and a cloud top warmer than about -10 C, where
+# ice nuclei are scarce and the cloud stays liquid. Each model/member is a
+# yes/no per hour; ensembles show the share of members that say yes.
+DRIZZLE_TIERS = {
+    "sat_rh": 90.0,             # saturated: RH >= 90% on a level between the surface and low_top_hpa
+    "low_top_hpa": 850,         # ... the saturated layer must be below this level
+    "aloft_rh": 85.0,           # no deep moisture: RH < 85% at 800 and 700 mb (where the model has them)
+    "max_precip_in": 0.04,      # light QPF only (in/hr); heavier is rain/snow, not drizzle
+    "fz_sfc_f": 32.0,           # freezing drizzle: 2 m temperature <= 32 F ...
+    "fz_top_c": -10.0,          # ... and saturated-layer top warmer than -10 C
+    "pct_bands": (10, 30, 60),  # % of members -> low / moderate / high
+}
+DRIZZLE_LEVELS = ["None", "Low", "Moderate", "High"]
+# Pressure levels each source returns on Open-Meteo (checked live at KCMH).
+# RRFS and GFS have the finest low-level spacing; ensembles only 925/850/700.
+DRIZZLE_DET_LEVELS = [1000, 975, 950, 925, 900, 850, 800, 700]
+DRIZZLE_ENS_T_LEVELS = [1000, 925, 850, 700]
+DRIZZLE_ENS_RH_LEVELS = [925, 850, 700]
+DRIZZLE_SOURCES = [  # (row label, Open-Meteo slug, is ensemble)
+    ("GFS", "gfs_seamless", False), ("ECMWF", "ecmwf_ifs025", False), ("RRFS", RRFS_SLUG, False),
+    ("EPS", "ecmwf_ifs025", True), ("AIFS", "ecmwf_aifs025", True), ("GEFS", "gfs_seamless", True),
+]
+
 # Inputs for the derived snowfall variables, fetched in a separate request so a
 # model that rejects them can't break the main fetch. These are the pressure
 # levels the ensemble API actually returns (checked live: nothing in between
@@ -795,6 +821,32 @@ def fetch_archive_daily(station, utc_offset_seconds):
     df["family"] = df["model_slug"].map(ENS_NAME_MAP)
     return df.dropna(subset=["family"])
 
+def generate_mock_drizzle_inputs():
+    """Synthetic drizzle inputs for Dev Mode, shaped like fetch_drizzle_inputs():
+    a shallow saturated layer with a subfreezing surface about 20-40 hours out."""
+    rng = np.random.RandomState(5)
+    times = pd.date_range(pd.Timestamp.now().floor('h'), periods=HAZARD_HOURS + 24, freq='h')
+    hours = np.arange(len(times))
+    event = ((hours >= 20) & (hours <= 40)).astype(float)
+
+    def member(skill):
+        flip = rng.rand(len(times)) < skill  # chance this member agrees with the "truth" this hour
+        on = np.where(flip, event, 1 - event) if skill < 1 else event
+        m = {"t2m": np.where(on > 0, 29.0, 38.0) + rng.normal(0, 1, len(times)),
+             "precip": np.where(on > 0, 0.01, 0.0), "sfc_p": np.full(len(times), 985.0)}
+        for p in DRIZZLE_DET_LEVELS:
+            m[f"rh{p}"] = np.where(on > 0, 96.0, 60.0) if p >= 850 else np.full(len(times), 55.0)
+            m[f"t{p}"] = 29.0 - (1000 - p) * 0.08 + np.where(on > 0, 0, 3) + 0 * hours
+        return m
+
+    out = {}
+    for label, _slug, is_ens in DRIZZLE_SOURCES:
+        n = 25 if is_ens else 1
+        skill = 0.85 if is_ens else 1.0
+        out[label] = {"time": times, "members": {f"m{i:02d}": member(skill) for i in range(n)}}
+    return out, []
+
+
 def visibility_to_miles(values, unit):
     """Open-Meteo visibility (meters by default, feet with imperial units) in miles."""
     arr = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
@@ -874,6 +926,52 @@ def fetch_fog_inputs(lat, lon):
         except Exception as e:
             errors.append(f"{name}: {e}")
     return data, errors
+
+@st.cache_data(ttl=3600)
+def _fetch_drizzle_source_cached(lat, lon, slug, ensemble):
+    """One model's low-level profile for the drizzle/freezing-drizzle tabs:
+    {"time": DatetimeIndex, "members": {id: {"t2m", "precip", "sfc_p", "t<p>", "rh<p>": array}}}.
+    Temperatures in F, precipitation in inches/hr. One request per source so
+    one failure doesn't take the others down; failures are never cached."""
+    t_levels = DRIZZLE_ENS_T_LEVELS if ensemble else DRIZZLE_DET_LEVELS
+    rh_levels = DRIZZLE_ENS_RH_LEVELS if ensemble else DRIZZLE_DET_LEVELS
+    names = ["temperature_2m", "precipitation", "surface_pressure"] \
+        + [f"temperature_{p}hPa" for p in t_levels] + [f"relative_humidity_{p}hPa" for p in rh_levels]
+    url = "https://ensemble-api.open-meteo.com/v1/ensemble" if ensemble else "https://api.open-meteo.com/v1/forecast"
+    hourly, _units = _fog_request(url, {
+        "latitude": lat, "longitude": lon, "hourly": ",".join(names), "models": slug,
+        "temperature_unit": "fahrenheit", "precipitation_unit": "inch", "timezone": "auto", "forecast_days": 4
+    })
+    # Single-model responses use bare names; ensemble members add "_memberNN".
+    suffixes = [k[len("temperature_2m"):] for k in hourly if k == "temperature_2m" or k.startswith("temperature_2m_member")]
+    members = {}
+    for sfx in suffixes:
+        def arr(name):
+            vals = hourly.get(f"{name}{sfx}")
+            return None if vals is None else pd.to_numeric(pd.Series(vals), errors="coerce").to_numpy(dtype=float)
+        m = {"t2m": arr("temperature_2m"), "precip": arr("precipitation"), "sfc_p": arr("surface_pressure")}
+        for p in t_levels:
+            m[f"t{p}"] = arr(f"temperature_{p}hPa")
+        for p in rh_levels:
+            m[f"rh{p}"] = arr(f"relative_humidity_{p}hPa")
+        m = {k: v for k, v in m.items() if v is not None and not np.isnan(v).all()}
+        if "t2m" in m and any(k.startswith("rh") for k in m):
+            members[sfx.lstrip("_") or "control"] = m
+    if not members:
+        raise ValueError("no low-level humidity data for this location")
+    return {"time": pd.to_datetime(hourly["time"]), "members": members}
+
+
+def fetch_drizzle_inputs(lat, lon):
+    """Low-level profiles for every source in DRIZZLE_SOURCES: ({label: source}, errors)."""
+    data, errors = {}, []
+    for label, slug, ensemble in DRIZZLE_SOURCES:
+        try:
+            data[label] = _fetch_drizzle_source_cached(lat, lon, slug, ensemble)
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+    return data, errors
+
 
 # ==============================================================================
 # SNOWFALL: 10:1, KUCHERA AND COBB RATIOS
@@ -1406,6 +1504,107 @@ def fog_episodes(window, overall, types):
     return episodes
 
 
+def _hourly_on(times, values, window):
+    """A series on an hourly window (NaN where missing); None -> all NaN."""
+    if values is None:
+        return np.full(len(window), np.nan)
+    s = pd.Series(np.asarray(values, dtype=float), index=pd.to_datetime(times).floor('h'))
+    return s[~s.index.duplicated()].reindex(window).to_numpy()
+
+
+def drizzle_flags(member, times, window):
+    """Drizzle and freezing-drizzle yes/no per hour for one model or member.
+    Returns dict of arrays: drizzle, fzdz (1.0 / 0.0 / NaN where the profile
+    is missing), plus evidence: sat, deep, top_c (top of the saturated low
+    layer, C), t2m, precip. Levels below ground (pressure above surface
+    pressure) are ignored."""
+    T = DRIZZLE_TIERS
+    g = lambda key: _hourly_on(times, member.get(key), window)
+    n = len(window)
+    sfc_p, t2m, precip = g("sfc_p"), g("t2m"), g("precip")
+    sat, have_low = np.zeros(n, bool), np.zeros(n, bool)
+    top_c = np.full(n, np.nan)
+    for p in sorted((int(k[2:]) for k in member if k.startswith("rh")), reverse=True):
+        if p < T["low_top_hpa"]:
+            continue
+        rh, t = g(f"rh{p}"), g(f"t{p}")
+        with np.errstate(invalid="ignore"):
+            valid = ~np.isnan(rh) & ~np.isnan(t) & ~(sfc_p < p)
+            hit = valid & (rh >= T["sat_rh"])
+        have_low |= valid
+        sat |= hit
+        top_c = np.where(hit, (t - 32) * 5 / 9, top_c)  # higher levels overwrite lower ones
+    deep, have_aloft = np.zeros(n, bool), np.zeros(n, bool)
+    for p in (800, 700):
+        if f"rh{p}" not in member:
+            continue
+        rh = g(f"rh{p}")
+        with np.errstate(invalid="ignore"):
+            valid = ~np.isnan(rh) & ~(sfc_p < p)
+            deep |= valid & (rh >= T["aloft_rh"])
+        have_aloft |= valid
+    known = have_low & have_aloft & ~np.isnan(precip)
+    with np.errstate(invalid="ignore"):
+        dz = sat & ~deep & (precip <= T["max_precip_in"])
+        fz = dz & (t2m <= T["fz_sfc_f"]) & (top_c > T["fz_top_c"])
+    known_fz = known & ~np.isnan(t2m)
+    return {"drizzle": np.where(known, dz.astype(float), np.nan),
+            "fzdz": np.where(known_fz, fz.astype(float), np.nan),
+            "sat": sat, "deep": deep, "top_c": top_c, "t2m": t2m, "precip": precip}
+
+
+def build_drizzle_rows(window, inputs, kind):
+    """Hazards rows for drizzle (kind "drizzle") or freezing drizzle ("fzdz").
+    Deterministic rows are yes (Moderate) / no; ensemble rows are the share of
+    members saying yes, banded like the fog GEFS row. Returns (rows, hover)
+    with hover[label] a list of per-hour text."""
+    rows, hover = {}, {}
+    fmt = lambda v, spec, suffix="": "—" if v is None or np.isnan(v) else f"{v:{spec}}{suffix}"
+    for label, _slug, is_ens in DRIZZLE_SOURCES:
+        src = inputs.get(label)
+        if not src:
+            continue
+        flags = [drizzle_flags(m, src["time"], window) for m in src["members"].values()]
+        mat = np.vstack([f[kind] for f in flags])  # (members, hours)
+        n_valid = (~np.isnan(mat)).sum(axis=0)
+        if not n_valid.any():
+            continue
+        with np.errstate(invalid="ignore", divide="ignore"):
+            yes = np.nansum(mat, axis=0)
+            pct = np.where(n_valid > 0, 100 * yes / np.maximum(n_valid, 1), np.nan)
+        with warnings_ignored():
+            med = lambda key: np.nanmedian(np.vstack([f[key] for f in flags]), axis=0)
+            t2m_med, top_med, precip_med = med("t2m"), med("top_c"), med("precip")
+        if is_ens:
+            rows[f"{label} %"] = pct_level(pct)
+        else:
+            rows[label] = np.where(np.isnan(pct), np.nan, np.where(pct >= 50, 2.0, 0.0))
+        key = f"{label} %" if is_ens else label
+        text = []
+        for i, t in enumerate(window):
+            lvl = rows[key][i]
+            parts = [f"<b>{key}</b> · {t:%a %b %d %I %p}", f"Level: {'—' if np.isnan(lvl) else DRIZZLE_LEVELS[int(lvl)]}"]
+            if is_ens and n_valid[i]:
+                parts.append(f"{int(yes[i])} of {int(n_valid[i])} members")
+            else:
+                f0 = flags[0]
+                parts.append(f"Saturated low layer: {'yes' if f0['sat'][i] else 'no'}; deep moisture aloft: {'yes' if f0['deep'][i] else 'no'}")
+            parts.append(f"2 m temp: {fmt(t2m_med[i], '.0f', '°F')}")
+            parts.append(f"Saturated-layer top: {fmt(top_med[i] * 9 / 5 + 32 if not np.isnan(top_med[i]) else np.nan, '.0f', '°F')}")
+            parts.append(f"Precip: {fmt(precip_med[i], '.3f', ' in/h')}")
+            text.append("<br>".join(parts))
+        hover[key] = text
+    if rows:
+        rows["Overall"] = combine_fog_levels(list(rows.values()))
+        text = []
+        for i, t in enumerate(window):
+            lvl = rows["Overall"][i]
+            text.append(f"<b>Overall</b> · {t:%a %b %d %I %p}<br>Level: {'—' if np.isnan(lvl) else DRIZZLE_LEVELS[int(lvl)]}"
+                        f"<br>Average of the rows above")
+        hover["Overall"] = text
+    return rows, hover
+
+
 def grand_trend_value(df_daily, target_day, run_day, how):
     """Grand Ensemble daily high ("max") or low ("min") forecast for a target
     day from one archived run: {0.25, 0.5, 0.75} quantiles with equal share
@@ -1506,6 +1705,7 @@ if dev_mode:
     prev_runs, prev_runs_err = generate_mock_previous_runs(), None
     archive_daily = pd.DataFrame()
     fog_inputs, fog_errors = generate_mock_fog_inputs()
+    drizzle_inputs, drizzle_errors = generate_mock_drizzle_inputs()
 else:
     with st.spinner("Fetching multi-model ensemble payloads..."):
         dict_det, fetch_time, det_run_cycles, det_err, utc_offset_seconds = fetch_deterministic_data(lat, lon, days=forecast_days)
@@ -1515,6 +1715,8 @@ else:
         archive_daily = (fetch_archive_daily(archive_station, utc_offset_seconds)
                          if archive_station in ARCHIVE_STATIONS else pd.DataFrame())
         fog_inputs, fog_errors = fetch_fog_inputs(lat, lon)
+        # Only the Hazards view uses these (6 small requests, cached for an hour).
+        drizzle_inputs, drizzle_errors = fetch_drizzle_inputs(lat, lon) if view == "Hazards" else ({}, [])
 
 if not dev_mode and (det_err or dict_det[selected_var_key].empty):
     st.error(f"⚠️ Unable to fetch weather data from Open-Meteo. Details: `{det_err}`")
@@ -2053,12 +2255,12 @@ if view == "Forecast":
 
 
 # ==============================================================================
-# HAZARDS VIEW (tabs per hazard; drizzle / freezing drizzle to come)
+# HAZARDS VIEW (one tab per hazard: fog, drizzle, freezing drizzle)
 # ==============================================================================
 
 if view == "Hazards":
     # --- HAZARDS VIEW: FOG TAB ---
-    (fog_tab,) = st.tabs(["🌫️ Fog"])
+    fog_tab, drizzle_tab, fzdz_tab = st.tabs(["🌫️ Fog", "🌦️ Drizzle", "🧊 Freezing Drizzle"])
     with fog_tab:
         st.subheader(f"Fog Potential — next {HAZARD_HOURS} h")
         st.caption(
@@ -2146,3 +2348,73 @@ if view == "Hazards":
             "These models are 3–25 km grids and fog is notoriously hard to forecast; treat a flag as a prompt to "
             "check soundings and observations, not a forecast."
         )
+
+    # --- HAZARDS VIEW: DRIZZLE AND FREEZING DRIZZLE TABS ---
+    def render_drizzle_tab(kind):
+        T = DRIZZLE_TIERS
+        freezing = kind == "fzdz"
+        st.subheader(f"{'Freezing Drizzle' if freezing else 'Drizzle'} Potential — next {HAZARD_HOURS} h")
+        criteria = (
+            f"Each model/member says yes when: RH ≥ {T['sat_rh']:g}% somewhere between the surface and {T['low_top_hpa']} mb, "
+            f"RH < {T['aloft_rh']:g}% at 800/700 mb (no deep moisture, so no ice), and model precip ≤ {T['max_precip_in']:g} in/h"
+        )
+        if freezing:
+            criteria += f", plus a 2 m temperature ≤ {T['fz_sfc_f']:g}°F and a saturated-layer top warmer than {T['fz_top_c']:g}°C (liquid cloud)"
+        st.caption(
+            criteria + ". Deterministic rows (GFS, ECMWF, RRFS) are yes/no; EPS/AIFS/GEFS rows are the share of members "
+            "saying yes. Overall = average of the rows."
+        )
+        window = pd.date_range(station_now_local(dev_mode, utc_offset_seconds).floor('h'), periods=HAZARD_HOURS, freq='h')
+        rows, hover_by_row = build_drizzle_rows(window, drizzle_inputs, kind)
+        if not rows:
+            st.info("No low-level profile data is available for this location right now.")
+        else:
+            labels = list(rows)
+            z = np.vstack([rows[r] for r in labels])
+            hover = [hover_by_row[r] for r in labels]
+            steps = (["rgba(128, 128, 128, 0.12)", "#F3C9DD", "#DF65B0", "#980043"] if freezing
+                     else ["rgba(128, 128, 128, 0.12)", "#C6DBEF", "#6BAED6", "#08519C"])
+            colorscale = []
+            for k, c in enumerate(steps):
+                colorscale += [(k / len(steps), c), ((k + 1) / len(steps), c)]
+            fig = go.Figure(go.Heatmap(
+                z=z, x=window, y=labels, zmin=-0.5, zmax=3.5, colorscale=colorscale, xgap=1, ygap=3,
+                customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+                colorbar=dict(tickvals=list(range(4)), ticktext=DRIZZLE_LEVELS, title="Freezing drizzle" if freezing else "Drizzle")
+            ))
+            for t in window:
+                if t.hour == 0 and t != window[0]:
+                    edge = t - pd.Timedelta(minutes=30)
+                    fig.add_shape(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
+                                  line=dict(color="rgba(128, 128, 128, 0.9)", width=2))
+            fig.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(size=13))
+            fig.update_xaxes(tickformat="%a %m/%d %I%p", dtick=6 * 3600 * 1000, tickangle=-45, showgrid=False, automargin=True)
+            fig.update_layout(height=140 + 55 * len(labels), margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+            episodes = fog_episodes(window, rows["Overall"], [""] * len(window))
+            word = "freezing drizzle" if freezing else "drizzle"
+            if episodes:
+                st.markdown(f"**{word.capitalize()} potential periods**")
+                for start, end, peak, _kind in episodes:
+                    span = f"{start:%a %I %p}" if start == end else f"{start:%a %I %p} – {end:%a %I %p}"
+                    st.markdown(f"- {span}: peak **{DRIZZLE_LEVELS[peak]}**")
+            else:
+                st.markdown(f"No {word} potential flagged in the next 72 hours.")
+        notes = []
+        if drizzle_errors:
+            notes.append("Source errors: " + "; ".join(drizzle_errors))
+        if not dev_mode:
+            notes.append("RRFS and GFS resolve 975/950/900 mb; ECMWF and the ensembles only 1000/925/850/700 mb, "
+                         "so their shallow layers are crude (RRFS is also limited to its first ~3.5 days).")
+        if notes:
+            st.caption(" ".join(notes))
+        st.caption(
+            "Models handle drizzle poorly (it forms in layers they barely resolve and the QPF is tiny). "
+            "Treat a flag as a prompt to check soundings, ceilings and observations, not a forecast."
+        )
+
+    with drizzle_tab:
+        render_drizzle_tab("drizzle")
+    with fzdz_tab:
+        render_drizzle_tab("fzdz")
