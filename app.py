@@ -191,7 +191,6 @@ ARCHIVE_STATIONS = {"KCMH"}
 # temperature underlay. Normals belong to a weather station, so only airports
 # listed here (airport code -> GHCN-Daily station ID) get the underlay.
 NORMALS_STATIONS = {"KCMH": "USW00014821"}
-NORMAL_LOW_HOUR, NORMAL_HIGH_HOUR = 7, 15  # local hours the normal low / high are placed at
 
 # Hazards tab (fog potential). RRFS is NOAA's 3 km CONUS model, HRRR's
 # successor on Open-Meteo (HRRR is discontinued there end of Nov 2026); it's
@@ -833,6 +832,13 @@ def generate_mock_normals():
     return pd.DataFrame({"tmax": 72.0, "tmin": 58.0, "sd_max": 9.0, "sd_min": 8.0}, index=keys)
 
 
+def generate_mock_hourly_normals():
+    """Synthetic hourly normals for Dev Mode (same shape as fetch_hourly_normals)."""
+    idx = pd.date_range("2021-01-01", "2021-12-31 23:00", freq="h")
+    normal = 65 + 8 * np.sin((idx.hour.to_numpy() - 9) / 24 * 2 * np.pi)
+    return pd.DataFrame({"normal": normal, "p10": normal - 9, "p90": normal + 9}, index=idx.strftime("%m-%dT%H"))
+
+
 def generate_mock_drizzle_inputs():
     """Synthetic drizzle inputs for Dev Mode, shaped like fetch_drizzle_inputs():
     a shallow saturated layer with a subfreezing surface about 20-40 hours out."""
@@ -890,28 +896,39 @@ def normal_daily(normals, dates):
     return rows["tmax"].to_numpy(), rows["tmin"].to_numpy(), rows["sd_max"].to_numpy(), rows["sd_min"].to_numpy()
 
 
-def normal_curve(normals, times):
-    """Hourly normal temperature and standard deviation at station-local
-    `times`. NCEI gives only a daily normal high and low, so the curve runs
-    cosine-smoothly from each day's low (NORMAL_LOW_HOUR) to its high
-    (NORMAL_HIGH_HOUR) and down to the next low; the standard deviation is
-    blended the same way. An approximation of the daily cycle, exact at the
-    extremes. Returns (normal, sigma) arrays."""
-    times = pd.DatetimeIndex(times)
-    days = pd.date_range(times.min().normalize() - pd.Timedelta(days=1), times.max().normalize() + pd.Timedelta(days=1))
-    rows = normals.reindex(days.strftime("%m-%d")).ffill().bfill()
-    xs, ts, ss = [], [], []
-    for day, (_, r) in zip(days, rows.iterrows()):
-        xs += [day + pd.Timedelta(hours=NORMAL_LOW_HOUR), day + pd.Timedelta(hours=NORMAL_HIGH_HOUR)]
-        ts += [r["tmin"], r["tmax"]]
-        ss += [r["sd_min"], r["sd_max"]]
-    base = days[0]
-    hrs_x = np.array([(x - base) / pd.Timedelta(hours=1) for x in xs])
-    t_x = np.array((times - base) / pd.Timedelta(hours=1), dtype=float)
-    i = np.clip(np.searchsorted(hrs_x, t_x) - 1, 0, len(hrs_x) - 2)
-    w = (1 - np.cos(np.pi * np.clip((t_x - hrs_x[i]) / (hrs_x[i + 1] - hrs_x[i]), 0, 1))) / 2
-    ts, ss = np.array(ts), np.array(ss)
-    return ts[i] + (ts[i + 1] - ts[i]) * w, ss[i] + (ss[i + 1] - ss[i]) * w
+@st.cache_data(ttl=7 * 24 * 3600)
+def fetch_hourly_normals(ghcn_id):
+    """NCEI 1991-2020 hourly temperature normals for one station: DataFrame
+    indexed by "MM-DDTHH" with normal, p10 and p90 (the 10th and 90th
+    percentile of the hour's temperature, F). NCEI publishes no standard
+    deviation by hour. 365 days (no Feb 29). Raises on failure."""
+    res = requests.get("https://www.ncei.noaa.gov/access/services/data/v1", params={
+        "dataset": "normals-hourly-1991-2020", "stations": ghcn_id,
+        "startDate": "2020-01-01T00:00:00", "endDate": "2020-12-31T23:00:00",
+        "dataTypes": "HLY-TEMP-NORMAL,HLY-TEMP-10PCTL,HLY-TEMP-90PCTL",
+        "format": "json", "units": "standard"}, timeout=60)
+    res.raise_for_status()
+    rows = res.json()
+    if not rows:
+        raise ValueError(f"no hourly normals returned for {ghcn_id}")
+    df = pd.DataFrame(rows)
+    out = pd.DataFrame({
+        "normal": pd.to_numeric(df["HLY-TEMP-NORMAL"], errors="coerce").to_numpy(),
+        "p10": pd.to_numeric(df["HLY-TEMP-10PCTL"], errors="coerce").to_numpy(),
+        "p90": pd.to_numeric(df["HLY-TEMP-90PCTL"], errors="coerce").to_numpy(),
+    }, index=df["DATE"].str[:-6].to_numpy())  # "11-18T15:00:00" -> "11-18T15"
+    if out["normal"].isna().all():
+        raise ValueError("hourly normals are missing temperatures")
+    return out.sort_index()
+
+
+def normal_hourly(normals_hourly, times):
+    """Hourly normal and 10th/90th percentile at station-local `times`:
+    (normal, p10, p90) arrays. Feb 29 uses Feb 28's values."""
+    keys = [t.replace(day=28).strftime("%m-%dT%H") if (t.month == 2 and t.day == 29) else t.strftime("%m-%dT%H")
+            for t in pd.DatetimeIndex(times)]
+    rows = normals_hourly.reindex(keys)
+    return rows["normal"].to_numpy(), rows["p10"].to_numpy(), rows["p90"].to_numpy()
 
 
 def departure_chips_html(labels, values, normal, sigma):
@@ -1763,10 +1780,10 @@ with st.sidebar:
 
     # NCEI normals underlay: air temperature only, and only for stations that
     # have normals. Outside the form so it toggles instantly.
-    normals_df, show_normals = None, False
+    normals_df, normals_hourly, show_normals = None, None, False
     if view == "Forecast" and selected_var_key == "temperature_2m":
         if dev_mode:
-            normals_df = generate_mock_normals()
+            normals_df, normals_hourly = generate_mock_normals(), generate_mock_hourly_normals()
         elif loc_mode == "Airport Code" and airport_input in NORMALS_STATIONS:
             normals_df = True  # placeholder until the toggle is on (fetched below)
         if normals_df is not None:
@@ -1778,8 +1795,13 @@ with st.sidebar:
                 except Exception as e:
                     st.caption(f"NCEI normals unavailable: {e}")
                     show_normals = False
+                else:
+                    try:
+                        normals_hourly = fetch_hourly_normals(NORMALS_STATIONS[airport_input])
+                    except Exception as e:
+                        st.caption(f"NCEI hourly normals unavailable (daily charts still use normals): {e}")
     if not show_normals:
-        normals_df = None
+        normals_df, normals_hourly = None, None
     
     st.divider()
     if st.button("🔄 Force Clear Cache & Refresh", use_container_width=True):
@@ -1952,27 +1974,29 @@ if view == "Forecast":
     with tab1:
         fig_hourly = go.Figure()
 
-        if normals_df is not None:
-            # NCEI normal underlay: faint bands first so every line draws over them.
+        if normals_hourly is not None:
+            # NCEI hourly normal underlay (measured 1991-2020 hourly normals, not
+            # interpolated): a faint 10th-90th percentile band first so every
+            # line draws over it.
             n_times = pd.DatetimeIndex(sorted(df_det_active['time'].dt.floor('h').unique()))
-            n_norm, n_sig = normal_curve(normals_df, n_times)
+            n_norm, n_p10, n_p90 = normal_hourly(normals_hourly, n_times)
             ens_med = None
             if "Grand Ensemble" in hourly_summaries:
                 gs = hourly_summaries["Grand Ensemble"]
                 ens_med = pd.Series(gs['median'].values, index=gs['time'].dt.floor('h')).pipe(
                     lambda x: x[~x.index.duplicated()]).reindex(n_times).to_numpy()
-            for k, alpha in ((2, 0.07), (1, 0.12)):
-                fig_hourly.add_trace(go.Scatter(x=n_times, y=n_norm + k * n_sig, mode='lines', line=dict(width=0),
-                                                hoverinfo='skip', showlegend=False, legendgroup="normals"))
-                fig_hourly.add_trace(go.Scatter(x=n_times, y=n_norm - k * n_sig, mode='lines', line=dict(width=0), fill='tonexty',
-                                                fillcolor=f"rgba(128,128,128,{alpha})", name=f"Normal ±{k}σ", hoverinfo='skip',
-                                                legendgroup="normals"))
+            fig_hourly.add_trace(go.Scatter(x=n_times, y=n_p90, mode='lines', line=dict(width=0),
+                                            hoverinfo='skip', showlegend=False, legendgroup="normals"))
+            fig_hourly.add_trace(go.Scatter(x=n_times, y=n_p10, mode='lines', line=dict(width=0), fill='tonexty',
+                                            fillcolor="rgba(128,128,128,0.14)", name="Normal 10th–90th percentile",
+                                            hoverinfo='skip', legendgroup="normals"))
             dep = (ens_med - n_norm) if ens_med is not None else np.full(len(n_times), np.nan)
             fig_hourly.add_trace(go.Scatter(
                 x=n_times, y=n_norm, mode='lines', name="NCEI normal", legendgroup="normals",
                 line=dict(color="rgba(128,128,128,0.85)", width=1.5, dash='dot'),
-                customdata=np.c_[dep, dep / n_sig],
-                hovertemplate="<b>NCEI normal</b>: %{y:.0f} °F<br>Grand Ens. median vs. normal: %{customdata[0]:+.0f}° (%{customdata[1]:+.1f}σ)<extra></extra>"
+                customdata=np.c_[dep, n_p10, n_p90],
+                hovertemplate="<b>NCEI normal</b>: %{y:.0f} °F (10th–90th: %{customdata[1]:.0f}–%{customdata[2]:.0f})"
+                              "<br>Grand Ens. median vs. normal: %{customdata[0]:+.0f}°<extra></extra>"
             ))
     
         # Render all available operational deterministic models
@@ -2209,9 +2233,9 @@ if view == "Forecast":
             )
 
             color_by_departure = False
-            if normals_df is not None:
+            if normals_hourly is not None:
                 color_by_departure = st.radio(
-                    "Color cells by", ["Temperature", "Departure from normal (σ)"], horizontal=True, key="grid_color_mode"
+                    "Color cells by", ["Temperature", "Departure from normal (°F)"], horizontal=True, key="grid_color_mode"
                 ) != "Temperature"
             grid_start = station_now_local(dev_mode, utc_offset_seconds).floor('h')
 
@@ -2254,26 +2278,32 @@ if view == "Forecast":
                 show_spread = len(models) > 1
                 fig_grid = make_subplots(
                     rows=2 if show_spread else 1, cols=1, shared_xaxes=True,
-                    row_heights=[len(models) + (1 if normals_df is not None else 0), 1.2] if show_spread else [1],
+                    row_heights=[len(models) + (1 if normals_hourly is not None else 0), 1.2] if show_spread else [1],
                     vertical_spacing=0.04
                 )
-                # Optional NCEI normal row on top (same temperature scale), and an
-                # optional departure-from-normal (σ) coloring.
+                # Optional NCEI hourly-normal row on top (same temperature scale), and an
+                # optional departure-from-normal (°F) coloring.
                 z_show, y_show, hover_dep = z, models, None
                 z_color, scale, zmin, zmax, cbar_title = z, grid_cfg["colorscale"], None, None, unit
-                if normals_df is not None:
-                    n_row, n_sig = normal_curve(normals_df, pd.DatetimeIndex(times))
+                if normals_hourly is not None:
+                    n_row, n_p10, n_p90 = normal_hourly(normals_hourly, pd.DatetimeIndex(times))
                     z_show = np.vstack([n_row, z])
                     y_show = ["NCEI normal"] + models
                     z_color = z_show
-                    dev_sigma = (z_show - n_row) / n_sig
-                    hover_dep = [[f"{y_show[i]}<br>{times[j]:%a %b %d, %I:%M %p}<br><b>{z_show[i, j]:.0f} {unit}</b>"
-                                  + ("" if i == 0 else f"<br>Normal {n_row[j]:.0f} · {z_show[i, j] - n_row[j]:+.0f}° ({dev_sigma[i, j]:+.1f}σ)")
+                    dev = z_show - n_row
+
+                    def dep_note(i, j):
+                        if i == 0:
+                            return f"<br>10th–90th percentile: {n_p10[j]:.0f}–{n_p90[j]:.0f} {unit}"
+                        outside = " (outside the normal 10th–90th range)" if (z_show[i, j] < n_p10[j] or z_show[i, j] > n_p90[j]) else ""
+                        return f"<br>Normal {n_row[j]:.0f} · {dev[i, j]:+.0f}°{outside}"
+                    hover_dep = [[f"{y_show[i]}<br>{times[j]:%a %b %d, %I:%M %p}<br><b>{z_show[i, j]:.0f} {unit}</b>" + dep_note(i, j)
                                   for j in range(len(times))] for i in range(len(y_show))]
                     if color_by_departure:
-                        z_color = dev_sigma
+                        z_color = dev
                         scale = [[0, "#2166AC"], [0.25, "#92C5DE"], [0.5, "#F7F7F7"], [0.75, "#F4A582"], [1, "#B2182B"]]
-                        zmin, zmax, cbar_title = -2.5, 2.5, "σ vs. normal"
+                        lim = max(10.0, float(np.ceil(np.nanmax(np.abs(dev)) / 5) * 5))
+                        zmin, zmax, cbar_title = -lim, lim, "°F vs. normal"
                 if zmin is None:
                     zmin = grid_cfg.get("zmin", float(np.nanmin(z_color)))
                     zmax = max(float(np.nanmax(z_color)), float(grid_cfg.get("zmax_floor", -np.inf)))
@@ -2317,7 +2347,7 @@ if view == "Forecast":
                         )
 
                 fig_grid.update_layout(
-                    height=110 + 42 * (len(models) + (1 if show_spread else 0) + (1 if normals_df is not None else 0)) + 90,
+                    height=110 + 42 * (len(models) + (1 if show_spread else 0) + (1 if normals_hourly is not None else 0)) + 90,
                     margin=dict(l=10, r=10, t=20, b=10)
                 )
                 st.plotly_chart(fig_grid, use_container_width=True)
