@@ -2054,7 +2054,7 @@ if view == "Forecast":
         stats = grand_box_stats(df_days)
         return go.Box(
             x=list(df_days.index), name=name, marker_color=color, line=dict(width=2),
-            whiskerwidth=0.8, legendgroup=name, showlegend=showlegend, hoverinfo="y+name",
+            whiskerwidth=0.8, legendgroup=name, offsetgroup=name, showlegend=showlegend, hoverinfo="y+name",
             **stats
         )
 
@@ -2088,7 +2088,7 @@ if view == "Forecast":
                             y_vals.extend(vals)
                     fig.add_trace(go.Box(
                         x=x_vals, y=y_vals, name=ens_name, marker_color=color, line=dict(width=2),
-                        whiskerwidth=0.8, boxpoints='outliers', legendgroup=ens_name,
+                        whiskerwidth=0.8, boxpoints='outliers', legendgroup=ens_name, offsetgroup=ens_name,
                         showlegend=showlegend, hoverinfo="y+name"
                     ), row=row, col=1)
                 for det_col in daily_det.columns:
