@@ -197,12 +197,13 @@ NORMALS_STATIONS = {"KCMH": "USW00014821"}
 # optional, so the tab still works if it's unavailable.
 RRFS_SLUG = DET_MODEL_SLUGS["RRFS Operational"]
 HAZARD_HOURS = 72
+HAZARD_PAST_HOURS = 12  # hours of observations/recent model state shown before the latest observation
 FOG_TIERS = {
     "mist_mi": 3.0,             # visibility < 3 mi: mist (low)
-    "fog_mi": 1.0,              # < 1 mi: fog (high)
-    "dense_mi": 0.25,           # < 1/4 mi: dense fog (NWS Dense Fog Advisory)
+    "fog_mi": 1.0,              # <= 1 mi: fog (high)
+    "dense_mi": 0.25,           # <= 1/4 mi: dense fog (NWS Dense Fog Advisory)
     "pct_bands": (10, 30, 60),  # % of members/models -> low / moderate / high
-    "dense_member_pct": 30,     # GEFS: % of members < dense_mi -> dense likely
+    "dense_member_pct": 30,     # GEFS: % of members <= dense_mi -> dense likely
     "spread_f": 2.0,            # Signals: dew-point spread <= 2 F ...
     "wind_mph": 10.0,           # ... and wind <= 10 mph
     "radiation_wind_mph": 5.0,  # type: night + wind <= 5 mph -> radiation
@@ -439,9 +440,9 @@ def generate_mock_fog_inputs():
     """Synthetic fog inputs for Dev Mode, shaped like fetch_fog_inputs(): an
     overnight fog event roughly 30-40 hours out (dense in the middle)."""
     rng = np.random.RandomState(11)
-    times = pd.date_range(pd.Timestamp.now().floor('h'), periods=HAZARD_HOURS + 24, freq='h')
-    hours = np.arange(len(times))
-    dip = np.clip(1 - np.abs(hours - 35) / 6, 0, 1)  # 0..1 peak at hour 35
+    times = pd.date_range(pd.Timestamp.now().floor('h') - pd.Timedelta(hours=24), periods=HAZARD_HOURS + 48, freq='h')
+    hours = np.arange(len(times)) - 24  # hours from now
+    dip = np.maximum(np.clip(1 - np.abs(hours - 35) / 6, 0, 1), np.clip(1 - np.abs(hours + 4) / 3, 0, 1))  # fog ~35 h out, and a short one ~4 h ago
     base_vis = 10 - 9.9 * dip
 
     def vis_frame(cols, noise):
@@ -839,13 +840,22 @@ def generate_mock_hourly_normals():
     return pd.DataFrame({"normal": normal, "p10": normal - 9, "p90": normal + 9}, index=idx.strftime("%m-%dT%H"))
 
 
+def generate_mock_metar_history(now_hour):
+    """Synthetic hourly observations for Dev Mode (same shape as fetch_metar_history):
+    mist, drizzle and a short fog spell over the last 14 hours."""
+    hours = pd.date_range(now_hour - pd.Timedelta(hours=14), now_hour, freq='h')
+    wx = ["", "", "-RA BR", "BR", "BR", "-DZ BR", "-DZ BR", "FG", "FG", "-DZ FG", "BR", "-DZ BR", "-RA", "-RA BR", ""]
+    vis = [10, 10, 4, 2.5, 2, 1.5, 1, 0.5, 0.25, 0.125, 0.75, 3, 5, 4, 10]
+    return pd.DataFrame({"wx": wx, "vis": vis, "raw": "MOCK METAR (Dev Mode)"}, index=hours)
+
+
 def generate_mock_drizzle_inputs():
     """Synthetic drizzle inputs for Dev Mode, shaped like fetch_drizzle_inputs():
     a shallow saturated layer with a subfreezing surface about 20-40 hours out."""
     rng = np.random.RandomState(5)
-    times = pd.date_range(pd.Timestamp.now().floor('h'), periods=HAZARD_HOURS + 24, freq='h')
-    hours = np.arange(len(times))
-    event = ((hours >= 20) & (hours <= 40)).astype(float)
+    times = pd.date_range(pd.Timestamp.now().floor('h') - pd.Timedelta(hours=24), periods=HAZARD_HOURS + 48, freq='h')
+    hours = np.arange(len(times)) - 24  # hours from now
+    event = (((hours >= 20) & (hours <= 40)) | ((hours >= -5) & (hours <= -1))).astype(float)
 
     def member(skill):
         flip = rng.rand(len(times)) < skill  # chance this member agrees with the "truth" this hour
@@ -955,7 +965,19 @@ def visibility_to_miles(values, unit):
 
 
 def _fog_request(url, params):
-    res = requests.get(url, params=params, timeout=20)
+    # One retry after a short pause on a timeout or a 502/503/504 (Open-Meteo
+    # throws these now and then, especially on the heavier pressure-level requests).
+    for attempt in range(3):
+        try:
+            res = requests.get(url, params=params, timeout=20)
+            if res.status_code in (502, 503, 504) and attempt < 2:
+                time.sleep(2 + 2 * attempt)
+                continue
+            break
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 2:
+                raise
+            time.sleep(2 + 2 * attempt)
     res.raise_for_status()
     data = res.json()
     return data["hourly"], data.get("hourly_units", {})
@@ -968,7 +990,7 @@ FOG_DET_MODELS = {"GFS Operational": "gfs_seamless", "NBM Operational": "ncep_nb
 def _fetch_fog_det_cached(lat, lon):
     hourly, units = _fog_request("https://api.open-meteo.com/v1/forecast", {
         "latitude": lat, "longitude": lon, "hourly": "visibility,cloud_cover_low,is_day",
-        "models": ",".join(FOG_DET_MODELS.values()), "timezone": "auto", "forecast_days": 4
+        "models": ",".join(FOG_DET_MODELS.values()), "timezone": "auto", "past_days": 1, "forecast_days": 4
     })
     times = pd.to_datetime(hourly["time"])
     vis, low_cloud = pd.DataFrame({"time": times}), pd.DataFrame({"time": times})
@@ -990,7 +1012,7 @@ def _fetch_fog_det_cached(lat, lon):
 def _fetch_fog_rrfs_cached(lat, lon):
     hourly, units = _fog_request("https://api.open-meteo.com/v1/forecast", {
         "latitude": lat, "longitude": lon, "hourly": "visibility", "models": RRFS_SLUG,
-        "timezone": "auto", "forecast_days": 4
+        "timezone": "auto", "past_days": 1, "forecast_days": 4
     })
     if not any(v is not None for v in hourly.get("visibility", [])):
         raise ValueError("no RRFS visibility for this location")
@@ -1002,7 +1024,7 @@ def _fetch_fog_rrfs_cached(lat, lon):
 def _fetch_fog_gefs_cached(lat, lon):
     hourly, units = _fog_request("https://ensemble-api.open-meteo.com/v1/ensemble", {
         "latitude": lat, "longitude": lon, "hourly": "visibility", "models": "gfs_seamless",
-        "timezone": "auto", "forecast_days": 4
+        "timezone": "auto", "past_days": 1, "forecast_days": 4
     })
     vis = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
     for k, v in hourly.items():
@@ -1041,7 +1063,7 @@ def _fetch_drizzle_source_cached(lat, lon, slug, ensemble):
     url = "https://ensemble-api.open-meteo.com/v1/ensemble" if ensemble else "https://api.open-meteo.com/v1/forecast"
     hourly, _units = _fog_request(url, {
         "latitude": lat, "longitude": lon, "hourly": ",".join(names), "models": slug,
-        "temperature_unit": "fahrenheit", "precipitation_unit": "inch", "timezone": "auto", "forecast_days": 4
+        "temperature_unit": "fahrenheit", "precipitation_unit": "inch", "timezone": "auto", "past_days": 1, "forecast_days": 4
     })
     # Single-model responses use bare names; ensemble members add "_memberNN".
     suffixes = [k[len("temperature_2m"):] for k in hourly if k == "temperature_2m" or k.startswith("temperature_2m_member")]
@@ -1442,11 +1464,188 @@ def run_forecast_value(df_runs, target_day, run_day, today, how):
     return at_hour.mean() if not at_hour.empty else np.nan
 
 
+def parse_visibility_mi(v):
+    """Statute miles from aviationweather.gov's visib value: a number, or text
+    such as "10+", "1 1/2", "1/4" or "M1/4" (less than 1/4: counted as 1/4)."""
+    if v is None:
+        return np.nan
+    if isinstance(v, (int, float)):
+        return float(v)
+    text = str(v).strip().lstrip("MP").rstrip("+")
+    try:
+        total = 0.0
+        for part in text.split():
+            if "/" in part:
+                num, den = part.split("/")
+                total += float(num) / float(den)
+            else:
+                total += float(part)
+        return total
+    except ValueError:
+        return np.nan
+
+
+@st.cache_data(ttl=600)
+def _fetch_metar_history_cached(code, hours):
+    res = requests.get("https://aviationweather.gov/api/data/metar",
+                       params={"ids": code, "format": "json", "hours": hours}, timeout=15)
+    res.raise_for_status()
+    data = res.json()
+    if not isinstance(data, list) or not data:
+        raise ValueError("no recent observations")
+    return data
+
+
+def fetch_metar_history(code, utc_offset_seconds, hours=HAZARD_PAST_HOURS + 6):
+    """Recent METARs/SPECIs for a station, one row per station-local hour:
+    (DataFrame indexed by hour with wx (present weather), vis (statute miles,
+    lowest report in the hour) and raw (latest report), error). Reports are
+    placed by their report time, so a routine :51 ob belongs to the next hour,
+    as in the hourly METAR convention. Failures return (None, message)."""
+    try:
+        data = _fetch_metar_history_cached(code.strip().upper(), hours)
+        rows = []
+        for ob in data:
+            if ob.get("reportTime"):
+                t = pd.to_datetime(ob["reportTime"], utc=True).tz_localize(None)
+            elif ob.get("obsTime") is not None:
+                t = pd.to_datetime(ob["obsTime"], unit="s")
+            else:
+                continue
+            rows.append((t + pd.Timedelta(seconds=utc_offset_seconds), (ob.get("wxString") or "").strip(),
+                         parse_visibility_mi(ob.get("visib")), ob.get("rawOb") or ""))
+        rows.sort(key=lambda r: r[0])
+        by_hour = {}
+        for t, wx, vis, raw in rows:
+            h = t.floor("h")
+            cur = by_hour.setdefault(h, {"wx": [], "vis": np.nan, "raw": ""})
+            cur["wx"] += [w for w in wx.split() if w not in cur["wx"]]
+            cur["vis"] = vis if np.isnan(cur["vis"]) else (cur["vis"] if np.isnan(vis) else min(cur["vis"], vis))
+            cur["raw"] = raw
+        if not by_hour:
+            raise ValueError("no usable observations")
+        return pd.DataFrame({h: {"wx": " ".join(v["wx"]), "vis": v["vis"], "raw": v["raw"]} for h, v in by_hour.items()}).T.sort_index(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def observed_level(kind, wx, vis_mi):
+    """Level of one observed hour on the tab's scale. Fog uses the same
+    visibility tiers as the forecast rows (<= 1/4 mi dense, <= 1 mi fog,
+    < 3 mi mist); drizzle / freezing drizzle: 2 = reported (DZ / FZDZ),
+    1 = other weather reported, 0 = none."""
+    if kind == "fog":
+        if vis_mi is None or np.isnan(vis_mi):
+            return 0.0
+        return float(4 if vis_mi <= FOG_TIERS["dense_mi"] else 3 if vis_mi <= FOG_TIERS["fog_mi"]
+                     else 1 if vis_mi < FOG_TIERS["mist_mi"] else 0)
+    tokens = wx.split()
+    target = "FZDZ" if kind == "fzdz" else "DZ"
+    if any(target in t for t in tokens):
+        return 2.0
+    return 1.0 if tokens else 0.0
+
+
+def build_observed_row(kind, window, anchor, obs):
+    """The Observed (METAR) row for every column up to and including the
+    anchor hour: {"x", "z", "text", "hover"}. z = -1 where no observation
+    exists for that hour."""
+    codes = ("FZDZ", "DZ", "FZRA", "SN", "RA", "PL", "FG", "BR", "HZ")
+    out = {"x": [], "z": [], "text": [], "hover": []}
+    for t in [t for t in window if t <= anchor]:
+        out["x"].append(t)
+        if obs is not None and t in obs.index:
+            r = obs.loc[t]
+            vis = r["vis"]
+            out["z"].append(observed_level(kind, r["wx"], vis))
+            out["text"].append(next((c for c in codes if any(c in tok for tok in r["wx"].split())), ""))
+            vis_txt = "—" if vis is None or np.isnan(vis) else (f"{vis:g}+" if vis >= 10 else f"{vis:g}") + " mi"
+            out["hover"].append(f"<b>Observed (METAR)</b> · {t:%a %b %d %I %p}<br>Weather: {r['wx'] or 'none reported'}"
+                                f"<br>Visibility: {vis_txt}<br>{r['raw']}")
+        else:
+            out["z"].append(-1.0)
+            out["text"].append("")
+            out["hover"].append(f"<b>Observed (METAR)</b> · {t:%a %b %d %I %p}<br>no observation this hour")
+    return out
+
+
+def observed_summary(word, observed, overall, hit_level):
+    """One line comparing the observed hours with the model Overall row: how
+    many observed hours reported the hazard, and how many of those the
+    Overall row flagged (Low or higher)."""
+    z = np.array(observed["z"], dtype=float)
+    seen = z >= 0
+    hits = seen & (z >= hit_level)
+    if not seen.any():
+        return ""
+    if not hits.any():
+        return f"No {word} reported in the {int(seen.sum())} observed hours shown."
+    over = np.nan_to_num(np.asarray(overall, dtype=float)[:len(z)], nan=0.0)
+    return (f"METAR reported {word} in {int(hits.sum())} of {int(seen.sum())} observed hours shown; "
+            f"the Overall row flagged {int((hits & (over >= 1)).sum())} of those (Low or higher).")
+
+
+def render_hazard_heatmap(window, anchor, anchor_label, labels, z, hover, steps, level_names, cbar_title,
+                          cell_text=None, observed=None, obs_steps=None, obs_dark_from=None):
+    """Hazard heatmap shared by the Fog, Drizzle and Freezing Drizzle tabs:
+    model rows over `window`, an optional Observed (METAR) row on top for the
+    hours up to the anchor (the latest observation hour, also the first
+    forecast hour), a shaded past, and a dashed line at the anchor."""
+    def discrete(colors, lo=0):
+        scale = []
+        for i, c in enumerate(colors):
+            scale += [(i / len(colors), c), ((i + 1) / len(colors), c)]
+        return scale
+
+    two = observed is not None
+    fig = make_subplots(rows=2 if two else 1, cols=1, shared_xaxes=True,
+                        row_heights=[1.0, float(len(labels))] if two else [1.0], vertical_spacing=0.03)
+    main_row = 2 if two else 1
+    extra = {"text": cell_text, "texttemplate": "%{text}", "textfont": dict(size=11)} if cell_text is not None else {}
+    fig.add_trace(go.Heatmap(
+        z=z, x=window, y=labels, zmin=-0.5, zmax=len(steps) - 0.5, colorscale=discrete(steps), xgap=1, ygap=3,
+        customdata=hover, hovertemplate="%{customdata}<extra></extra>",
+        colorbar=dict(tickvals=list(range(len(steps))), ticktext=level_names, title=cbar_title,
+                      **(dict(len=0.8, y=0, yanchor="bottom") if two else {})),
+        **extra
+    ), row=main_row, col=1)
+    if two:
+        # Level -1 (no observation that hour) is transparent.
+        fig.add_trace(go.Heatmap(
+            z=[observed["z"]], x=observed["x"], y=["Observed (METAR)"], zmin=-1.5, zmax=len(obs_steps) - 0.5,
+            colorscale=discrete(["rgba(0, 0, 0, 0)"] + list(obs_steps)), showscale=False, xgap=1, ygap=3,
+            text=[observed["text"]], texttemplate="%{text}", textfont=dict(size=8),
+            customdata=[observed["hover"]], hovertemplate="%{customdata}<extra></extra>"
+        ), row=1, col=1)
+        for t, lvl, txt in zip(observed["x"], observed["z"], observed["text"]):
+            if txt and lvl >= obs_dark_from:  # white label on the dark cells
+                fig.add_annotation(x=t, y="Observed (METAR)", text=txt, showarrow=False, font=dict(color="white", size=8), row=1, col=1)
+        fig.update_xaxes(showticklabels=False, row=1, col=1)
+    fig.add_vrect(x0=window[0] - pd.Timedelta(minutes=30), x1=anchor, fillcolor="rgba(128, 128, 128, 0.07)",
+                  line_width=0, layer="below", row="all", col=1)
+    fig.add_shape(type="line", xref="x", yref="paper", x0=anchor, x1=anchor, y0=0, y1=1,
+                  line=dict(color="rgba(128, 128, 128, 1)", width=2, dash="dash"))
+    fig.add_annotation(x=anchor, y=1.0, yref="paper", text=f"◀ past  |  {anchor_label}  |  forecast ▶",
+                       showarrow=False, yanchor="bottom", font=dict(size=12))
+    for t in window:
+        if t.hour == 0 and t != window[0]:
+            edge = t - pd.Timedelta(minutes=30)
+            fig.add_shape(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
+                          line=dict(color="rgba(128, 128, 128, 0.9)", width=2))
+    fig.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(size=13))
+    fig.update_xaxes(tickformat="%a %m/%d %I%p", dtick=6 * 3600 * 1000, tickangle=-45, showgrid=False,
+                     automargin=True, row=main_row, col=1)
+    fig.update_layout(height=140 + 55 * (len(labels) + (1 if two else 0)), margin=dict(l=10, r=10, t=36, b=10))
+    return fig
+
+
 def vis_level(vis_mi):
     """Fog level per hour from a visibility series (miles): >= 3 mi none,
-    mist low, fog high, dense fog dense likely. NaN stays NaN."""
+    < 3 mi mist (low), <= 1 mi fog (high), <= 1/4 mi dense fog (dense likely).
+    The fog and dense limits are inclusive, like the NWS definitions and the
+    discrete METAR visibility steps. NaN stays NaN."""
     v = np.asarray(vis_mi, dtype=float)
-    lvl = np.where(v < FOG_TIERS["dense_mi"], 4, np.where(v < FOG_TIERS["fog_mi"], 3,
+    lvl = np.where(v <= FOG_TIERS["dense_mi"], 4, np.where(v <= FOG_TIERS["fog_mi"], 3,
                    np.where(v < FOG_TIERS["mist_mi"], 1, 0))).astype(float)
     return np.where(np.isnan(v), np.nan, lvl)
 
@@ -1514,11 +1713,11 @@ def build_fog_rows(window, fog, dict_det, dict_ens):
         cols = [c for c in gv.columns if c != 'time']
         mat = np.vstack([_on_window(gv, c, window) for c in cols])
         n_valid = (~np.isnan(mat)).sum(axis=0)
-        ev["gefs_fog"] = (mat < FOG_TIERS["fog_mi"]).sum(axis=0)
+        ev["gefs_fog"] = (mat <= FOG_TIERS["fog_mi"]).sum(axis=0)
         ev["gefs_n"] = n_valid
         with np.errstate(invalid="ignore", divide="ignore"):
             pct_fog = np.where(n_valid > 0, 100 * ev["gefs_fog"] / n_valid, np.nan)
-            pct_dense = np.where(n_valid > 0, 100 * (mat < FOG_TIERS["dense_mi"]).sum(axis=0) / n_valid, np.nan)
+            pct_dense = np.where(n_valid > 0, 100 * (mat <= FOG_TIERS["dense_mi"]).sum(axis=0) / n_valid, np.nan)
         lvl = pct_level(pct_fog)
         rows["GEFS %"] = np.where(pct_dense >= FOG_TIERS["dense_member_pct"], 4, lvl)
     if "RRFS" in fog:
@@ -2468,17 +2667,33 @@ if view == "Forecast":
 
 if view == "Hazards":
     # --- HAZARDS VIEW: FOG TAB ---
+    # Shared timeline for all three tabs: 12 h back from the latest observation
+    # hour (which is also the first forecast column) and HAZARD_HOURS ahead.
+    now_hour = station_now_local(dev_mode, utc_offset_seconds).floor('h')
+    obs_df, obs_err = None, None
+    if dev_mode:
+        obs_df = generate_mock_metar_history(now_hour)
+    elif loc_mode == "Airport Code":
+        obs_df, obs_err = fetch_metar_history(airport_input, utc_offset_seconds)
+    else:
+        obs_err = "the Observed row needs an airport code"
+    has_obs = obs_df is not None and len(obs_df) > 0
+    anchor = obs_df.index.max() if has_obs else now_hour
+    anchor_label = f"latest obs {anchor:%I %p}" if has_obs else f"now {anchor:%I %p}"
+    window = pd.date_range(anchor - pd.Timedelta(hours=HAZARD_PAST_HOURS), anchor + pd.Timedelta(hours=HAZARD_HOURS), freq='h')
+    ai = HAZARD_PAST_HOURS  # index of the anchor column; forecast periods are listed from here on
+    past_note = ("Columns before the dashed line show each model's most recent run (not the forecast made earlier). "
+                 "The Observed row is the station's METARs: " if has_obs else "")
     fog_tab, drizzle_tab, fzdz_tab = st.tabs(["🌫️ Fog", "🌦️ Drizzle", "🧊 Freezing Drizzle"])
     with fog_tab:
-        st.subheader(f"Fog Potential — next {HAZARD_HOURS} h")
+        st.subheader(f"Fog Potential — {HAZARD_PAST_HOURS} h back, next {HAZARD_HOURS} h")
         st.caption(
-            f"Visibility tiers: mist < {FOG_TIERS['mist_mi']:g} mi, fog < {FOG_TIERS['fog_mi']:g} mi, "
-            f"dense < {FOG_TIERS['dense_mi']:g} mi (NWS Dense Fog Advisory). "
+            f"Visibility tiers: mist < {FOG_TIERS['mist_mi']:g} mi, fog ≤ {FOG_TIERS['fog_mi']:g} mi, "
+            f"dense ≤ {FOG_TIERS['dense_mi']:g} mi (NWS Dense Fog Advisory). "
             f"GEFS % = share of members with fog; Signals = share of models/members with dew-point spread ≤ "
             f"{FOG_TIERS['spread_f']:g}°F and wind ≤ {FOG_TIERS['wind_mph']:g} mph (each model family an equal share). "
             "Overall = average of the rows; dense only when two rows agree."
         )
-        window = pd.date_range(station_now_local(dev_mode, utc_offset_seconds).floor('h'), periods=HAZARD_HOURS, freq='h')
         fog_rows, fog_ev = build_fog_rows(window, fog_inputs, dict_det, dict_ens)
         missing_rows = [r for r in ("NBM vis", "GEFS %", "RRFS vis", "Signals") if r not in fog_rows]
         if not fog_rows:
@@ -2506,7 +2721,7 @@ if view == "Hazards":
                     if "rrfs_vis" in fog_ev:
                         parts.append(f"RRFS vis: {fmt(fog_ev['rrfs_vis'][i], '.2f', ' mi')}")
                     if "gefs_n" in fog_ev and fog_ev["gefs_n"][i]:
-                        parts.append(f"GEFS: {int(fog_ev['gefs_fog'][i])} of {int(fog_ev['gefs_n'][i])} members < {FOG_TIERS['fog_mi']:g} mi")
+                        parts.append(f"GEFS: {int(fog_ev['gefs_fog'][i])} of {int(fog_ev['gefs_n'][i])} members ≤ {FOG_TIERS['fog_mi']:g} mi")
                     if fog_ev.get("type") and fog_ev["type"][i]:
                         parts.append(f"Likely type: {fog_ev['type'][i]}")
                     row_text.append("<br>".join(parts))
@@ -2514,29 +2729,19 @@ if view == "Hazards":
             cell_text = [[(fog_ev["type"][i][:1] if r == "Overall" and fog_ev.get("type") and fog_ev["type"][i] not in ("", "Unclear") else "")
                           for i in range(len(window))] for r in labels]
 
-            # Discrete 5-step scale: none (faint gray) -> dense (deep red).
+            # Discrete 5-step scale: none (faint gray) -> dense (deep red). The
+            # Observed row uses the same scale, from METAR visibility.
             steps = ["rgba(128, 128, 128, 0.12)", "#FFE08A", "#FDAE61", "#F46D43", "#B2182B"]
-            colorscale = []
-            for k, c in enumerate(steps):
-                colorscale += [(k / len(steps), c), ((k + 1) / len(steps), c)]
-            fig_fog = go.Figure(go.Heatmap(
-                z=z, x=window, y=labels, zmin=-0.5, zmax=4.5, colorscale=colorscale, xgap=1, ygap=3,
-                customdata=hover, hovertemplate="%{customdata}<extra></extra>",
-                text=cell_text, texttemplate="%{text}", textfont=dict(size=11),
-                colorbar=dict(tickvals=list(range(5)), ticktext=FOG_LEVELS, title="Fog")
-            ))
-            for t in window:
-                if t.hour == 0 and t != window[0]:
-                    edge = t - pd.Timedelta(minutes=30)
-                    fig_fog.add_shape(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
-                                      line=dict(color="rgba(128, 128, 128, 0.9)", width=2))
-            fig_fog.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(size=13))
-            fig_fog.update_xaxes(tickformat="%a %m/%d %I%p", dtick=6 * 3600 * 1000, tickangle=-45, showgrid=False, automargin=True)
-            fig_fog.update_layout(height=140 + 55 * len(labels), margin=dict(l=10, r=10, t=10, b=10))
+            observed = build_observed_row("fog", window, anchor, obs_df) if has_obs else None
+            fig_fog = render_hazard_heatmap(window, anchor, anchor_label, labels, z, hover, steps, FOG_LEVELS, "Fog",
+                                            cell_text=cell_text, observed=observed, obs_steps=steps, obs_dark_from=3)
             st.plotly_chart(fig_fog, use_container_width=True)
             st.caption("Overall row letters: R = likely radiation fog (night, light wind), A = likely advection fog (5–15 mph).")
 
-            episodes = fog_episodes(window, fog_rows["Overall"], fog_ev.get("type", [""] * len(window)))
+            if has_obs:
+                st.caption(past_note + "fog colors use the forecast scale (dense ≤ ¼ mi, fog ≤ 1 mi, mist < 3 mi). "
+                           + observed_summary("fog (visibility ≤ 1 mi)", observed, fog_rows["Overall"][:ai + 1], 3))
+            episodes = fog_episodes(window[ai:], fog_rows["Overall"][ai:], fog_ev.get("type", [""] * len(window))[ai:])
             if episodes:
                 st.markdown("**Fog potential periods**")
                 for start, end, peak, kind in episodes:
@@ -2550,6 +2755,8 @@ if view == "Hazards":
             notes.append(f"Not shown (no data for this location/time): {', '.join(missing_rows)}.")
         if fog_errors:
             notes.append("Source errors: " + "; ".join(fog_errors))
+        if obs_err and not has_obs:
+            notes.append(f"Observations unavailable: {obs_err}.")
         if notes:
             st.caption(" ".join(notes))
         st.caption(
@@ -2561,7 +2768,7 @@ if view == "Hazards":
     def render_drizzle_tab(kind):
         T = DRIZZLE_TIERS
         freezing = kind == "fzdz"
-        st.subheader(f"{'Freezing Drizzle' if freezing else 'Drizzle'} Potential — next {HAZARD_HOURS} h")
+        st.subheader(f"{'Freezing Drizzle' if freezing else 'Drizzle'} Potential — {HAZARD_PAST_HOURS} h back, next {HAZARD_HOURS} h")
         criteria = (
             f"Each model/member says yes when: RH ≥ {T['sat_rh']:g}% somewhere between the surface and {T['low_top_hpa']} mb, "
             f"RH < {T['aloft_rh']:g}% at 800/700 mb (no deep moisture, so no ice), and model precip ≤ {T['max_precip_in']:g} in/h"
@@ -2572,7 +2779,6 @@ if view == "Hazards":
             criteria + ". Deterministic rows (GFS, ECMWF, RRFS) are yes/no; EPS/AIFS/GEFS rows are the share of members "
             "saying yes. Overall = average of the rows."
         )
-        window = pd.date_range(station_now_local(dev_mode, utc_offset_seconds).floor('h'), periods=HAZARD_HOURS, freq='h')
         rows, hover_by_row = build_drizzle_rows(window, drizzle_inputs, kind)
         if not rows:
             st.info("No low-level profile data is available for this location right now.")
@@ -2582,26 +2788,18 @@ if view == "Hazards":
             hover = [hover_by_row[r] for r in labels]
             steps = (["rgba(128, 128, 128, 0.12)", "#F3C9DD", "#DF65B0", "#980043"] if freezing
                      else ["rgba(128, 128, 128, 0.12)", "#C6DBEF", "#6BAED6", "#08519C"])
-            colorscale = []
-            for k, c in enumerate(steps):
-                colorscale += [(k / len(steps), c), ((k + 1) / len(steps), c)]
-            fig = go.Figure(go.Heatmap(
-                z=z, x=window, y=labels, zmin=-0.5, zmax=3.5, colorscale=colorscale, xgap=1, ygap=3,
-                customdata=hover, hovertemplate="%{customdata}<extra></extra>",
-                colorbar=dict(tickvals=list(range(4)), ticktext=DRIZZLE_LEVELS, title="Freezing drizzle" if freezing else "Drizzle")
-            ))
-            for t in window:
-                if t.hour == 0 and t != window[0]:
-                    edge = t - pd.Timedelta(minutes=30)
-                    fig.add_shape(type="line", xref="x", yref="paper", x0=edge, x1=edge, y0=0, y1=1,
-                                  line=dict(color="rgba(128, 128, 128, 0.9)", width=2))
-            fig.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(size=13))
-            fig.update_xaxes(tickformat="%a %m/%d %I%p", dtick=6 * 3600 * 1000, tickangle=-45, showgrid=False, automargin=True)
-            fig.update_layout(height=140 + 55 * len(labels), margin=dict(l=10, r=10, t=10, b=10))
+            dark = "#4A0D2B" if freezing else "#0B2545"
+            observed = build_observed_row(kind, window, anchor, obs_df) if has_obs else None
+            fig = render_hazard_heatmap(window, anchor, anchor_label, labels, z, hover, steps, DRIZZLE_LEVELS,
+                                        "Freezing drizzle" if freezing else "Drizzle", observed=observed,
+                                        obs_steps=["rgba(128, 128, 128, 0.12)", "#E9D8A6", dark], obs_dark_from=2)
             st.plotly_chart(fig, use_container_width=True)
 
-            episodes = fog_episodes(window, rows["Overall"], [""] * len(window))
             word = "freezing drizzle" if freezing else "drizzle"
+            if has_obs:
+                st.caption(past_note + f"dark = {'FZDZ' if freezing else 'DZ'} reported, tan = other weather reported, gray = none. "
+                           + observed_summary(f"{'FZDZ' if freezing else 'DZ'} ({word})", observed, rows["Overall"][:ai + 1], 2))
+            episodes = fog_episodes(window[ai:], rows["Overall"][ai:], [""] * (len(window) - ai))
             if episodes:
                 st.markdown(f"**{word.capitalize()} potential periods**")
                 for start, end, peak, _kind in episodes:
@@ -2612,6 +2810,8 @@ if view == "Hazards":
         notes = []
         if drizzle_errors:
             notes.append("Source errors: " + "; ".join(drizzle_errors))
+        if obs_err and not has_obs:
+            notes.append(f"Observations unavailable: {obs_err}.")
         if not dev_mode:
             notes.append("RRFS and GFS resolve 975/950/900 mb; ECMWF and the ensembles only 1000/925/850/700 mb, "
                          "so their shallow layers are crude (RRFS is also limited to its first ~3.5 days).")
