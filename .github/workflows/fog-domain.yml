@@ -48,8 +48,10 @@ jobs:
       - name: Fetch the currently published files (if any)
         run: |
           mkdir out
-          if git ls-remote --exit-code --heads origin fog-domain > /dev/null; then
-            git fetch --depth=1 origin fog-domain
+          # Full ref name: a bare "fog-domain" also matches other branches that end in
+          # /fog-domain (such as claude/fog-domain), which made this step fail.
+          if git ls-remote --exit-code --heads origin refs/heads/fog-domain > /dev/null; then
+            git fetch --depth=1 origin refs/heads/fog-domain
             git --work-tree=out checkout FETCH_HEAD -- .
           fi
 
