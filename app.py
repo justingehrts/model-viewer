@@ -211,21 +211,30 @@ FOG_TIERS = {
 }
 FOG_LEVELS = ["None", "Low", "Moderate", "High", "Dense likely"]
 
-# Hazards view: drizzle and freezing drizzle. Drizzle falls from a shallow,
-# saturated layer with little or no deep moisture above it (no ice crystals
-# to grow into snow/rain), and only a little model QPF. Freezing drizzle also
-# needs a subfreezing surface and a cloud top warmer than about -10 C, where
-# ice nuclei are scarce and the cloud stays liquid. Each model/member is a
-# yes/no per hour; ensembles show the share of members that say yes.
+# Hazards view: drizzle and freezing drizzle, scored as an ingredient ladder
+# calibrated on four winters (Oct 2022 - Nov 2026) of GFS profiles vs. KCMH
+# METAR present weather (and, for freezing drizzle, five Midwest stations).
+# What separates drizzle hours from the rest is a saturated surface (2 m
+# temperature within ~2 F of the dew point), a moist low deck (925/850 mb RH)
+# and light model QPF -- not shallow-cloud/dry-air-aloft: ~64% of observed
+# drizzle hours had RH >= 85% at 700 mb. Model QPF is zero in ~89% of them, so it
+# only rules out real rain/snow. Each model or member gets a tier 0-3 per hour.
 DRIZZLE_TIERS = {
-    "sat_rh": 90.0,             # saturated: RH >= 90% on a level between the surface and low_top_hpa
-    "low_top_hpa": 850,         # ... the saturated layer must be below this level
-    "aloft_rh": 85.0,           # no deep moisture: RH < 85% at 800 and 700 mb (where the model has them)
-    "max_precip_in": 0.04,      # light QPF only (in/hr); heavier is rain/snow, not drizzle
-    "fz_sfc_f": 32.0,           # freezing drizzle: 2 m temperature <= 32 F ...
-    "fz_top_c": -10.0,          # ... and saturated-layer top warmer than -10 C
-    "pct_bands": (10, 30, 60),  # % of members -> low / moderate / high
+    "spread_f": 2.0, "spread_tight_f": 1.5,  # 2 m temperature minus dew point
+    "rh_low": 95.0,                          # RH at 925 mb (900/850 where 925 is below ground)
+    "rh_mid": 90.0, "rh_mid_tight": 95.0,    # RH at 850 mb (800 where 850 is below ground)
+    "near_sfc_rh": 90.0,                     # RH at 975/950 mb (GFS and RRFS only)
+    "light_precip_in": 0.02,                 # light model QPF (in/h)
+    "sat_rh": 90.0, "low_base_hpa": 850,     # saturated column: from the lowest saturated level >= 850 mb upward
+    "fz_sfc_f": 33.0,                        # freezing drizzle: 2 m temp <= 33 F (models run ~1 F warm near freezing) ...
+    "fz_warm_top_c": -5.0, "fz_cold_top_c": -10.0,  # ... graded by the temperature at the top of the saturated column
 }
+# Chance that METAR reports drizzle in an hour at each tier (KCMH, 4 winters, GFS).
+DRIZZLE_PROB = (0.002, 0.03, 0.12, 0.23)
+# Relative weights for freezing drizzle tiers, used only to average ensemble members
+# and rows (FZDZ is too rare at KCMH for absolute chances; see FZDZ_WEIGHT note).
+FZDZ_WEIGHT = (0.002, 0.03, 0.08, 0.28)
+PROB_BANDS = (0.01, 0.06, 0.15)  # mean chance -> Low / Moderate / High
 DRIZZLE_LEVELS = ["None", "Low", "Moderate", "High"]
 # Pressure levels each source returns on Open-Meteo (checked live at KCMH).
 # RRFS and GFS have the finest low-level spacing; ensembles only 925/850/700.
@@ -851,7 +860,7 @@ def generate_mock_metar_history(now_hour):
 
 def generate_mock_drizzle_inputs():
     """Synthetic drizzle inputs for Dev Mode, shaped like fetch_drizzle_inputs():
-    a shallow saturated layer with a subfreezing surface about 20-40 hours out."""
+    a saturated low layer with a subfreezing surface about 20-40 hours out (and a short one ~3 h ago)."""
     rng = np.random.RandomState(5)
     times = pd.date_range(pd.Timestamp.now().floor('h') - pd.Timedelta(hours=24), periods=HAZARD_HOURS + 48, freq='h')
     hours = np.arange(len(times)) - 24  # hours from now
@@ -860,11 +869,11 @@ def generate_mock_drizzle_inputs():
     def member(skill):
         flip = rng.rand(len(times)) < skill  # chance this member agrees with the "truth" this hour
         on = np.where(flip, event, 1 - event) if skill < 1 else event
-        m = {"t2m": np.where(on > 0, 29.0, 38.0) + rng.normal(0, 1, len(times)),
-             "precip": np.where(on > 0, 0.01, 0.0), "sfc_p": np.full(len(times), 985.0)}
+        t2 = np.where(on > 0, 29.0, 38.0) + rng.normal(0, 1, len(times))
+        m = {"t2m": t2, "td2m": t2 - np.where(on > 0, 1.0, 8.0), "precip": np.where(on > 0, 0.01, 0.0), "sfc_p": np.full(len(times), 985.0)}
         for p in DRIZZLE_DET_LEVELS:
-            m[f"rh{p}"] = np.where(on > 0, 96.0, 60.0) if p >= 850 else np.full(len(times), 55.0)
-            m[f"t{p}"] = 29.0 - (1000 - p) * 0.08 + np.where(on > 0, 0, 3) + 0 * hours
+            m[f"rh{p}"] = np.where(on > 0, 97.0, 60.0) if p >= 850 else np.full(len(times), 55.0)
+            m[f"t{p}"] = 29.0 - (1000 - p) * 0.02 + np.where(on > 0, 0, 3) + 0 * hours
         return m
 
     out = {}
@@ -1053,12 +1062,12 @@ def fetch_fog_inputs(lat, lon):
 @st.cache_data(ttl=3600)
 def _fetch_drizzle_source_cached(lat, lon, slug, ensemble):
     """One model's low-level profile for the drizzle/freezing-drizzle tabs:
-    {"time": DatetimeIndex, "members": {id: {"t2m", "precip", "sfc_p", "t<p>", "rh<p>": array}}}.
+    {"time": DatetimeIndex, "members": {id: {"t2m", "td2m", "precip", "sfc_p", "t<p>", "rh<p>": array}}}.
     Temperatures in F, precipitation in inches/hr. One request per source so
     one failure doesn't take the others down; failures are never cached."""
     t_levels = DRIZZLE_ENS_T_LEVELS if ensemble else DRIZZLE_DET_LEVELS
     rh_levels = DRIZZLE_ENS_RH_LEVELS if ensemble else DRIZZLE_DET_LEVELS
-    names = ["temperature_2m", "precipitation", "surface_pressure"] \
+    names = ["temperature_2m", "dew_point_2m", "precipitation", "surface_pressure"] \
         + [f"temperature_{p}hPa" for p in t_levels] + [f"relative_humidity_{p}hPa" for p in rh_levels]
     url = "https://ensemble-api.open-meteo.com/v1/ensemble" if ensemble else "https://api.open-meteo.com/v1/forecast"
     hourly, _units = _fog_request(url, {
@@ -1072,7 +1081,7 @@ def _fetch_drizzle_source_cached(lat, lon, slug, ensemble):
         def arr(name):
             vals = hourly.get(f"{name}{sfx}")
             return None if vals is None else pd.to_numeric(pd.Series(vals), errors="coerce").to_numpy(dtype=float)
-        m = {"t2m": arr("temperature_2m"), "precip": arr("precipitation"), "sfc_p": arr("surface_pressure")}
+        m = {"t2m": arr("temperature_2m"), "td2m": arr("dew_point_2m"), "precip": arr("precipitation"), "sfc_p": arr("surface_pressure")}
         for p in t_levels:
             m[f"t{p}"] = arr(f"temperature_{p}hPa")
         for p in rh_levels:
@@ -1812,95 +1821,128 @@ def _hourly_on(times, values, window):
     return s[~s.index.duplicated()].reindex(window).to_numpy()
 
 
-def drizzle_flags(member, times, window):
-    """Drizzle and freezing-drizzle yes/no per hour for one model or member.
-    Returns dict of arrays: drizzle, fzdz (1.0 / 0.0 / NaN where the profile
-    is missing), plus evidence: sat, deep, top_c (top of the saturated low
-    layer, C), t2m, precip. Levels below ground (pressure above surface
-    pressure) are ignored."""
+def _first_valid(*arrs):
+    """Element-wise first non-NaN across arrays."""
+    out = np.array(arrs[0], dtype=float)
+    for a in arrs[1:]:
+        out = np.where(np.isnan(out), a, out)
+    return out
+
+
+def drizzle_tiers(member, times, window):
+    """Drizzle and freezing-drizzle tiers (0 none ... 3 high) per hour for one
+    model or member, plus the evidence behind them.
+
+    Drizzle: 3 = 2 m spread <= 1.5 F, RH >= 95% at 925 and 850 mb, light QPF;
+    2 = spread <= 2 F, RH >= 95% at 925 and >= 90% at 850 mb, light QPF;
+    1 = spread <= 2 F or RH >= 90% at 975/950 mb, with light QPF; else 0.
+    Freezing drizzle needs a 2 m temperature <= fz_sfc_f and the tier-2
+    moisture/QPF test, graded by the temperature at the top of the saturated
+    column starting at the lowest saturated level >= 850 mb: warmer than -5 C
+    is 3, -10 to -5 C is 2; a colder top, or only surface saturation with light
+    QPF, is 1 (cold tops usually mean snow). Levels below ground are ignored.
+    Tiers are NaN where the profile or QPF is missing."""
     T = DRIZZLE_TIERS
     g = lambda key: _hourly_on(times, member.get(key), window)
     n = len(window)
-    sfc_p, t2m, precip = g("sfc_p"), g("t2m"), g("precip")
-    sat, have_low = np.zeros(n, bool), np.zeros(n, bool)
-    top_c = np.full(n, np.nan)
-    for p in sorted((int(k[2:]) for k in member if k.startswith("rh")), reverse=True):
-        if p < T["low_top_hpa"]:
-            continue
-        rh, t = g(f"rh{p}"), g(f"t{p}")
-        with np.errstate(invalid="ignore"):
-            valid = ~np.isnan(rh) & ~np.isnan(t) & ~(sfc_p < p)
-            hit = valid & (rh >= T["sat_rh"])
-        have_low |= valid
-        sat |= hit
-        top_c = np.where(hit, (t - 32) * 5 / 9, top_c)  # higher levels overwrite lower ones
-    deep, have_aloft = np.zeros(n, bool), np.zeros(n, bool)
-    for p in (800, 700):
-        if f"rh{p}" not in member:
-            continue
-        rh = g(f"rh{p}")
-        with np.errstate(invalid="ignore"):
-            valid = ~np.isnan(rh) & ~(sfc_p < p)
-            deep |= valid & (rh >= T["aloft_rh"])
-        have_aloft |= valid
-    known = have_low & have_aloft & ~np.isnan(precip)
+    sfc_p, t2m, td2m, precip = g("sfc_p"), g("t2m"), g("td2m"), g("precip")
+
+    def rh_at(p):
+        return np.where(sfc_p < p, np.nan, g(f"rh{p}")) if f"rh{p}" in member else np.full(n, np.nan)
+    rh_low = _first_valid(rh_at(925), rh_at(900), rh_at(850))
+    rh_mid = _first_valid(rh_at(850), rh_at(800))
+    near = np.fmax(rh_at(975), rh_at(950))
+    spread = t2m - td2m
     with np.errstate(invalid="ignore"):
-        dz = sat & ~deep & (precip <= T["max_precip_in"])
-        fz = dz & (t2m <= T["fz_sfc_f"]) & (top_c > T["fz_top_c"])
-    known_fz = known & ~np.isnan(t2m)
-    return {"drizzle": np.where(known, dz.astype(float), np.nan),
-            "fzdz": np.where(known_fz, fz.astype(float), np.nan),
-            "sat": sat, "deep": deep, "top_c": top_c, "t2m": t2m, "precip": precip}
+        light = precip <= T["light_precip_in"]
+        sfc_sat = (spread <= T["spread_f"])
+        d3 = (spread <= T["spread_tight_f"]) & (rh_low >= T["rh_low"]) & (rh_mid >= T["rh_mid_tight"]) & light
+        d2 = sfc_sat & (rh_low >= T["rh_low"]) & (rh_mid >= T["rh_mid"]) & light
+        d1 = (sfc_sat | (near >= T["near_sfc_rh"])) & light
+    known = ~np.isnan(rh_low) & ~np.isnan(precip)
+    drizzle = np.where(known, np.select([d3, d2, d1], [3.0, 2.0, 1.0], 0.0), np.nan)
+
+    # Top of the contiguous saturated column (temperature, C), levels from the surface up.
+    levels = sorted((int(k[2:]) for k in member if k.startswith("rh") and f"t{k[2:]}" in member), reverse=True)
+    started, ended, top_c = np.zeros(n, bool), np.zeros(n, bool), np.full(n, np.nan)
+    for p in levels:
+        rh, t = rh_at(p), g(f"t{p}")
+        with np.errstate(invalid="ignore"):
+            valid = ~np.isnan(rh) & ~np.isnan(t)
+            sat = valid & (rh >= T["sat_rh"])
+            begin = ~started & ~ended & sat & (p >= T["low_base_hpa"])
+            cont = started & ~ended & sat
+            top_c = np.where(begin | cont, (t - 32) * 5 / 9, top_c)
+            ended = ended | (started & ~ended & valid & ~sat)
+            started = started | begin
+    with np.errstate(invalid="ignore"):
+        sub = t2m <= T["fz_sfc_f"]
+        base = sub & (rh_low >= T["rh_low"]) & (rh_mid >= T["rh_mid"]) & light
+        fz3 = base & (top_c > T["fz_warm_top_c"])
+        fz2 = base & (top_c > T["fz_cold_top_c"])
+        fz1 = base | (sub & d1)
+    fzdz = np.where(known & ~np.isnan(t2m), np.select([fz3, fz2, fz1], [3.0, 2.0, 1.0], 0.0), np.nan)
+    return {"drizzle": drizzle, "fzdz": fzdz, "spread": spread, "rh_low": rh_low, "rh_mid": rh_mid, "top_c": top_c, "t2m": t2m, "precip": precip}
+
+
+def prob_band(p):
+    """Level 0-3 (None/Low/Moderate/High) from a mean chance; NaN stays NaN."""
+    p = np.asarray(p, dtype=float)
+    lvl = np.where(p >= PROB_BANDS[2], 3.0, np.where(p >= PROB_BANDS[1], 2.0, np.where(p >= PROB_BANDS[0], 1.0, 0.0)))
+    return np.where(np.isnan(p), np.nan, lvl)
 
 
 def build_drizzle_rows(window, inputs, kind):
     """Hazards rows for drizzle (kind "drizzle") or freezing drizzle ("fzdz").
-    Deterministic rows are yes (Moderate) / no; ensemble rows are the share of
-    members saying yes, banded like the fog GEFS row. Returns (rows, hover)
-    with hover[label] a list of per-hour text."""
-    rows, hover = {}, {}
+    Deterministic rows show the model's tier. Ensemble rows and the Overall
+    row average the per-tier chance (DRIZZLE_PROB; FZDZ_WEIGHT for freezing
+    drizzle) over members / rows and band it. Returns (rows, hover) with
+    hover[label] a list of per-hour text."""
+    weights = np.array(FZDZ_WEIGHT if kind == "fzdz" else DRIZZLE_PROB)
+    rows, hover, probs = {}, {}, {}
     fmt = lambda v, spec, suffix="": "—" if v is None or np.isnan(v) else f"{v:{spec}}{suffix}"
     for label, _slug, is_ens in DRIZZLE_SOURCES:
         src = inputs.get(label)
         if not src:
             continue
-        flags = [drizzle_flags(m, src["time"], window) for m in src["members"].values()]
-        mat = np.vstack([f[kind] for f in flags])  # (members, hours)
+        ev = [drizzle_tiers(m, src["time"], window) for m in src["members"].values()]
+        mat = np.vstack([e[kind] for e in ev])  # (members, hours)
         n_valid = (~np.isnan(mat)).sum(axis=0)
         if not n_valid.any():
             continue
-        with np.errstate(invalid="ignore", divide="ignore"):
-            yes = np.nansum(mat, axis=0)
-            pct = np.where(n_valid > 0, 100 * yes / np.maximum(n_valid, 1), np.nan)
+        p_mat = np.where(np.isnan(mat), np.nan, weights[np.nan_to_num(mat).astype(int)])
         with warnings_ignored():
-            med = lambda key: np.nanmedian(np.vstack([f[key] for f in flags]), axis=0)
-            t2m_med, top_med, precip_med = med("t2m"), med("top_c"), med("precip")
-        if is_ens:
-            rows[f"{label} %"] = pct_level(pct)
-        else:
-            rows[label] = np.where(np.isnan(pct), np.nan, np.where(pct >= 50, 2.0, 0.0))
+            prob = np.nanmean(p_mat, axis=0)
+            med = lambda key: np.nanmedian(np.vstack([e[key] for e in ev]), axis=0)
+            spread_m, rl_m, rm_m, top_m, t2m_m, pr_m = (med(k) for k in ("spread", "rh_low", "rh_mid", "top_c", "t2m", "precip"))
         key = f"{label} %" if is_ens else label
+        rows[key] = prob_band(prob) if is_ens else mat[0]
+        probs[key] = prob
+        at_least_mod = (np.nan_to_num(mat) >= 2).sum(axis=0)
         text = []
         for i, t in enumerate(window):
             lvl = rows[key][i]
             parts = [f"<b>{key}</b> · {t:%a %b %d %I %p}", f"Level: {'—' if np.isnan(lvl) else DRIZZLE_LEVELS[int(lvl)]}"]
+            if kind == "drizzle" and not np.isnan(prob[i]):
+                parts.append(f"Chance of drizzle this hour: ~{100 * prob[i]:.0f}%")
             if is_ens and n_valid[i]:
-                parts.append(f"{int(yes[i])} of {int(n_valid[i])} members")
-            else:
-                f0 = flags[0]
-                parts.append(f"Saturated low layer: {'yes' if f0['sat'][i] else 'no'}; deep moisture aloft: {'yes' if f0['deep'][i] else 'no'}")
-            parts.append(f"2 m temp: {fmt(t2m_med[i], '.0f', '°F')}")
-            parts.append(f"Saturated-layer top: {fmt(top_med[i] * 9 / 5 + 32 if not np.isnan(top_med[i]) else np.nan, '.0f', '°F')}")
-            parts.append(f"Precip: {fmt(precip_med[i], '.3f', ' in/h')}")
+                parts.append(f"{int(at_least_mod[i])} of {int(n_valid[i])} members at Moderate or higher")
+            parts.append(f"2 m temp − dew point: {fmt(spread_m[i], '.1f', '°F')} · 2 m temp: {fmt(t2m_m[i], '.0f', '°F')}")
+            parts.append(f"RH 925 mb: {fmt(rl_m[i], '.0f', '%')} · 850 mb: {fmt(rm_m[i], '.0f', '%')}")
+            if kind == "fzdz":
+                parts.append(f"Saturated-layer top: {fmt(top_m[i], '.0f', '°C')}")
+            parts.append(f"Precip: {fmt(pr_m[i], '.3f', ' in/h')}")
             text.append("<br>".join(parts))
         hover[key] = text
     if rows:
-        rows["Overall"] = combine_fog_levels(list(rows.values()))
+        with warnings_ignored():
+            overall_p = np.nanmean(np.vstack(list(probs.values())), axis=0)
+        rows["Overall"] = prob_band(overall_p)
         text = []
         for i, t in enumerate(window):
             lvl = rows["Overall"][i]
-            text.append(f"<b>Overall</b> · {t:%a %b %d %I %p}<br>Level: {'—' if np.isnan(lvl) else DRIZZLE_LEVELS[int(lvl)]}"
-                        f"<br>Average of the rows above")
+            extra = f"<br>Average chance across the rows: ~{100 * overall_p[i]:.0f}%" if kind == "drizzle" and not np.isnan(overall_p[i]) else "<br>Average of the rows above"
+            text.append(f"<b>Overall</b> · {t:%a %b %d %I %p}<br>Level: {'—' if np.isnan(lvl) else DRIZZLE_LEVELS[int(lvl)]}{extra}")
         hover["Overall"] = text
     return rows, hover
 
@@ -2769,16 +2811,23 @@ if view == "Hazards":
         T = DRIZZLE_TIERS
         freezing = kind == "fzdz"
         st.subheader(f"{'Freezing Drizzle' if freezing else 'Drizzle'} Potential — {HAZARD_PAST_HOURS} h back, next {HAZARD_HOURS} h")
-        criteria = (
-            f"Each model/member says yes when: RH ≥ {T['sat_rh']:g}% somewhere between the surface and {T['low_top_hpa']} mb, "
-            f"RH < {T['aloft_rh']:g}% at 800/700 mb (no deep moisture, so no ice), and model precip ≤ {T['max_precip_in']:g} in/h"
-        )
         if freezing:
-            criteria += f", plus a 2 m temperature ≤ {T['fz_sfc_f']:g}°F and a saturated-layer top warmer than {T['fz_top_c']:g}°C (liquid cloud)"
-        st.caption(
-            criteria + ". Deterministic rows (GFS, ECMWF, RRFS) are yes/no; EPS/AIFS/GEFS rows are the share of members "
-            "saying yes. Overall = average of the rows."
-        )
+            st.caption(
+                f"Each model/member needs a surface at or below {T['fz_sfc_f']:g}°F (models run slightly warm near freezing), a saturated low layer "
+                f"(RH ≥ {T['rh_low']:g}% at 925 mb and ≥ {T['rh_mid']:g}% at 850 mb) and light model precip (≤ {T['light_precip_in']:g} in/h). It is then graded by the "
+                f"temperature at the top of the saturated layer: warmer than {T['fz_warm_top_c']:g}°C is High, {T['fz_cold_top_c']:g} to {T['fz_warm_top_c']:g}°C Moderate; "
+                "a colder top, or only a saturated surface, is Low (cold tops usually mean snow instead). Deterministic rows show the model's tier; "
+                "EPS/AIFS/GEFS and Overall average over members/rows. Freezing drizzle is rare, so read these as ingredients, not a probability."
+            )
+        else:
+            st.caption(
+                f"Each model/member is scored on a saturated surface (2 m temp − dew point ≤ {T['spread_f']:g}°F), a moist low layer "
+                f"(RH ≥ {T['rh_low']:g}% at 925 mb, ≥ {T['rh_mid']:g}% at 850 mb) and light model precip (≤ {T['light_precip_in']:g} in/h). "
+                f"Over 4 winters of GFS vs. KCMH METARs, hours rated Low / Moderate / High had drizzle reported about "
+                f"{100 * DRIZZLE_PROB[1]:.0f}% / {100 * DRIZZLE_PROB[2]:.0f}% / {100 * DRIZZLE_PROB[3]:.0f}% of the time (about 1% of all hours). "
+                "Deterministic rows show the model's tier; EPS/AIFS/GEFS and Overall average that chance over members/rows. "
+                "Real forecasts will do worse than that calibration; it used the models' own short-range data."
+            )
         rows, hover_by_row = build_drizzle_rows(window, drizzle_inputs, kind)
         if not rows:
             st.info("No low-level profile data is available for this location right now.")
