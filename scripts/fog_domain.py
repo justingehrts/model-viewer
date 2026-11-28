@@ -16,6 +16,7 @@ cycle is already published is skipped, so frequent triggers are cheap.
 Adding a model = adding an entry to MODELS (where its files live, which hours,
 and which message is which canonical field). Canonical fields:
     vis_mi      visibility (miles, capped at 10)
+    p_vis_qmi   chance (%) visibility is under 1/4 mile (dense fog; REFS)
     p_vis_1mi   chance (%) visibility is under 1 mile   (probabilistic models)
     p_vis_3mi   chance (%) visibility is under 3 miles
     t2m_f       2 m temperature (F)
@@ -62,10 +63,22 @@ def plain(var, level):
     return match
 
 
-def prob(var, level, threshold_prefix):
-    """NBM/REFS probability message, matched on the start of its threshold text."""
+def prob(var, level, threshold, exact=False):
+    """NBM/REFS probability message. `threshold` is matched against the start of
+    the threshold text ("prob <1609" for NBM's "prob <1609.34"), or exactly
+    with exact=True (REFS thresholds are whole meters, and "prob <400" must not
+    also match "prob <4829")."""
     def match(v, lev, fc, extra, fh):
-        return v == var and lev == level and extra.startswith(threshold_prefix) and fc == f"{fh} hour fcst"
+        head = extra.split(":")[0]
+        return (v == var and lev == level and fc == f"{fh} hour fcst"
+                and (head == threshold if exact else head.startswith(threshold)))
+    return match
+
+
+def ens_mean(var, level):
+    """REFS weighted ensemble-mean message."""
+    def match(v, lev, fc, extra, fh):
+        return v == var and lev == level and extra == "wt ens mean" and fc == f"{fh} hour fcst"
     return match
 
 
@@ -89,6 +102,29 @@ NBM_FIELDS = {
     "tcdc": (plain("TCDC", "surface"), lambda a: a),
 }
 
+RRFS_FIELDS = {
+    "vis": (plain("VIS", "surface"), lambda a: a * M_TO_MI),
+    "t2m": (plain("TMP", "2 m above ground"), k_to_f),
+    "td2m": (plain("DPT", "2 m above ground"), k_to_f),
+    "u10": (plain("UGRD", "10 m above ground"), lambda a: a * MS_TO_MPH),
+    "v10": (plain("VGRD", "10 m above ground"), lambda a: a * MS_TO_MPH),
+    "lcdc": (plain("LCDC", "low cloud layer"), lambda a: a),
+    "ceil": (plain("CEIL", "cloud ceiling"), lambda a: a * M_TO_FT),
+}
+# REFS: probabilities of visibility under 1/4, 1 and 3 miles (400, 1600, 4829 m) from
+# the "prob" product, and ensemble-mean temperature/dew point from the "mean" product.
+# (Each field names the file it lives in; a model's `files` maps those names to URLs.)
+REFS_FIELDS = {
+    "pq": ("prob", prob("VIS", "surface", "prob <400", exact=True), lambda a: a),
+    "p1": ("prob", prob("VIS", "surface", "prob <1600", exact=True), lambda a: a),
+    "p3": ("prob", prob("VIS", "surface", "prob <4829", exact=True), lambda a: a),
+    "t2m": ("mean", ens_mean("TMP", "2 m above ground"), k_to_f),
+    "td2m": ("mean", ens_mean("DPT", "2 m above ground"), k_to_f),
+}
+
+NOMADS = "https://nomads.ncep.noaa.gov/pub/data/nccf/com"
+HOURLY_THEN_3H = list(range(1, 37)) + list(range(39, 73, 3))   # hourly for a day and a half, then 3-hourly
+
 MODELS = {
     "gfs": {
         "label": "GFS",
@@ -97,8 +133,8 @@ MODELS = {
         "latency_h": 4,            # newest cycle is normally complete ~4 h after its nominal time
         # hourly for the first day (where fog timing matters most), then 3-hourly
         "hours": list(range(1, 25)) + list(range(27, 73, 3)),
-        "url": lambda cyc, fh: (f"https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.{cyc:%Y%m%d}/{cyc:%H}/atmos/"
-                                f"gfs.t{cyc:%H}z.pgrb2.0p25.f{fh:03d}"),
+        "files": {"main": lambda cyc, fh: (f"https://noaa-gfs-bdp-pds.s3.amazonaws.com/gfs.{cyc:%Y%m%d}/{cyc:%H}/atmos/"
+                                           f"gfs.t{cyc:%H}z.pgrb2.0p25.f{fh:03d}")},
         "fields": GFS_FIELDS,
     },
     "nbm": {
@@ -107,9 +143,33 @@ MODELS = {
         "cycle_step_h": 3,         # NBM runs hourly; every 3rd cycle is plenty for a 3-hourly job
         "latency_h": 1,
         "hours": list(range(1, 37)) + list(range(39, 73, 3)),
-        "url": lambda cyc, fh: (f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{cyc:%Y%m%d}/{cyc:%H}/core/"
-                                f"blend.t{cyc:%H}z.core.f{fh:03d}.co.grib2"),
+        "files": {"main": lambda cyc, fh: (f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{cyc:%Y%m%d}/{cyc:%H}/core/"
+                                           f"blend.t{cyc:%H}z.core.f{fh:03d}.co.grib2")},
         "fields": NBM_FIELDS,
+    },
+    "rrfs": {
+        "label": "RRFS",
+        "regrid": "nn",            # 3 km CONUS grid
+        "cycle_step_h": 6,         # the 00/06/12/18Z cycles run to 84 h (other hourly cycles are short)
+        "latency_h": 3,
+        "hours": HOURLY_THEN_3H,
+        "workers": 4,              # NOMADS: be polite
+        "files": {"main": lambda cyc, fh: (f"{NOMADS}/rrfs/prod/rrfs.{cyc:%Y%m%d}/{cyc:%H}/"
+                                           f"rrfs.t{cyc:%H}z.2dfld.3km.f{fh:03d}.conus.grib2")},
+        "fields": RRFS_FIELDS,
+    },
+    "refs": {
+        "label": "REFS",
+        "regrid": "nn",
+        "cycle_step_h": 6,         # 00/06/12/18Z, 60 h
+        "latency_h": 4,
+        "hours": list(range(1, 37)) + list(range(39, 61, 3)),
+        "workers": 4,
+        "files": {"prob": lambda cyc, fh: (f"{NOMADS}/refs/prod/refs.{cyc:%Y%m%d}/{cyc:%H}/ensprod/"
+                                           f"refs.t{cyc:%H}z.prob.f{fh:02d}.conus.grib2"),
+                  "mean": lambda cyc, fh: (f"{NOMADS}/refs/prod/refs.{cyc:%Y%m%d}/{cyc:%H}/ensprod/"
+                                           f"refs.t{cyc:%H}z.mean.f{fh:02d}.conus.grib2")},
+        "fields": REFS_FIELDS,
     },
 }
 
@@ -157,10 +217,18 @@ def fetch_message(url, rows, i):
     return r.content
 
 
-def pick_messages(rows, fields, fh):
-    """{raw name: index of the first matching idx row}."""
+def field_spec(spec):
+    """(file key, matcher, conversion) from a field spec with or without a file key."""
+    return spec if len(spec) == 3 else ("main", spec[0], spec[1])
+
+
+def pick_messages(rows, fields, fh, file_key="main"):
+    """{raw name: index of the first matching idx row} for the fields stored in one file."""
     picks = {}
-    for name, (match, _conv) in fields.items():
+    for name, spec in fields.items():
+        fkey, match, _conv = field_spec(spec)
+        if fkey != file_key:
+            continue
         for i, r in enumerate(rows):
             if match(r["var"], r["level"], r["fcst"], r["extra"], fh):
                 picks[name] = i
@@ -260,28 +328,29 @@ def newest_cycle(cfg, now, max_hours):
     t = (now - timedelta(hours=cfg["latency_h"])).replace(minute=0, second=0, microsecond=0)
     t = t.replace(hour=(t.hour // step) * step)
     for _ in range(int(48 / step) + 2):
-        if read_index(cfg["url"](t, hours[-1])) is not None:
+        if all(read_index(f(t, hours[-1])) is not None for f in cfg["files"].values()):
             return t
         t -= timedelta(hours=step)
     raise RuntimeError("no complete cycle found in the last 48 h")
 
 
 def process_hour(cfg, cyc, fh, regridder_holder):
-    url = cfg["url"](cyc, fh)
-    rows = read_index(url)
-    if rows is None:
-        raise RuntimeError(f"missing {url}")
-    picks = pick_messages(rows, cfg["fields"], fh)
     raw = {}
-    for name, i in picks.items():
-        msg = fetch_message(url, rows, i)
-        if regridder_holder.get("r") is None:   # first message ever: build the regridder from its lat/lon
-            vals, lat, lon = decode(msg)
-            regridder_holder["r"] = Regridder(lat, lon, cfg["regrid"])
-        else:
-            vals = values_only(msg)
-        raw[name] = cfg["fields"][name][1](regridder_holder["r"].apply(vals))
-    check_smooth(raw.get("t2m"), url)
+    for fkey, url_fn in cfg["files"].items():
+        url = url_fn(cyc, fh)
+        rows = read_index(url)
+        if rows is None:
+            raise RuntimeError(f"missing {url}")
+        for name, i in pick_messages(rows, cfg["fields"], fh, fkey).items():
+            msg = fetch_message(url, rows, i)
+            if regridder_holder.get("r") is None:   # first message ever: build the regridder from its lat/lon
+                vals, lat, lon = decode(msg)
+                regridder_holder["r"] = Regridder(lat, lon, cfg["regrid"])
+            else:
+                vals = values_only(msg)
+            raw[name] = field_spec(cfg["fields"][name])[2](regridder_holder["r"].apply(vals))
+        if fkey == next(iter(cfg["files"])):
+            check_smooth(raw.get("t2m"), url)
     return raw
 
 
@@ -302,7 +371,7 @@ def canonical(cfg_name, raw):
     out = {}
     if "vis" in raw:
         out["vis_mi"] = np.clip(raw["vis"], 0, 10)
-    for k_raw, k_out in (("p1", "p_vis_1mi"), ("p3", "p_vis_3mi")):
+    for k_raw, k_out in (("pq", "p_vis_qmi"), ("p1", "p_vis_1mi"), ("p3", "p_vis_3mi")):
         if k_raw in raw:
             out[k_out] = np.clip(raw[k_raw], 0, 100)
     if "t2m" in raw:
@@ -333,7 +402,7 @@ def run_model(name, cfg, out_dir, manifest, now, max_hours, force):
     # Hour 1 builds the regridder; the rest run in parallel threads.
     first = process_hour(cfg, cyc, hours[0], holder)
     results = {hours[0]: first}
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=cfg.get("workers", 6)) as pool:
         futs = {fh: pool.submit(process_hour, cfg, cyc, fh, holder) for fh in hours[1:]}
         for fh, f in futs.items():
             try:
@@ -349,7 +418,7 @@ def run_model(name, cfg, out_dir, manifest, now, max_hours, force):
     arrays = {}
     for f in fields:
         stack = np.stack([p.get(f, np.full((len(lats), len(lons)), np.nan)) for p in per_hour]).astype("float32")
-        if f.startswith("p_vis"):
+        if f.startswith("p_vis"):  # percent, 255 = missing
             arrays[f] = np.where(np.isnan(stack), 255, np.round(stack)).astype("uint8")
         elif f == "cloud_pct":
             arrays[f] = np.where(np.isnan(stack), 255, np.round(stack)).astype("uint8")

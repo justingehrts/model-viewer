@@ -1,6 +1,6 @@
 name: Fog domain extract
 
-# Crops fog-relevant fields for central Ohio out of the newest NBM and GFS runs
+# Crops fog-relevant fields for central Ohio out of the newest NBM, GFS, RRFS and REFS runs
 # (scripts/fog_domain.py) and publishes them to the orphan `fog-domain` branch,
 # where the dashboard's Fog Domain tab reads them. Only the latest files are
 # kept: the branch is rebuilt as a single commit each run, so it never grows.
@@ -13,8 +13,8 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: "Comma-separated models (gfs,nbm)"
-        default: "gfs,nbm"
+        description: "Comma-separated models (gfs,nbm,rrfs,refs)"
+        default: "gfs,nbm,rrfs,refs"
       force:
         description: "Rebuild even if the newest cycle is already published"
         type: boolean
@@ -58,7 +58,7 @@ jobs:
       - name: Extract
         run: |
           python scripts/fog_domain.py --out out \
-            --models "${{ github.event.inputs.models || 'gfs,nbm' }}" \
+            --models "${{ github.event.inputs.models || 'gfs,nbm,rrfs,refs' }}" \
             ${{ github.event.inputs.force == 'true' && '--force' || '' }}
 
       - name: Publish to fog-domain (single commit, history discarded)
