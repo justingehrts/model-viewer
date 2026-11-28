@@ -113,6 +113,10 @@ should see there, instead of only mentioning them in chat. This repo is `justing
 - Sessions can update or finish only items they created; Justin's tasks are read-only and nothing
   can be deleted.
 
+## Fog Domain map lines
+
+`data/fog_map_lines.json` (built by `scripts/build_map_lines.py` from Census county boundaries and TIGER interstates, clipped to the domain and simplified; ~90 KB) is drawn on the Fog Domain map by `load_map_lines`.
+
 ## Fog site calibration
 
 `research/fog/calibrate_sites.py` (IEM ASOS 2022–26, 20 `FOG_SITES`) prints `FOG_SITE_PROB`/`FOG_SITE_CLIMO`, pasted into `app.py`: per-site chance of fog (vis ≤ 1 mi or FG) by ingredient tier of dew-point spread and wind (`FOG_SITE_TIERS`), shrunk toward the all-site rate. The Fog Domain tab draws it as "site-calibrated fog chance" (`site_fog_chance`) for models with spread and wind (not REFS). Site ranking repeats across years (Spearman 0.92). Checked on KCMH: GFS-derived tiers gave 24% at the top tier versus 13% from observations, so model-based figures are a bit rarer-but-stronger; model-based per-site calibration is a possible later step.

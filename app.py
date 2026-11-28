@@ -10,6 +10,7 @@ import re
 import io
 import math
 import os
+import json
 import subprocess
 
 # ==============================================================================
@@ -1802,6 +1803,27 @@ def fetch_domain_metars():
         return [], str(e)
 
 
+@st.cache_data
+def load_map_lines():
+    """County borders and interstates for the Fog Domain map (scripts/build_map_lines.py), as plotly line traces."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "fog_map_lines.json")) as f:
+            g = json.load(f)
+    except (OSError, ValueError):
+        return []
+
+    def joined(lines):
+        xs, ys = [], []
+        for ln in lines:
+            xs += [p[0] for p in ln] + [None]
+            ys += [p[1] for p in ln] + [None]
+        return xs, ys
+    cx, cy = joined(g["counties"])
+    ix, iy = joined([r["xy"] for r in g["interstates"]])
+    return [go.Scatter(x=cx, y=cy, mode="lines", line=dict(color="rgba(70,70,70,0.45)", width=0.7), hoverinfo="skip", showlegend=False, name="Counties"),
+            go.Scatter(x=ix, y=iy, mode="lines", line=dict(color="rgba(20,40,110,0.75)", width=1.2), hoverinfo="skip", showlegend=False, name="Interstates")]
+
+
 def domain_metrics(d):
     """Display options for one model's extract: {label: key}, only for the fields it has."""
     out = {}
@@ -3120,7 +3142,7 @@ if view == "Hazards":
             info = man.get("models", {}).get(model, {})
             st.caption(f"{label(model)} run {info.get('cycle_utc', '?')} · published {man.get('generated_utc', '?')} · "
                        f"grid {len(lat)}×{len(lon)} at {man.get('domain', {}).get('step', '?')}° · dots are the latest METARs "
-                       "(same color scale, from reported visibility; gray = no fog).")
+                       "(same color scale, from reported visibility; gray = no fog). Thin gray lines are county borders, blue lines interstates.")
 
             steps = ["rgba(128, 128, 128, 0.12)", "#FFE08A", "#FDAE61", "#F46D43", "#B2182B"]
             colorscale = []
@@ -3138,6 +3160,8 @@ if view == "Hazards":
                 z=levels[ti], x=lon, y=lat, zmin=-0.5, zmax=4.5, colorscale=colorscale, customdata=custom, hovertemplate=hover,
                 colorbar=dict(tickvals=list(range(5)), ticktext=FOG_LEVELS, title="Fog", len=0.8)
             ))
+            for tr in load_map_lines():
+                fig_map.add_trace(tr)
             obs_in = [o for o in domain_obs if FOG_DOMAIN_BBOX[0] <= o["lat"] <= FOG_DOMAIN_BBOX[2] and FOG_DOMAIN_BBOX[1] <= o["lon"] <= FOG_DOMAIN_BBOX[3]]
             if obs_in:
                 lv = [observed_level("fog", o["wx"], o["vis"]) for o in obs_in]
