@@ -171,14 +171,30 @@ def pick_messages(rows, fields, fh):
 # ---------------------------------------------------------------------------
 # Decoding and regridding
 # ---------------------------------------------------------------------------
+def _grid_values(gid):
+    """Message values as a flat array in the same order as the latitudes/longitudes
+    arrays. Some grids (NBM's Lambert grid) are stored with alternating row
+    scanning: every second row is written in the opposite direction, and eccodes
+    returns the values in stored order while the coordinate arrays are in normal
+    order. Without this fix every other row is mirrored (striped maps)."""
+    import eccodes
+    eccodes.codes_set(gid, "missingValue", 1e20)
+    vals = eccodes.codes_get_values(gid).astype("float64")
+    vals[vals > 1e19] = np.nan
+    if eccodes.codes_is_defined(gid, "alternativeRowScanning") and eccodes.codes_get(gid, "alternativeRowScanning") == 1:
+        ni, nj = eccodes.codes_get(gid, "Ni"), eccodes.codes_get(gid, "Nj")
+        v2 = vals.reshape(nj, ni)
+        v2[1::2] = v2[1::2, ::-1].copy()
+        vals = v2.reshape(-1)
+    return vals
+
+
 def decode(msg):
     """(values, lat, lon) of one GRIB2 message; missing values become NaN."""
     import eccodes
     gid = eccodes.codes_new_from_message(msg)
     try:
-        eccodes.codes_set(gid, "missingValue", 1e20)
-        vals = eccodes.codes_get_values(gid).astype("float64")
-        vals[vals > 1e19] = np.nan
+        vals = _grid_values(gid)
         lat = eccodes.codes_get_array(gid, "latitudes")
         lon = eccodes.codes_get_array(gid, "longitudes")
     finally:
@@ -191,11 +207,9 @@ def values_only(msg):
     import eccodes
     gid = eccodes.codes_new_from_message(msg)
     try:
-        eccodes.codes_set(gid, "missingValue", 1e20)
-        vals = eccodes.codes_get_values(gid).astype("float64")
+        vals = _grid_values(gid)
     finally:
         eccodes.codes_release(gid)
-    vals[vals > 1e19] = np.nan
     return vals
 
 
@@ -267,7 +281,20 @@ def process_hour(cfg, cyc, fh, regridder_holder):
         else:
             vals = values_only(msg)
         raw[name] = cfg["fields"][name][1](regridder_holder["r"].apply(vals))
+    check_smooth(raw.get("t2m"), url)
     return raw
+
+
+def check_smooth(t2m, label):
+    """Guard against scrambled grids (e.g. unhandled row scanning): a real 2 m
+    temperature field changes about as much between rows as between columns,
+    stripes make the row-to-row change several times larger (smooth fields measure ~1.1, the striped NBM grid 4+)."""
+    if t2m is None or np.isnan(t2m).all():
+        return
+    rows = np.nanmean(np.abs(np.diff(t2m, axis=0)))
+    cols = np.nanmean(np.abs(np.diff(t2m, axis=1)))
+    if rows > 2.5 * max(cols, 0.05):
+        raise RuntimeError(f"{label}: temperature field looks scrambled (row change {rows:.2f} vs column change {cols:.2f})")
 
 
 def canonical(cfg_name, raw):
