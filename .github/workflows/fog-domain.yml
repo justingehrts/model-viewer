@@ -1,0 +1,72 @@
+name: Fog domain extract
+
+# Crops fog-relevant fields for central Ohio out of the newest NBM and GFS runs
+# (scripts/fog_domain.py) and publishes them to the orphan `fog-domain` branch,
+# where the dashboard's Fog Domain tab reads them. Only the latest files are
+# kept: the branch is rebuilt as a single commit each run, so it never grows.
+#
+# Trigger: cron-job.org calls the workflow-dispatch API a few minutes after
+# each model cycle is normally out (GitHub's own `schedule` runs hours late, so
+# the schedule below is only a backup; the script skips a cycle it already
+# published, so extra triggers are cheap).
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Comma-separated models (gfs,nbm)"
+        default: "gfs,nbm"
+      force:
+        description: "Rebuild even if the newest cycle is already published"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fog-domain
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/fog_domain.py
+
+      - name: Install dependencies
+        run: pip install numpy scipy eccodes requests
+
+      - name: Fetch the currently published files (if any)
+        run: |
+          mkdir out
+          if git ls-remote --exit-code --heads origin fog-domain > /dev/null; then
+            git fetch --depth=1 origin fog-domain
+            git --work-tree=out checkout FETCH_HEAD -- .
+          fi
+
+      - name: Extract
+        run: |
+          python scripts/fog_domain.py --out out \
+            --models "${{ github.event.inputs.models || 'gfs,nbm' }}" \
+            ${{ github.event.inputs.force == 'true' && '--force' || '' }}
+
+      - name: Publish to fog-domain (single commit, history discarded)
+        working-directory: out
+        run: |
+          rm -rf .git
+          git init -q -b fog-domain
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Fog domain extract $(date -u +%Y-%m-%dT%H:%MZ)"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push --force origin fog-domain

@@ -198,6 +198,23 @@ NORMALS_STATIONS = {"KCMH": "USW00014821"}
 RRFS_SLUG = DET_MODEL_SLUGS["RRFS Operational"]
 HAZARD_HOURS = 72
 HAZARD_PAST_HOURS = 12  # hours of observations/recent model state shown before the latest observation
+# Fog Domain tab: model fields cropped to central Ohio by scripts/fog_domain.py
+# (GitHub Action -> orphan `fog-domain` branch). FOG_DOMAIN_URL overrides the
+# location (e.g. a local folder served over http for testing).
+FOG_DOMAIN_URL = os.environ.get("FOG_DOMAIN_URL", "https://raw.githubusercontent.com/justingehrts/model-viewer/fog-domain")
+FOG_DOMAIN_BBOX = (38.0, -85.3, 41.6, -80.3)  # lat_min, lon_min, lat_max, lon_max (same as the script's DOMAIN)
+FOG_DOMAIN_MODELS = {"nbm": "NBM Operational", "gfs": "GFS Operational", "rrfs": "RRFS Operational"}  # -> MODEL_CONFIG names
+# Sites for the Fog Domain site rows: the Columbus airports plus river-valley and
+# outlying stations that see fog Columbus does not (see research notes in CLAUDE.md).
+FOG_SITES = [
+    ("CMH", "Columbus", 39.991, -82.881), ("OSU", "Columbus/St Univ", 40.080, -83.080), ("LCK", "Rickenbacker", 39.814, -82.928),
+    ("TZR", "Bolton Field", 39.901, -83.137), ("LHQ", "Lancaster", 39.756, -82.657), ("VTA", "Newark", 40.025, -82.462),
+    ("DLZ", "Delaware", 40.280, -83.115), ("MRT", "Marysville", 40.225, -83.352), ("4I3", "Mount Vernon", 40.329, -82.526),
+    ("MNN", "Marion", 40.616, -83.064), ("I40", "Coshocton", 40.310, -81.850), ("ZZV", "Zanesville", 39.944, -81.892),
+    ("CDI", "Cambridge", 39.975, -81.578), ("UNI", "Albany", 39.212, -82.229), ("JRO", "Jackson", 38.981, -82.578),
+    ("RZT", "Chillicothe", 39.440, -83.023), ("I23", "Wash. Court House", 39.570, -83.421), ("ILN", "Wilmington", 39.420, -83.822),
+    ("GDK", "Dayton (Greene Co.)", 39.691, -83.993), ("SGH", "Springfield", 39.840, -83.840),
+]
 FOG_TIERS = {
     "mist_mi": 3.0,             # visibility < 3 mi: mist (low)
     "fog_mi": 1.0,              # <= 1 mi: fog (high)
@@ -856,6 +873,43 @@ def generate_mock_metar_history(now_hour):
     wx = ["", "", "-RA BR", "BR", "BR", "-DZ BR", "-DZ BR", "FG", "FG", "-DZ FG", "BR", "-DZ BR", "-RA", "-RA BR", ""]
     vis = [10, 10, 4, 2.5, 2, 1.5, 1, 0.5, 0.25, 0.125, 0.75, 3, 5, 4, 10]
     return pd.DataFrame({"wx": wx, "vis": vis, "raw": "MOCK METAR (Dev Mode)"}, index=hours)
+
+
+def generate_mock_fog_domain():
+    """Synthetic Fog Domain data for Dev Mode (same shape as fetch_fog_domain):
+    valley fog that builds overnight on NBM and GFS grids of different texture."""
+    rng = np.random.RandomState(8)
+    lat = np.round(np.arange(38.0, 41.6001, 0.05), 3)
+    lon = np.round(np.arange(-85.3, -80.2999, 0.05), 3)
+    glon, glat = np.meshgrid(lon, lat)
+    start = pd.Timestamp.now().floor('h')
+    times = pd.date_range(start, periods=48, freq='h')
+    valley = np.exp(-((glat - 39.2 - 0.25 * np.sin((glon + 82.5) * 3)) / 0.25) ** 2) + 0.6 * np.exp(-((glon + 81.9) / 0.25) ** 2 - ((glat - 40.3) / 0.4) ** 2)
+    hours = np.arange(48)
+    night = np.clip(np.sin((times.hour.to_numpy() - 20) % 24 / 12 * np.pi), 0, 1)       # 0 by day, 1 by dawn
+    out = {}
+    for name, noise in (("nbm", 0.15), ("gfs", 0.05)):
+        fog = night[:, None, None] * (valley[None] + rng.normal(0, noise, (48,) + glat.shape))
+        vis = np.clip(10 - 11 * fog, 0.05, 10)
+        d = {"lat": lat.astype("float32"), "lon": lon.astype("float32"),
+             "valid_min": ((times.tz_localize("UTC") - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(minutes=1)).to_numpy().astype("int64"), "cycle_min": np.int64((start.tz_localize("UTC") - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(minutes=1)),
+             "vis_mi": vis.astype("float16"), "spread_f": np.clip(6 - 6 * fog, 0, 40).astype("float16"),
+             "wind_mph": np.clip(8 - 5 * fog, 0, 30).astype("float16"), "t2m_f": (45 - 12 * fog).astype("float16"), "cloud_pct": np.clip(100 * fog, 0, 100).astype("uint8")}
+        if name == "nbm":
+            d["p_vis_1mi"] = np.clip(100 * fog * 0.9, 0, 100).astype("uint8")
+        out[name] = d
+    manifest = {"generated_utc": start.strftime("%Y-%m-%dT%H:%MZ"), "domain": {"lat_min": 38.0, "lat_max": 41.6, "lon_min": -85.3, "lon_max": -80.3, "step": 0.05},
+                "models": {n: {"label": n.upper(), "cycle_utc": start.strftime("%Y-%m-%dT%H:%MZ"), "n_times": 48} for n in out}}
+    return {"manifest": manifest, "models": out}
+
+
+def generate_mock_domain_metars():
+    """A few synthetic observations for the Dev Mode Fog Domain map."""
+    rows = []
+    for sid, name, la, lo in FOG_SITES:
+        vis = 0.5 if sid in ("JRO", "UNI", "I40") else (2.0 if sid in ("VTA", "ZZV") else 10.0)
+        rows.append({"id": sid, "lat": la, "lon": lo, "vis": vis, "wx": "FG" if vis < 1 else ("BR" if vis < 3 else ""), "time": "mock"})
+    return rows
 
 
 def generate_mock_drizzle_inputs():
@@ -1646,6 +1700,67 @@ def render_hazard_heatmap(window, anchor, anchor_label, labels, z, hover, steps,
                      automargin=True, row=main_row, col=1)
     fig.update_layout(height=140 + 55 * (len(labels) + (1 if two else 0)), margin=dict(l=10, r=10, t=36, b=10))
     return fig
+
+
+@st.cache_data(ttl=600)
+def _fetch_fog_domain_cached(base_url):
+    res = requests.get(f"{base_url}/latest.json", timeout=20)
+    res.raise_for_status()
+    manifest = res.json()
+    models = {}
+    for name, info in manifest.get("models", {}).items():
+        try:
+            r = requests.get(f"{base_url}/{info['file']}", timeout=60)
+            r.raise_for_status()
+            z = np.load(io.BytesIO(r.content))
+            models[name] = {k: z[k] for k in z.files}
+        except Exception as e:
+            manifest.setdefault("load_errors", {})[name] = str(e)[:200]
+    if not models:
+        raise ValueError("no fog-domain model files could be read")
+    return {"manifest": manifest, "models": models}
+
+
+def fetch_fog_domain(base_url=FOG_DOMAIN_URL):
+    """Fog Domain extracts published by scripts/fog_domain.py:
+    ({"manifest": {...}, "models": {name: {"lat", "lon", "valid_min", "<field>": (time, lat, lon) array}}}, error).
+    Failures are returned, never cached."""
+    try:
+        return _fetch_fog_domain_cached(base_url), None
+    except Exception as e:
+        return None, str(e)
+
+
+@st.cache_data(ttl=600)
+def _fetch_domain_metars_cached():
+    res = requests.get("https://aviationweather.gov/api/data/metar",
+                       params={"bbox": ",".join(str(x) for x in FOG_DOMAIN_BBOX), "format": "json", "hours": 2}, timeout=30)
+    res.raise_for_status()
+    latest = {}
+    for ob in res.json():
+        sid, t = ob.get("icaoId"), ob.get("reportTime") or ""
+        if sid and ob.get("lat") is not None and (sid not in latest or t > latest[sid]["time"]):
+            latest[sid] = {"id": sid[1:] if len(sid) == 4 and sid.startswith("K") else sid, "lat": float(ob["lat"]), "lon": float(ob["lon"]),
+                           "vis": parse_visibility_mi(ob.get("visib")), "wx": (ob.get("wxString") or "").strip(), "time": t}
+    return list(latest.values())
+
+
+def fetch_domain_metars():
+    """Latest METAR per station inside the Fog Domain box: (list of dicts, error)."""
+    try:
+        return _fetch_domain_metars_cached(), None
+    except Exception as e:
+        return [], str(e)
+
+
+def domain_levels(d, chance=False):
+    """Fog level (0-4) grids (time, lat, lon) for one model's extract: from
+    visibility, or (chance=True) from the probability of visibility under 1 mile."""
+    if chance:
+        p = d["p_vis_1mi"].astype("float32")
+        p[p == 255] = np.nan
+        return pct_level(p)
+    return vis_level(d["vis_mi"].astype("float32"))
 
 
 def vis_level(vis_mi):
@@ -2704,7 +2819,7 @@ if view == "Forecast":
 
 
 # ==============================================================================
-# HAZARDS VIEW (one tab per hazard: fog, drizzle, freezing drizzle)
+# HAZARDS VIEW (fog, fog domain map, drizzle, freezing drizzle)
 # ==============================================================================
 
 if view == "Hazards":
@@ -2726,7 +2841,7 @@ if view == "Hazards":
     ai = HAZARD_PAST_HOURS  # index of the anchor column; forecast periods are listed from here on
     past_note = ("Columns before the dashed line show each model's most recent run (not the forecast made earlier). "
                  "The Observed row is the station's METARs: " if has_obs else "")
-    fog_tab, drizzle_tab, fzdz_tab = st.tabs(["🌫️ Fog", "🌦️ Drizzle", "🧊 Freezing Drizzle"])
+    fog_tab, domain_tab, drizzle_tab, fzdz_tab = st.tabs(["🌫️ Fog", "🗺️ Fog Domain", "🌦️ Drizzle", "🧊 Freezing Drizzle"])
     with fog_tab:
         st.subheader(f"Fog Potential — {HAZARD_PAST_HOURS} h back, next {HAZARD_HOURS} h")
         st.caption(
@@ -2875,3 +2990,125 @@ if view == "Hazards":
         render_drizzle_tab("drizzle")
     with fzdz_tab:
         render_drizzle_tab("fzdz")
+
+    # --- HAZARDS VIEW: FOG DOMAIN TAB ---
+    with domain_tab:
+        st.subheader("Fog Domain — central Ohio and the surrounding river valleys")
+        if dev_mode and "FOG_DOMAIN_URL" not in os.environ:  # Dev Mode uses mock data unless a data location is given explicitly
+            domain_data, domain_err = generate_mock_fog_domain(), None
+            domain_obs, domain_obs_err = generate_mock_domain_metars(), None
+        else:
+            domain_data, domain_err = fetch_fog_domain()
+            domain_obs, domain_obs_err = fetch_domain_metars()
+        if domain_err or not domain_data:
+            st.info("The Fog Domain data isn't available yet. It is published by the 'Fog domain extract' GitHub Action "
+                    f"(NBM and GFS cropped to this area).{' Details: ' + domain_err if domain_err else ''}")
+        else:
+            man, mods = domain_data["manifest"], domain_data["models"]
+            names = [n for n in ("nbm", "rrfs", "gfs") if n in mods] + [n for n in mods if n not in ("nbm", "rrfs", "gfs")]
+            label = lambda n: man.get("models", {}).get(n, {}).get("label", n.upper())
+            c1, c2 = st.columns(2)
+            with c1:
+                model = st.radio("Model", names, format_func=label, horizontal=True, key="dom_model")
+            d = mods[model]
+            has_p = "p_vis_1mi" in d
+            with c2:
+                metric = st.radio("Show", ["Fog level (visibility)"] + (["Chance of visibility ≤ 1 mi"] if has_p else []), horizontal=True, key="dom_metric")
+            chance = metric.startswith("Chance")
+            lat, lon = d["lat"], d["lon"]
+            times_local = pd.to_datetime(d["valid_min"].astype("int64") * 60, unit="s") + pd.Timedelta(seconds=utc_offset_seconds)
+            levels = domain_levels(d, chance)
+            now_local = station_now_local(dev_mode, utc_offset_seconds)
+            upcoming = [i for i, t in enumerate(times_local) if t >= now_local.floor('h')]
+            default_i = upcoming[0] if upcoming else 0
+            extent = 100 * (d["vis_mi"].astype("float32") <= FOG_TIERS["fog_mi"]).mean(axis=(1, 2))
+            peak_i = int(np.argmax(extent[default_i:]) + default_i) if default_i < len(extent) else default_i
+            sc1, sc2 = st.columns([5, 1])
+            with sc2:
+                st.button("⏩ Peak fog hour", key=f"dom_peak_{model}", use_container_width=True, help=f"Jump to {times_local[peak_i]:%a %b %d %I %p}, when {extent[peak_i]:.0f}% of the area has visibility ≤ 1 mi",
+                          on_click=lambda: st.session_state.update({f"dom_hour_{model}": peak_i}), disabled=extent[peak_i] < 0.05)
+            with sc1:
+                hour_key = f"dom_hour_{model}"
+                if st.session_state.get(hour_key) not in range(len(times_local)):
+                    st.session_state[hour_key] = default_i  # first visit (or a new run with a different length): start at "now"
+                ti = st.select_slider("Valid time (local)", options=list(range(len(times_local))),
+                                      format_func=lambda i: f"{times_local[i]:%a %b %d %I %p}", key=hour_key)
+            info = man.get("models", {}).get(model, {})
+            st.caption(f"{label(model)} run {info.get('cycle_utc', '?')} · published {man.get('generated_utc', '?')} · "
+                       f"grid {len(lat)}×{len(lon)} at {man.get('domain', {}).get('step', '?')}° · dots are the latest METARs "
+                       "(same color scale, from reported visibility; gray = no fog).")
+
+            steps = ["rgba(128, 128, 128, 0.12)", "#FFE08A", "#FDAE61", "#F46D43", "#B2182B"]
+            colorscale = []
+            for k, c in enumerate(steps):
+                colorscale += [(k / len(steps), c), ((k + 1) / len(steps), c)]
+            at = lambda f: d[f][ti].astype("float32") if f in d else np.full(levels[ti].shape, np.nan)
+            custom = np.dstack([at("vis_mi"), at("spread_f"), at("wind_mph")] + ([at("p_vis_1mi")] if has_p else []))
+            custom = np.where(custom >= 255, np.nan, custom)
+            hover = ("Visibility %{customdata[0]:.1f} mi<br>Temp − dew point %{customdata[1]:.1f}°F<br>Wind %{customdata[2]:.0f} mph"
+                     + ("<br>Chance vis ≤ 1 mi %{customdata[3]:.0f}%" if has_p else "") + "<br>%{x:.2f}, %{y:.2f}<extra></extra>")
+            fig_map = go.Figure(go.Heatmap(
+                z=levels[ti], x=lon, y=lat, zmin=-0.5, zmax=4.5, colorscale=colorscale, customdata=custom, hovertemplate=hover,
+                colorbar=dict(tickvals=list(range(5)), ticktext=FOG_LEVELS, title="Fog", len=0.8)
+            ))
+            obs_in = [o for o in domain_obs if FOG_DOMAIN_BBOX[0] <= o["lat"] <= FOG_DOMAIN_BBOX[2] and FOG_DOMAIN_BBOX[1] <= o["lon"] <= FOG_DOMAIN_BBOX[3]]
+            if obs_in:
+                lv = [observed_level("fog", o["wx"], o["vis"]) for o in obs_in]
+                fig_map.add_trace(go.Scatter(
+                    x=[o["lon"] for o in obs_in], y=[o["lat"] for o in obs_in], mode="markers",
+                    marker=dict(size=[5 if l == 0 else 9 + 3 * l for l in lv], color=[steps[int(l)] if l > 0 else "rgba(150,150,150,0.8)" for l in lv],
+                                line=dict(color="black", width=1 if any(lv) else 0.5)),
+                    text=[f"<b>{o['id']}</b><br>Visibility {'—' if o['vis'] is None or np.isnan(o['vis']) else format(o['vis'], 'g')} mi"
+                          f"<br>Weather: {o['wx'] or 'none'}<br>{o['time']}" for o in obs_in],
+                    hovertemplate="%{text}<extra></extra>", showlegend=False))
+            site_ids = {sid for sid, *_ in FOG_SITES}
+            lab = [o for o in obs_in if o["id"] in site_ids]
+            if lab:
+                fig_map.add_trace(go.Scatter(x=[o["lon"] for o in lab], y=[o["lat"] for o in lab], mode="text", text=[o["id"] for o in lab],
+                                             textposition="top center", textfont=dict(size=10), hoverinfo="skip", showlegend=False))
+            fig_map.update_layout(height=700, margin=dict(l=10, r=10, t=10, b=10),
+                                  xaxis=dict(title="Longitude", range=[float(lon.min()), float(lon.max())], showgrid=False),
+                                  yaxis=dict(title="Latitude", range=[float(lat.min()), float(lat.max())], showgrid=False,
+                                             scaleanchor="x", scaleratio=1 / np.cos(np.radians(39.8))))
+            st.plotly_chart(fig_map, use_container_width=True)
+            if domain_obs_err:
+                st.caption(f"Observations unavailable: {domain_obs_err}")
+
+            # Share of the domain with fog (visibility <= 1 mi), every model, with the selected time marked.
+            fig_ext = go.Figure()
+            for n in names:
+                dn = mods[n]
+                tl = pd.to_datetime(dn["valid_min"].astype("int64") * 60, unit="s") + pd.Timedelta(seconds=utc_offset_seconds)
+                pct = 100 * (dn["vis_mi"].astype("float32") <= FOG_TIERS["fog_mi"]).mean(axis=(1, 2))
+                color = model_color(FOG_DOMAIN_MODELS[n]) if n in FOG_DOMAIN_MODELS else None
+                fig_ext.add_trace(go.Scatter(x=tl, y=pct, mode="lines+markers", name=label(n), line=dict(color=color, width=2), marker=dict(size=4)))
+            fig_ext.add_vline(x=times_local[ti], line=dict(color="rgba(128,128,128,0.9)", width=2, dash="dash"))
+            fig_ext.update_layout(title=dict(text="Share of the domain with fog (visibility ≤ 1 mi)", font=dict(size=16)),
+                                  yaxis=dict(title="% of grid cells", rangemode="tozero", **AXIS_STYLE),
+                                  xaxis=dict(tickformat="%a %m/%d %I%p", **AXIS_STYLE), height=300, margin=dict(l=10, r=10, t=50, b=10),
+                                  legend=dict(orientation="h", y=1.15, x=0.5, xanchor="center"))
+            st.plotly_chart(fig_ext, use_container_width=True)
+
+            # One row per site over time, from the selected model's nearest grid cell.
+            rows_lbl, rows_z, rows_txt = [], [], []
+            for sid, sname, la, lo in FOG_SITES:
+                y, x = int(np.abs(lat - la).argmin()), int(np.abs(lon - lo).argmin())
+                rows_lbl.append(f"{sid} {sname}")
+                rows_z.append(levels[:, y, x])
+                rows_txt.append([f"<b>{sid} {sname}</b> · {t:%a %b %d %I %p}<br>Visibility {d['vis_mi'][k, y, x]:.1f} mi"
+                                 + (f"<br>Chance vis ≤ 1 mi {int(d['p_vis_1mi'][k, y, x])}%" if has_p and d['p_vis_1mi'][k, y, x] != 255 else "")
+                                 for k, t in enumerate(times_local)])
+            fig_sites = go.Figure(go.Heatmap(z=np.vstack(rows_z), x=times_local, y=rows_lbl, zmin=-0.5, zmax=4.5, colorscale=colorscale, xgap=1, ygap=2,
+                                             customdata=rows_txt, hovertemplate="%{customdata}<extra></extra>",
+                                             colorbar=dict(tickvals=list(range(5)), ticktext=FOG_LEVELS, title="Fog", len=0.8)))
+            fig_sites.update_yaxes(autorange="reversed", showgrid=False)
+            fig_sites.update_xaxes(tickformat="%a %m/%d %I%p", dtick=6 * 3600 * 1000, tickangle=-45, showgrid=False)
+            fig_sites.add_vline(x=times_local[ti], line=dict(color="rgba(128,128,128,0.9)", width=2, dash="dash"))
+            fig_sites.update_layout(title=dict(text=f"{label(model)} fog level by site", font=dict(size=16)), height=120 + 26 * len(FOG_SITES),
+                                    margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig_sites, use_container_width=True)
+            if man.get("errors"):
+                st.caption("Last extract errors: " + "; ".join(f"{k}: {v}" for k, v in man["errors"].items()))
+        st.caption("Fog is hard for any model: NBM and GFS visibility are model diagnostics (and GFS is coarse, ~25 km), not forecasts of "
+                   "individual valleys. Treat the map as a guide to where and when fog is plausible, and check the sites and observations.")
+
